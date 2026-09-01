@@ -13,9 +13,10 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://oink:oink@localhost:5432/oink"
     redis_url: str = "redis://localhost:6379/0"
     default_timezone: str = "America/Sao_Paulo"
-    evolution_api_url: str | None = None
+    evolution_base_url: str | None = None
     evolution_api_key: str | None = Field(default=None, repr=False)
-    evolution_instance_id: str | None = None
+    evolution_instance: str | None = None
+    evolution_webhook_secret: str | None = Field(default=None, repr=False)
 
 
 @lru_cache

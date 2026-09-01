@@ -1,0 +1,24 @@
+{
+  "event": "messages.upsert",
+  "instance": "finance-instance",
+  "data": {
+    "key": {
+      "remoteJid": "5511888888888@s.whatsapp.net",
+      "fromMe": false,
+      "id": "MSG-EXTENDED-001"
+    },
+    "message": {
+      "extendedTextMessage": {
+        "text": "Mercado 120,00",
+        "contextInfo": {
+          "mentionedJid": []
+        }
+      }
+    },
+    "messageType": "extendedTextMessage",
+    "messageTimestamp": "1788278460",
+    "instanceId": "finance-instance"
+  },
+  "date_time": "2026-09-01T12:01:00.000Z",
+  "sender": "5511888888888@s.whatsapp.net"
+}
