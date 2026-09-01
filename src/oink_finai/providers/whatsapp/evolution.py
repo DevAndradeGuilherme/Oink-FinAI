@@ -125,20 +125,46 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
             return None
 
         from_me = bool(key.get("fromMe", False))
+        remote_jid_alt = self._first_string(
+            key, data, names=("remoteJidAlt", "remoteJidAlternative")
+        )
+        participant_jid = self._first_string(key, data, names=("participant", "participantJid"))
+        participant_jid_alt = self._first_string(
+            key, data, names=("participantAlt", "participantJidAlt")
+        )
         message_type, text = self._extract_content(message, data.get("messageType"))
         timestamp = self._parse_timestamp(data.get("messageTimestamp"), payload.get("date_time"))
-        phone_number = remote_jid.split("@", maxsplit=1)[0]
+        phone_number = self._phone_from_jids(remote_jid_alt, remote_jid)
 
         return InboundWhatsAppMessage(
             external_message_id=external_id,
             instance_id=instance_id,
             remote_jid=remote_jid,
+            remote_jid_alt=remote_jid_alt,
+            participant_jid=participant_jid,
+            participant_jid_alt=participant_jid_alt,
             phone_number=phone_number,
             from_me=from_me,
             message_type=message_type,
             text_content=text,
             timestamp=timestamp,
         )
+
+    @staticmethod
+    def _first_string(*containers: dict[str, Any], names: tuple[str, ...]) -> str | None:
+        for container in containers:
+            for name in names:
+                value = container.get(name)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    @staticmethod
+    def _phone_from_jids(*jids: str | None) -> str:
+        for jid in jids:
+            if jid and jid.endswith("@s.whatsapp.net"):
+                return jid.partition("@")[0]
+        return next(jid.partition("@")[0] for jid in jids if jid)
 
     @staticmethod
     def _extract_instance(payload: dict[str, object], data: dict[str, Any]) -> str | None:

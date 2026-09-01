@@ -9,6 +9,9 @@ class InboundWhatsAppMessage(BaseModel):
     external_message_id: str
     instance_id: str
     remote_jid: str
+    remote_jid_alt: str | None = None
+    participant_jid: str | None = None
+    participant_jid_alt: str | None = None
     phone_number: str
     from_me: bool
     message_type: str

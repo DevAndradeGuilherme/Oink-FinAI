@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +18,19 @@ class Settings(BaseSettings):
     evolution_api_key: str | None = Field(default=None, repr=False)
     evolution_instance: str | None = None
     evolution_webhook_secret: str | None = Field(default=None, repr=False)
+    whatsapp_access_mode: Literal["allowlist"] = "allowlist"
+    whatsapp_allowed_numbers: str = ""
+    whatsapp_self_test_enabled: bool = False
+    whatsapp_self_test_number: str | None = Field(default=None, repr=False)
+    whatsapp_self_test_prefix: str = "!oink"
+
+    @property
+    def whatsapp_allowed_number_set(self) -> frozenset[str]:
+        return frozenset(
+            normalized
+            for value in self.whatsapp_allowed_numbers.split(",")
+            if (normalized := "".join(character for character in value if character.isdigit()))
+        )
 
 
 @lru_cache

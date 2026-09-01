@@ -10,6 +10,7 @@ from oink_finai.api.dependencies import get_evolution_provider
 from oink_finai.config.settings import get_settings
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.session import get_session
+from oink_finai.providers.whatsapp.access import filter_inbound_message
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
@@ -53,10 +54,10 @@ async def evolution_webhook(
         ) from None
     if message is None:
         return WebhookResponse(status="ignored")
-    if message.from_me or message.remote_jid.endswith("@g.us"):
+    decision = filter_inbound_message(message, get_settings())
+    if not decision.accepted or decision.message is None:
         return WebhookResponse(status="ignored")
-    if message.text_content is None:
-        return WebhookResponse(status="ignored")
+    message = decision.message
 
     session.add(
         ProcessedMessage(

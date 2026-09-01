@@ -90,6 +90,32 @@ async def test_parse_supported_text_messages(
     assert message.text_content == expected_text
 
 
+async def test_parse_lid_message_uses_remote_jid_alt_as_phone_number() -> None:
+    payload = load_payload("messages_upsert_conversation.json")
+    payload["data"]["key"].update(
+        {
+            "remoteJid": "123456789012345@lid",
+            "remoteJidAlt": "5511999999999@s.whatsapp.net",
+            "participant": "987654321012345@lid",
+            "participantAlt": "5511888888888@s.whatsapp.net",
+        }
+    )
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid", "sanitized-key", "finance-instance"
+    )
+
+    try:
+        message = await provider.parse_webhook(payload)
+    finally:
+        await provider.aclose()
+
+    assert message is not None
+    assert message.remote_jid_alt == "5511999999999@s.whatsapp.net"
+    assert message.participant_jid == "987654321012345@lid"
+    assert message.participant_jid_alt == "5511888888888@s.whatsapp.net"
+    assert message.phone_number == "5511999999999"
+
+
 async def test_send_text_uses_v237_contract() -> None:
     requests: list[httpx.Request] = []
 

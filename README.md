@@ -40,6 +40,12 @@ Configure `EVOLUTION_BASE_URL`, `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE` e
 cabeçalho customizado `X-Evolution-Webhook-Secret` com o mesmo segredo. O endpoint local é
 `POST /api/v1/webhooks/evolution`.
 
+O autoteste temporário pelo WhatsApp pessoal permanece desabilitado por padrão. Para ativá-lo,
+configure `WHATSAPP_ACCESS_MODE=allowlist`, inclua o próprio número em
+`WHATSAPP_ALLOWED_NUMBERS` e `WHATSAPP_SELF_TEST_NUMBER`, e defina
+`WHATSAPP_SELF_TEST_ENABLED=true`. Somente mensagens enviadas na conversa com o próprio número e
+iniciadas pelo `WHATSAPP_SELF_TEST_PREFIX` (padrão: `!oink`) serão processadas.
+
 ## Desenvolvimento local
 
 Python 3.12 é obrigatório.
