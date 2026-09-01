@@ -1,6 +1,8 @@
 # Oink FinAI
 
-Fundação do backend de controle financeiro cuja interface principal será o WhatsApp. Esta etapa fornece API, persistência, cache, modelos e contratos; não conecta IA nem Evolution API.
+Backend de controle financeiro cuja interface principal será o WhatsApp. A integração inicial com
+Evolution API recebe webhooks de texto com idempotência e permite o envio de mensagens; ainda não
+cria gastos nem conecta IA.
 
 ## Arquitetura
 
@@ -32,6 +34,11 @@ curl http://localhost:8000/health
 ```
 
 Resposta esperada: `{"status":"ok"}`. Encerre com `docker compose down`. Use `docker compose down -v` somente para apagar também os dados locais do PostgreSQL.
+
+Configure `EVOLUTION_BASE_URL`, `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE` e
+`EVOLUTION_WEBHOOK_SECRET` no ambiente. Na Evolution API 2.3.7, o webhook da instância deve enviar o
+cabeçalho customizado `X-Evolution-Webhook-Secret` com o mesmo segredo. O endpoint local é
+`POST /api/v1/webhooks/evolution`.
 
 ## Desenvolvimento local
 
