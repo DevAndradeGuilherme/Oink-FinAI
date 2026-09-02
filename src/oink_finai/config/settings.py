@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     default_timezone: str = "America/Sao_Paulo"
     gemini_api_key: str | None = Field(default=None, repr=False)
-    gemini_model: str | None = None
+    gemini_model: str = "gemini-3.1-flash-lite"
     gemini_timeout_seconds: float = Field(default=90.0, gt=0)
     evolution_base_url: str | None = None
     evolution_api_key: str | None = Field(default=None, repr=False)

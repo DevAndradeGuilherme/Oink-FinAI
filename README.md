@@ -65,6 +65,8 @@ Com PostgreSQL configurado no `.env`, use `alembic upgrade head` para aplicar mi
 
 Configurações são lidas por Pydantic Settings. Nunca versione `.env`, tokens, chaves da Evolution API ou senhas. `.env.example` contém somente valores locais ilustrativos. Dinheiro usa `Decimal`/`NUMERIC(14,2)`; exclusões de gastos devem preencher `deleted_at`, nunca remover a linha.
 
+O modelo Gemini padrão é `gemini-3.1-flash-lite`, configurável por `GEMINI_MODEL`.
+
 As tentativas e os intervalos do processamento durável de gastos são configurados por
 `EXPENSE_PROCESSING_MAX_ATTEMPTS`, `EXPENSE_RETRY_BASE_SECONDS` e
 `EXPENSE_RETRY_MAX_SECONDS`. Os nomes anteriores `GEMINI_MAX_ATTEMPTS`,

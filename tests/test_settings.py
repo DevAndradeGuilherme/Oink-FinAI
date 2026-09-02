@@ -28,10 +28,19 @@ def test_settings_loads_env_example(monkeypatch: pytest.MonkeyPatch) -> None:
 
     settings = Settings(_env_file=ENV_EXAMPLE)
 
+    assert settings.gemini_model == "gemini-3.1-flash-lite"
     assert settings.outbox_state_timeout_seconds == 300.0
     assert settings.expense_processing_max_attempts == 3
     assert settings.expense_retry_base_seconds == 0.5
     assert settings.expense_retry_max_seconds == 5.0
+
+
+def test_default_gemini_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_model == "gemini-3.1-flash-lite"
 
 
 def test_canonical_retry_environment_names_configure_settings(
