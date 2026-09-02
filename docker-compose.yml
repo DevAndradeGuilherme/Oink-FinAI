@@ -1,6 +1,7 @@
 services:
   api:
     build: .
+    image: oink-finai:local
     env_file: .env
     command: sh -c "alembic upgrade head && uvicorn oink_finai.main:app --host 0.0.0.0 --port 8000 --reload"
     volumes:
@@ -16,6 +17,7 @@ services:
 
   worker:
     build: .
+    image: oink-finai:local
     env_file: .env
     command: python -m oink_finai.worker
     volumes:
