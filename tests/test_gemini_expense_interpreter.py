@@ -14,6 +14,7 @@ from oink_finai.schemas.expense_interpretation import (
     GEMINI_EXPENSE_TRANSPORT_SCHEMA,
     GeminiExpenseTransport,
 )
+from oink_finai.services import gemini_expense_interpreter as interpreter_module
 from oink_finai.services.gemini_errors import (
     GeminiAuthenticationError,
     GeminiConfigurationError,
@@ -85,6 +86,24 @@ def make_interpreter(
         client=client,
     )
     return interpreter, client
+
+
+def test_sdk_retry_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def client_factory(**kwargs: object) -> FakeClient:
+        captured.update(kwargs)
+        return FakeClient(response(payload()))
+
+    monkeypatch.setattr(interpreter_module.genai, "Client", client_factory)
+    GeminiExpenseInterpreter(
+        api_key="test-secret",
+        model="configured-model",
+        timeout_seconds=90,
+    )
+
+    http_options = captured["http_options"]
+    assert http_options.retry_options.attempts == 1
 
 
 def build_system_instruction(timezone: str | ZoneInfo, reference: datetime) -> str:

@@ -38,3 +38,17 @@ def test_corrective_migration_preserves_legitimate_pending_messages() -> None:
     assert source.count("ADD COLUMN IF NOT EXISTS") == 3
     assert "status = 'PENDING' AND accepted_text = ''" in source
     assert "accepted_text != ''" not in source
+
+
+def test_durable_retry_migration_has_safe_backfill_and_terminal_kind() -> None:
+    source = (MIGRATIONS / "20260902_0005_durable_gemini_retries.py").read_text()
+
+    assert "ADD VALUE IF NOT EXISTS 'PROCESSING_FAILURE'" in source
+    assert 'sa.Column("processing_attempts",' in source
+    assert 'sa.Column("next_attempt_at", sa.DateTime(timezone=True), nullable=True)' in source
+    assert 'sa.Column("last_error_code", sa.String(64), nullable=True)' in source
+    assert 'server_default="0"' in source
+    assert (
+        'alter_column("processed_messages", "processing_attempts", server_default=None)' in source
+    )
+    assert "UPDATE processed_messages SET last_error_code = error_code" in source

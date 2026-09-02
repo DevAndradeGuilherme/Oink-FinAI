@@ -66,3 +66,4 @@ class OutboundMessageStatus(StrEnum):
 class OutboundMessageKind(StrEnum):
     EXPENSE_CONFIRMATION = "EXPENSE_CONFIRMATION"
     CLARIFICATION = "CLARIFICATION"
+    PROCESSING_FAILURE = "PROCESSING_FAILURE"

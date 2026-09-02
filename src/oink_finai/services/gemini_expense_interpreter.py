@@ -326,7 +326,10 @@ class GeminiExpenseInterpreter(ExpenseInterpreter):
         self._timeout_seconds = timeout_seconds
         self._client = client or genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=int(timeout_seconds * 1000)),
+            http_options=types.HttpOptions(
+                timeout=int(timeout_seconds * 1000),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
 
     async def interpret(

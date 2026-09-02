@@ -1,16 +1,28 @@
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from oink_finai.database.models import OutboundMessage, User
-from oink_finai.domain.enums import OutboundMessageKind, OutboundMessageStatus
+from oink_finai.database.models import OutboundMessage, ProcessedMessage, User
+from oink_finai.domain.enums import (
+    OutboundMessageKind,
+    OutboundMessageStatus,
+    ProcessedMessageStatus,
+)
 from oink_finai.providers.whatsapp import WhatsAppProvider
+from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
+from oink_finai.services.gemini_errors import (
+    GeminiErrorMetadata,
+    GeminiRequestError,
+    GeminiTimeoutError,
+    GeminiUnavailableError,
+)
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 
 pytestmark = pytest.mark.skipif(
@@ -25,6 +37,48 @@ class NoCallProvider(WhatsAppProvider):
 
     async def send_text(self, phone_number: str, text: str) -> str | None:
         raise AssertionError("provider must not be called")
+
+
+class ErrorInterpreter(ExpenseInterpreter):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def interpret(self, message: str, *, reference_timestamp: datetime):
+        raise self.error
+
+
+async def seed_processing_message(
+    factory: async_sessionmaker,
+    *,
+    processing_attempts: int = 1,
+) -> tuple[User, ProcessedMessage]:
+    unique = uuid4().hex
+    async with factory() as session, session.begin():
+        user = User(phone_number=f"pg-{unique[:20]}")
+        session.add(user)
+        await session.flush()
+        message = ProcessedMessage(
+            provider="postgres-test",
+            instance_id=unique,
+            external_message_id=unique,
+            user_id=user.id,
+            accepted_text="synthetic",
+            message_timestamp=datetime.now(UTC),
+            status=ProcessedMessageStatus.PROCESSING,
+            available_at=datetime.now(UTC),
+            locked_at=datetime.now(UTC),
+            processing_attempts=processing_attempts,
+        )
+        session.add(message)
+        await session.flush()
+        return user, message
+
+
+async def cleanup_processing_message(factory: async_sessionmaker, user_id) -> None:
+    async with factory() as session, session.begin():
+        await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
+        await session.execute(delete(ProcessedMessage).where(ProcessedMessage.user_id == user_id))
+        await session.execute(delete(User).where(User.id == user_id))
 
 
 async def test_postgres_rejects_numeric_14_2_overflow() -> None:
@@ -80,3 +134,184 @@ async def test_postgres_claim_and_recovery_transitions() -> None:
         assert message is not None
         assert message.status == OutboundMessageStatus.UNKNOWN
     await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (
+            GeminiUnavailableError(
+                "sanitized",
+                metadata=GeminiErrorMetadata(
+                    exception_class="ServerError",
+                    category="transient",
+                    duration_ms=1,
+                    http_status=503,
+                ),
+            ),
+            ProcessedMessageStatus.PENDING,
+            "GEMINI_UNAVAILABLE",
+        ),
+        (
+            GeminiTimeoutError("sanitized"),
+            ProcessedMessageStatus.PENDING,
+            "GEMINI_TIMEOUT",
+        ),
+        (
+            GeminiRequestError("sanitized"),
+            ProcessedMessageStatus.FAILED,
+            "GEMINI_REQUEST",
+        ),
+    ],
+)
+async def test_postgres_processing_errors_lock_only_message_and_leave_transaction_usable(
+    error: Exception,
+    expected_status: ProcessedMessageStatus,
+    expected_code: str,
+) -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user, message = await seed_processing_message(factory)
+    processor = ExpenseProcessingService(
+        factory,
+        lambda _: ErrorInterpreter(error),
+        retry_base_seconds=3600,
+        retry_max_seconds=3600,
+        jitter=lambda: 1,
+    )
+
+    try:
+        async with factory() as session, session.begin():
+            locked = await session.scalar(
+                ExpenseProcessingService._locked_message_statement(message.id)
+            )
+            assert locked is not None
+            assert await session.scalar(text("SELECT 1")) == 1
+
+        await processor.process(message.id)
+
+        async with factory() as session:
+            saved = await session.get(ProcessedMessage, message.id)
+            assert saved is not None
+            assert saved.status == expected_status
+            assert saved.error_code == expected_code
+            assert saved.last_error_code == expected_code
+            assert saved.available_at.tzinfo is not None
+            if expected_status == ProcessedMessageStatus.PENDING:
+                assert saved.next_attempt_at is not None
+                assert saved.next_attempt_at.tzinfo is not None
+            assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) >= 1
+    finally:
+        await cleanup_processing_message(factory, user.id)
+        await engine.dispose()
+
+
+async def test_postgres_concurrent_retry_is_applied_once() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user, message = await seed_processing_message(factory)
+    processor = ExpenseProcessingService(
+        factory,
+        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        max_attempts=3,
+        retry_base_seconds=3600,
+        retry_max_seconds=3600,
+        jitter=lambda: 1,
+    )
+
+    try:
+        await asyncio.gather(
+            processor._retry_or_fail(message.id, "GEMINI_TIMEOUT"),
+            processor._retry_or_fail(message.id, "GEMINI_TIMEOUT"),
+        )
+
+        async with factory() as session:
+            saved = await session.get(ProcessedMessage, message.id)
+            assert saved is not None
+            assert saved.status == ProcessedMessageStatus.PENDING
+            assert saved.attempt_count == 1
+            assert saved.next_attempt_at is not None
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(OutboundMessage)
+                    .where(OutboundMessage.user_id == user.id)
+                )
+                == 0
+            )
+    finally:
+        await cleanup_processing_message(factory, user.id)
+        await engine.dispose()
+
+
+async def test_postgres_concurrent_retry_exhaustion_creates_one_notification() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user, message = await seed_processing_message(factory, processing_attempts=2)
+    processor = ExpenseProcessingService(
+        factory,
+        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        max_attempts=2,
+    )
+
+    try:
+        await asyncio.gather(
+            processor._retry_or_fail(message.id, "GEMINI_TIMEOUT"),
+            processor._retry_or_fail(message.id, "GEMINI_TIMEOUT"),
+        )
+
+        async with factory() as session:
+            saved = await session.get(ProcessedMessage, message.id)
+            assert saved is not None
+            assert saved.status == ProcessedMessageStatus.FAILED
+            assert saved.attempt_count == 1
+            assert saved.next_attempt_at is None
+            notifications = list(
+                await session.scalars(
+                    select(OutboundMessage).where(OutboundMessage.user_id == user.id)
+                )
+            )
+            assert len(notifications) == 1
+            assert notifications[0].kind == OutboundMessageKind.PROCESSING_FAILURE
+    finally:
+        await cleanup_processing_message(factory, user.id)
+        await engine.dispose()
+
+
+async def test_postgres_two_workers_do_not_start_attempt_beyond_limit() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user, message = await seed_processing_message(factory, processing_attempts=2)
+    available_at = datetime(2099, 1, 1, tzinfo=UTC)
+    async with factory() as session, session.begin():
+        saved = await session.get(ProcessedMessage, message.id)
+        assert saved is not None
+        saved.status = ProcessedMessageStatus.PENDING
+        saved.locked_at = None
+        saved.available_at = available_at
+        saved.created_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def clock() -> datetime:
+        return datetime(2100, 1, 1, tzinfo=UTC)
+
+    first = ExpenseProcessingService(
+        factory, lambda _: ErrorInterpreter(Exception()), max_attempts=3, clock=clock
+    )
+    second = ExpenseProcessingService(
+        factory, lambda _: ErrorInterpreter(Exception()), max_attempts=3, clock=clock
+    )
+
+    try:
+        claims = await asyncio.gather(first.claim(1), second.claim(1))
+
+        assert sum(message.id in worker_claims for worker_claims in claims) == 1
+        async with factory() as session:
+            saved = await session.get(ProcessedMessage, message.id)
+            assert saved is not None
+            assert saved.status == ProcessedMessageStatus.PROCESSING
+            assert saved.processing_attempts == 3
+            assert saved.available_at.tzinfo is not None
+            assert saved.locked_at is not None and saved.locked_at.tzinfo is not None
+    finally:
+        await cleanup_processing_message(factory, user.id)
+        await engine.dispose()

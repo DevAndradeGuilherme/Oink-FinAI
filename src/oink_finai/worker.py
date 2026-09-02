@@ -42,9 +42,9 @@ async def run_worker() -> None:
             timeout_seconds=settings.gemini_timeout_seconds,
             timezone=timezone,
         ),
-        max_attempts=settings.gemini_max_attempts,
-        retry_base_seconds=settings.gemini_retry_base_seconds,
-        retry_max_seconds=settings.gemini_retry_max_seconds,
+        max_attempts=settings.expense_processing_max_attempts,
+        retry_base_seconds=settings.expense_retry_base_seconds,
+        retry_max_seconds=settings.expense_retry_max_seconds,
     )
     provider = EvolutionWhatsAppProvider(
         settings.evolution_base_url,

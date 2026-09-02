@@ -18,6 +18,7 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="uq_processed_message_external_identity",
         ),
         Index("ix_processed_messages_claim", "status", "available_at", "created_at"),
+        Index("ix_processed_messages_retry", "status", "next_attempt_at", "created_at"),
     )
 
     provider: Mapped[str] = mapped_column(String(40))
@@ -39,6 +40,9 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    processing_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
 
     user = relationship("User", back_populates="processed_messages")
     expense = relationship("Expense", back_populates="processed_message", uselist=False)
