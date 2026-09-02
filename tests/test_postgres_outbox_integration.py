@@ -1,6 +1,7 @@
 import asyncio
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -8,8 +9,18 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from oink_finai.database.models import OutboundMessage, ProcessedMessage, User
+from oink_finai.database.models import (
+    Category,
+    ConversationState,
+    Expense,
+    ExpenseHistory,
+    OutboundMessage,
+    ProcessedMessage,
+    User,
+)
 from oink_finai.domain.enums import (
+    ConversationStatus,
+    ExpenseHistoryAction,
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
@@ -314,4 +325,96 @@ async def test_postgres_two_workers_do_not_start_attempt_beyond_limit() -> None:
             assert saved.locked_at is not None and saved.locked_at.tzinfo is not None
     finally:
         await cleanup_processing_message(factory, user.id)
+        await engine.dispose()
+
+
+async def test_postgres_concurrent_delete_confirmations_delete_once() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    unique = uuid4().hex
+    now = datetime.now(UTC)
+    async with factory() as session, session.begin():
+        user = User(phone_number=f"delete-{unique[:20]}")
+        category = Category(name=f"Delete test {unique}", slug=f"delete-{unique}")
+        session.add_all([user, category])
+        await session.flush()
+        expense = Expense(
+            user_id=user.id,
+            category_id=category.id,
+            amount=Decimal("10.00"),
+            description="Concurrent delete",
+            expense_date=date.today(),
+        )
+        session.add(expense)
+        await session.flush()
+        session.add(
+            ConversationState(
+                user_id=user.id,
+                status=ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM,
+                active_expense_id=expense.id,
+                context={"action": "DELETE", "expense_id": str(expense.id)},
+                expires_at=now + timedelta(minutes=10),
+            )
+        )
+        messages = [
+            ProcessedMessage(
+                provider="postgres-delete-test",
+                instance_id=unique,
+                external_message_id=f"{unique}-{index}",
+                user_id=user.id,
+                accepted_text=f"confirmar-remocao {expense.id}",
+                message_timestamp=now,
+                status=ProcessedMessageStatus.PROCESSING,
+                available_at=now,
+                locked_at=now,
+                processing_attempts=1,
+            )
+            for index in range(2)
+        ]
+        session.add_all(messages)
+        await session.flush()
+        user_id, expense_id = user.id, expense.id
+        message_ids = [message.id for message in messages]
+
+    processor = ExpenseProcessingService(
+        factory, lambda _: ErrorInterpreter(AssertionError("interpreter called"))
+    )
+    try:
+        await asyncio.gather(*(processor.process(message_id) for message_id in message_ids))
+        async with factory() as session:
+            saved = await session.get(Expense, expense_id)
+            history_count = await session.scalar(
+                select(func.count())
+                .select_from(ExpenseHistory)
+                .where(
+                    ExpenseHistory.expense_id == expense_id,
+                    ExpenseHistory.action == ExpenseHistoryAction.DELETE,
+                )
+            )
+            confirmation_count = await session.scalar(
+                select(func.count())
+                .select_from(OutboundMessage)
+                .where(
+                    OutboundMessage.expense_id == expense_id,
+                    OutboundMessage.kind == OutboundMessageKind.EXPENSE_DELETED,
+                )
+            )
+            assert saved is not None and saved.deleted_at is not None
+            assert history_count == 1
+            assert confirmation_count == 1
+    finally:
+        async with factory() as session, session.begin():
+            await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
+            await session.execute(
+                delete(ExpenseHistory).where(ExpenseHistory.expense_id == expense_id)
+            )
+            await session.execute(
+                delete(ConversationState).where(ConversationState.user_id == user_id)
+            )
+            await session.execute(delete(Expense).where(Expense.id == expense_id))
+            await session.execute(
+                delete(ProcessedMessage).where(ProcessedMessage.user_id == user_id)
+            )
+            await session.execute(delete(User).where(User.id == user_id))
+            await session.execute(delete(Category).where(Category.slug == f"delete-{unique}"))
         await engine.dispose()

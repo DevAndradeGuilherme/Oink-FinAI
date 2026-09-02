@@ -1,6 +1,8 @@
+from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oink_finai.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -18,6 +20,10 @@ class ConversationState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     active_expense_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("expenses.id", ondelete="SET NULL")
     )
+    context: Mapped[dict[str, object] | None] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     user = relationship("User", back_populates="conversation_state")
     active_expense = relationship("Expense")

@@ -45,6 +45,7 @@ async def run_worker() -> None:
         max_attempts=settings.expense_processing_max_attempts,
         retry_base_seconds=settings.expense_retry_base_seconds,
         retry_max_seconds=settings.expense_retry_max_seconds,
+        delete_confirmation_ttl_seconds=settings.expense_delete_confirmation_ttl_seconds,
     )
     provider = EvolutionWhatsAppProvider(
         settings.evolution_base_url,

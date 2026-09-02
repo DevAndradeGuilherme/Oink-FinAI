@@ -120,7 +120,7 @@ async def seed(
             accepted_text="Mercado 42,50 no Pix",
             message_timestamp=datetime(2026, 9, 2, 2, 30, tzinfo=UTC),
             status=status,
-            available_at=available_at or datetime.now(UTC),
+            available_at=available_at or datetime(2026, 9, 2, 2, 30, tzinfo=UTC),
             locked_at=datetime.now(UTC) if status == ProcessedMessageStatus.PROCESSING else None,
             next_attempt_at=next_attempt_at,
             processing_attempts=processing_attempts,
@@ -172,7 +172,11 @@ async def test_create_expense_is_idempotent_and_uses_user_timezone(
             " Descrição: Mercado\n"
             f" Categoria: {ExpenseCategory.FOOD.value}\n"
             " Data: 01/09/2026\n"
-            " Pagamento: Pix"
+            " Pagamento: Pix\n\n"
+            "✏️ Para editar:\n"
+            f"editar {expenses[0].id}\n\n"
+            "🗑️ Para remover:\n"
+            f"remover {expenses[0].id}"
         )
 
     provider = FakeProvider()

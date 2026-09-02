@@ -15,12 +15,14 @@ from oink_finai.database.models import (
     Category,
     ConversationState,
     Expense,
+    ExpenseHistory,
     OutboundMessage,
     ProcessedMessage,
     User,
 )
 from oink_finai.domain.enums import (
     ConversationStatus,
+    ExpenseHistoryAction,
     ExpenseIntent,
     OutboundMessageKind,
     OutboundMessageStatus,
@@ -34,6 +36,11 @@ from oink_finai.domain.expense_limits import (
     EXPENSE_PAYMENT_METHOD_MAX_LENGTH,
 )
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
+from oink_finai.services.expense_commands import (
+    ExpenseCommand,
+    ExpenseCommandType,
+    parse_expense_command,
+)
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.gemini_errors import (
     GeminiAuthenticationError,
@@ -51,6 +58,15 @@ from oink_finai.services.gemini_errors import (
 CLARIFICATION_TEXT = "Não encontrei o valor. Envie novamente incluindo o valor do gasto."
 PROCESSING_FAILURE_TEXT = (
     "⚠️ Não consegui registrar esse gasto agora. Envie a mensagem novamente em alguns minutos."
+)
+EXPENSE_NOT_FOUND_TEXT = "Gasto não encontrado ou indisponível."
+INVALID_COMMAND_TEXT = "Comando inválido. Use o UUID completo, sem texto adicional."
+EDIT_NOT_AVAILABLE_TEXT = "O fluxo de edição será disponibilizado na próxima etapa."
+ACTION_CANCELLED_TEXT = "Operação cancelada."
+NOTHING_TO_CANCEL_TEXT = "Nenhuma operação pendente."
+DELETE_EXPIRED_TEXT = "A confirmação expirou. Envie um novo comando remover com o UUID do gasto."
+EXPENSE_DELETED_TEXT = (
+    "🗑️ Gasto removido.\n\nVocê já pode enviar outra mensagem para registrar um novo gasto."
 )
 
 
@@ -75,6 +91,7 @@ class ExpenseProcessingService:
         retry_max_seconds: float = 5.0,
         jitter: Callable[[], float] = random.random,
         clock: Callable[[], datetime] = utc_now,
+        delete_confirmation_ttl_seconds: float = 600.0,
     ) -> None:
         self._session_factory = session_factory
         self._interpreter_factory = interpreter_factory
@@ -83,6 +100,7 @@ class ExpenseProcessingService:
         self._retry_max_seconds = retry_max_seconds
         self._jitter = jitter
         self._clock = clock
+        self._delete_confirmation_ttl = timedelta(seconds=delete_confirmation_ttl_seconds)
 
     async def recover_stale(self, older_than: datetime) -> int:
         now = self._now()
@@ -176,6 +194,15 @@ class ExpenseProcessingService:
             text = message.accepted_text
             timestamp = message.message_timestamp
             timezone = user.timezone
+
+        command = parse_expense_command(text)
+        if command is not None:
+            try:
+                await self._process_command(message_id, command)
+            except IntegrityError:
+                await self._recover_unique_conflict(message_id)
+            return
+        await self._cancel_pending_for_normal_message(message_id)
 
         try:
             interpreter = self._interpreter_factory(timezone)
@@ -307,6 +334,8 @@ class ExpenseProcessingService:
         else:
             state.status = ConversationStatus.IDLE
             state.active_expense_id = None
+            state.context = None
+            state.expires_at = None
         self._create_outbox(
             session,
             message,
@@ -419,6 +448,218 @@ class ExpenseProcessingService:
             raise ValueError("clock must return a timezone-aware datetime")
         return now.astimezone(UTC)
 
+    async def _process_command(self, message_id: UUID, command: ExpenseCommand) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return
+            if message.user is None or message.user_id is None:
+                self._fail_locked_message(message, "USER_NOT_FOUND")
+                return
+            state = await self._locked_state(session, message.user_id)
+            if command.type is ExpenseCommandType.REMOVE:
+                await self._request_delete(session, message, state, command)
+            elif command.type is ExpenseCommandType.CONFIRM_REMOVE:
+                await self._confirm_delete(session, message, state, command)
+            elif command.type is ExpenseCommandType.CANCEL:
+                pending = state.status is ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM
+                self._reset_state(state)
+                self._complete_command(
+                    session,
+                    message,
+                    ACTION_CANCELLED_TEXT if pending else NOTHING_TO_CANCEL_TEXT,
+                    OutboundMessageKind.ACTION_CANCELLED,
+                )
+            elif command.type is ExpenseCommandType.EDIT:
+                self._complete_command(
+                    session,
+                    message,
+                    EDIT_NOT_AVAILABLE_TEXT,
+                    OutboundMessageKind.ACTION_ERROR,
+                )
+            else:
+                self._complete_command(
+                    session,
+                    message,
+                    INVALID_COMMAND_TEXT,
+                    OutboundMessageKind.ACTION_ERROR,
+                )
+
+    async def _request_delete(
+        self,
+        session: AsyncSession,
+        message: ProcessedMessage,
+        state: ConversationState,
+        command: ExpenseCommand,
+    ) -> None:
+        assert command.expense_id is not None
+        expense = await session.scalar(
+            select(Expense)
+            .where(
+                Expense.id == command.expense_id,
+                Expense.user_id == message.user_id,
+                Expense.deleted_at.is_(None),
+            )
+            .with_for_update(of=Expense)
+        )
+        if expense is None:
+            self._complete_command(
+                session,
+                message,
+                EXPENSE_NOT_FOUND_TEXT,
+                OutboundMessageKind.ACTION_ERROR,
+            )
+            return
+        state.status = ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM
+        state.active_expense_id = expense.id
+        state.context = {"action": "DELETE", "expense_id": str(expense.id)}
+        state.expires_at = self._now() + self._delete_confirmation_ttl
+        self._complete_command(
+            session,
+            message,
+            format_delete_confirmation_request(expense),
+            OutboundMessageKind.DELETE_CONFIRMATION_REQUEST,
+            expense=expense,
+        )
+
+    async def _confirm_delete(
+        self,
+        session: AsyncSession,
+        message: ProcessedMessage,
+        state: ConversationState,
+        command: ExpenseCommand,
+    ) -> None:
+        assert command.expense_id is not None
+        if self._state_expired(state):
+            self._reset_state(state)
+            self._complete_command(
+                session,
+                message,
+                DELETE_EXPIRED_TEXT,
+                OutboundMessageKind.ACTION_ERROR,
+            )
+            return
+        if (
+            state.status is not ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM
+            or state.active_expense_id != command.expense_id
+        ):
+            self._complete_command(
+                session,
+                message,
+                EXPENSE_NOT_FOUND_TEXT,
+                OutboundMessageKind.ACTION_ERROR,
+            )
+            return
+        expense = await session.scalar(
+            select(Expense)
+            .where(
+                Expense.id == command.expense_id,
+                Expense.user_id == message.user_id,
+                Expense.deleted_at.is_(None),
+            )
+            .with_for_update(of=Expense)
+        )
+        if expense is None:
+            self._reset_state(state)
+            self._complete_command(
+                session,
+                message,
+                EXPENSE_NOT_FOUND_TEXT,
+                OutboundMessageKind.ACTION_ERROR,
+            )
+            return
+        old_data = expense_history_data(expense)
+        now = self._now()
+        expense.deleted_at = now
+        expense.updated_at = now
+        new_data = expense_history_data(expense)
+        session.add(
+            ExpenseHistory(
+                expense_id=expense.id,
+                action=ExpenseHistoryAction.DELETE,
+                changes={"old_data": old_data, "new_data": new_data},
+            )
+        )
+        self._reset_state(state)
+        self._complete_command(
+            session,
+            message,
+            EXPENSE_DELETED_TEXT,
+            OutboundMessageKind.EXPENSE_DELETED,
+            expense=expense,
+        )
+
+    async def _cancel_pending_for_normal_message(self, message_id: UUID) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return
+            if message.user_id is None:
+                return
+            state = await self._locked_state(session, message.user_id)
+            if state.status is ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM:
+                self._reset_state(state)
+
+    @staticmethod
+    async def _locked_state(session: AsyncSession, user_id: UUID) -> ConversationState:
+        state = await session.scalar(
+            select(ConversationState)
+            .where(ConversationState.user_id == user_id)
+            .with_for_update(of=ConversationState)
+        )
+        if state is None:
+            state = ConversationState(user_id=user_id)
+            session.add(state)
+            await session.flush()
+        return state
+
+    def _complete_command(
+        self,
+        session: AsyncSession,
+        message: ProcessedMessage,
+        content: str,
+        kind: OutboundMessageKind,
+        *,
+        expense: Expense | None = None,
+    ) -> None:
+        self._create_outbox(
+            session,
+            message,
+            content=content,
+            kind=kind,
+            expense=expense,
+        )
+        self._complete_successfully(message, ProcessedMessageStatus.PROCESSED)
+
+    @staticmethod
+    def _reset_state(state: ConversationState) -> None:
+        state.status = ConversationStatus.IDLE
+        state.active_expense_id = None
+        state.context = None
+        state.expires_at = None
+
+    def _state_expired(self, state: ConversationState) -> bool:
+        if state.status is not ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM:
+            return False
+        if state.expires_at is None:
+            return True
+        expires_at = state.expires_at
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return expires_at <= self._now()
+
+    @staticmethod
+    def _fail_locked_message(message: ProcessedMessage, code: str) -> None:
+        message.status = ProcessedMessageStatus.FAILED
+        message.error_code = code
+        message.last_error_code = code
+        message.locked_at = None
+        message.next_attempt_at = None
+
     async def _recover_unique_conflict(self, message_id: UUID) -> None:
         async with self._session_factory() as session, session.begin():
             expense = await session.scalar(
@@ -470,5 +711,37 @@ def format_expense_confirmation(expense: Expense, category_name: str) -> str:
         f" Descrição: {expense.description}\n"
         f" Categoria: {category_name}\n"
         f" Data: {expense.expense_date.strftime('%d/%m/%Y')}\n"
-        f" Pagamento: {payment}"
+        f" Pagamento: {payment}\n\n"
+        "✏️ Para editar:\n"
+        f"editar {expense.id}\n\n"
+        "🗑️ Para remover:\n"
+        f"remover {expense.id}"
     )
+
+
+def format_delete_confirmation_request(expense: Expense) -> str:
+    amount = f"{expense.amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return (
+        "⚠️ Confirmar remoção?\n\n"
+        f"Valor: R$ {amount}\n"
+        f"Descrição: {expense.description}\n"
+        f"Data: {expense.expense_date.strftime('%d/%m/%Y')}\n\n"
+        "Para confirmar:\n"
+        f"confirmar-remocao {expense.id}\n\n"
+        "Para cancelar:\n"
+        "cancelar"
+    )
+
+
+def expense_history_data(expense: Expense) -> dict[str, object]:
+    return {
+        "id": str(expense.id),
+        "user_id": str(expense.user_id),
+        "category_id": str(expense.category_id),
+        "amount": str(expense.amount),
+        "description": expense.description,
+        "expense_date": expense.expense_date.isoformat(),
+        "merchant": expense.merchant,
+        "payment_method": expense.payment_method,
+        "deleted_at": expense.deleted_at.isoformat() if expense.deleted_at else None,
+    }
