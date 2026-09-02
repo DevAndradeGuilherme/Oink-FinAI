@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://oink:oink@localhost:5432/oink"
     redis_url: str = "redis://localhost:6379/0"
     default_timezone: str = "America/Sao_Paulo"
+    gemini_api_key: str | None = Field(default=None, repr=False)
+    gemini_model: str | None = None
+    gemini_timeout_seconds: float = Field(default=30.0, gt=0)
     evolution_base_url: str | None = None
     evolution_api_key: str | None = Field(default=None, repr=False)
     evolution_instance: str | None = None

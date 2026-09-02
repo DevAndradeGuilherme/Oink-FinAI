@@ -21,6 +21,7 @@ def message(**updates: object) -> InboundWhatsAppMessage:
 
 def enabled_settings() -> Settings:
     return Settings(
+        _env_file=None,
         whatsapp_allowed_numbers="+55 (11) 99999-9999",
         whatsapp_self_test_enabled=True,
         whatsapp_self_test_number="5511999999999",
@@ -40,6 +41,7 @@ def test_authorized_message_has_exact_prefix_removed() -> None:
 
 def test_from_me_is_ignored_with_default_self_test_configuration() -> None:
     settings = Settings(
+        _env_file=None,
         whatsapp_allowed_numbers="5511999999999",
         whatsapp_self_test_number="5511999999999",
     )
