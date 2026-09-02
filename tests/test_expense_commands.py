@@ -29,7 +29,14 @@ from oink_finai.domain.enums import (
     ProcessedMessageStatus,
 )
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
-from oink_finai.services.expense_commands import ExpenseCommandType, parse_expense_command
+from oink_finai.services.expense_commands import (
+    ExpenseCommand,
+    ExpenseCommandType,
+    encode_expense_action,
+    expense_command_text,
+    parse_expense_action,
+    parse_expense_command,
+)
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import (
     ExpenseProcessingService,
@@ -149,13 +156,44 @@ def test_parser_leaves_normal_messages_for_interpreter() -> None:
     assert parse_expense_command("remédios 27,40 no débito") is None
 
 
+@pytest.mark.parametrize(
+    "command_type",
+    [
+        ExpenseCommandType.EDIT,
+        ExpenseCommandType.REMOVE,
+        ExpenseCommandType.CONFIRM_REMOVE,
+    ],
+)
+def test_interactive_actions_round_trip_with_full_uuid(command_type: ExpenseCommandType) -> None:
+    expense_id = uuid4()
+    command = ExpenseCommand(command_type, expense_id)
+    action_id = encode_expense_action(command)
+
+    assert str(expense_id) in action_id
+    assert parse_expense_action(action_id) == command
+    assert parse_expense_command(expense_command_text(command)) == command
+
+
+def test_cancel_interactive_action_round_trip() -> None:
+    command = ExpenseCommand(ExpenseCommandType.CANCEL)
+    assert parse_expense_action(encode_expense_action(command)) == command
+
+
+@pytest.mark.parametrize(
+    "action_id",
+    ["oink:v1:r:short", "oink:v1:r:not-a-uuid", "oink:v1:unknown", "other:v1:c"],
+)
+def test_invalid_interactive_action_is_rejected(action_id: str) -> None:
+    assert parse_expense_action(action_id) is None
+
+
 async def test_confirmation_contains_uuid_commands_without_self_test_prefix(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     _, expense = await seed_expense(factory)
     text = format_expense_confirmation(expense, ExpenseCategory.FOOD.value)
-    assert f"editar {expense.id}" in text
-    assert f"remover {expense.id}" in text
+    assert str(expense.id) not in text
+    assert f"⚙️ ID: {str(expense.id)[:8]}" in text
     assert "!oink" not in text
 
 
@@ -182,7 +220,15 @@ async def test_remove_requests_confirmation_without_deleting_or_calling_interpre
         assert state.expires_at is not None
         assert len(outbox) == 1
         assert outbox[0].kind is OutboundMessageKind.DELETE_CONFIRMATION_REQUEST
-        assert f"confirmar-remocao {expense.id}" in outbox[0].content
+        assert outbox[0].content_type == "BUTTONS"
+        assert outbox[0].actions is not None
+        assert [action["label"] for action in outbox[0].actions] == [
+            "️ Confirmar exclusão",
+            "Cancelar",
+        ]
+        assert str(expense.id) in outbox[0].actions[0]["id"]
+        assert outbox[0].fallback_content is not None
+        assert f"confirmar-remocao {expense.id}" in outbox[0].fallback_content
         assert interpreter.calls == 0
 
 

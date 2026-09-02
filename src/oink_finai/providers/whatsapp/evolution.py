@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 from datetime import UTC, datetime
 from typing import Any
@@ -6,7 +7,11 @@ from urllib.parse import quote
 
 import httpx
 
-from oink_finai.providers.whatsapp.base import WhatsAppProvider
+from oink_finai.providers.whatsapp.base import (
+    InteractiveMessage,
+    InteractiveMessageUnsupportedError,
+    WhatsAppProvider,
+)
 from oink_finai.schemas.whatsapp import InboundWhatsAppMessage
 
 
@@ -71,12 +76,34 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
             await self._client.aclose()
 
     async def send_text(self, phone_number: str, text: str) -> str | None:
-        url = f"{self._base_url}/message/sendText/{quote(self._instance, safe='')}"
+        return await self._send_message(
+            "sendText",
+            {"number": phone_number, "text": text},
+            interactive=False,
+        )
+
+    async def send_interactive(self, phone_number: str, message: InteractiveMessage) -> str | None:
+        payload: dict[str, object] = {
+            "number": phone_number,
+            "title": message.title,
+            "buttons": [
+                {"type": "reply", "displayText": action.label, "id": action.id}
+                for action in message.actions
+            ],
+        }
+        if message.body:
+            payload["description"] = message.body
+        return await self._send_message("sendButtons", payload, interactive=True)
+
+    async def _send_message(
+        self, endpoint: str, payload: dict[str, object], *, interactive: bool
+    ) -> str | None:
+        url = f"{self._base_url}/message/{endpoint}/{quote(self._instance, safe='')}"
         for attempt in range(self._max_retries + 1):
             try:
                 response = await self._client.post(
                     url,
-                    json={"number": phone_number, "text": text},
+                    json=payload,
                     headers={"apikey": self._api_key},
                     timeout=self._timeout_seconds,
                 )
@@ -87,7 +114,9 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
                     return None
                 key = body.get("key") if isinstance(body, dict) else None
                 return key.get("id") if isinstance(key, dict) else None
-            except httpx.HTTPStatusError:
+            except httpx.HTTPStatusError as exc:
+                if interactive and exc.response.status_code in {400, 404, 405, 422}:
+                    raise InteractiveMessageUnsupportedError from None
                 raise EvolutionProviderError(
                     "Evolution send result is unknown after an HTTP response",
                     outcome_unknown=True,
@@ -140,6 +169,7 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
             key, data, names=("participantAlt", "participantJidAlt")
         )
         message_type, text = self._extract_content(message, data.get("messageType"))
+        interaction_id = self._extract_interaction_id(message)
         timestamp = self._parse_timestamp(data.get("messageTimestamp"), payload.get("date_time"))
         phone_number = self._phone_from_jids(remote_jid_alt, remote_jid)
 
@@ -154,6 +184,7 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
             from_me=from_me,
             message_type=message_type,
             text_content=text,
+            interaction_id=interaction_id,
             timestamp=timestamp,
         )
 
@@ -194,6 +225,30 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         if isinstance(reported_type, str) and reported_type:
             return reported_type, None
         return next(iter(message), "unknown"), None
+
+    @staticmethod
+    def _extract_interaction_id(message: dict[str, Any]) -> str | None:
+        interactive = message.get("interactiveResponseMessage")
+        if isinstance(interactive, dict):
+            native_flow = interactive.get("nativeFlowResponseMessage")
+            if isinstance(native_flow, dict):
+                params_json = native_flow.get("paramsJson")
+                if isinstance(params_json, str):
+                    try:
+                        params = json.loads(params_json)
+                    except (TypeError, ValueError):
+                        return None
+                    action_id = params.get("id") if isinstance(params, dict) else None
+                    return action_id if isinstance(action_id, str) and action_id else None
+        buttons = message.get("buttonsResponseMessage")
+        if isinstance(buttons, dict):
+            action_id = buttons.get("selectedButtonId")
+            return action_id if isinstance(action_id, str) and action_id else None
+        template = message.get("templateButtonReplyMessage")
+        if isinstance(template, dict):
+            action_id = template.get("selectedId")
+            return action_id if isinstance(action_id, str) and action_id else None
+        return None
 
     @staticmethod
     def _parse_timestamp(raw: object, fallback: object) -> datetime:

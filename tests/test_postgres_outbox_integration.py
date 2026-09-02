@@ -20,12 +20,15 @@ from oink_finai.database.models import (
 )
 from oink_finai.domain.enums import (
     ConversationStatus,
+    ExpenseCategory,
     ExpenseHistoryAction,
+    ExpenseIntent,
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
 )
 from oink_finai.providers.whatsapp import WhatsAppProvider
+from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.gemini_errors import (
@@ -56,6 +59,23 @@ class ErrorInterpreter(ExpenseInterpreter):
 
     async def interpret(self, message: str, *, reference_timestamp: datetime):
         raise self.error
+
+
+class NotExpenseInterpreter(ExpenseInterpreter):
+    async def interpret(self, message: str, *, reference_timestamp: datetime):
+        return ExpenseInterpretation(
+            intent=ExpenseIntent.NOT_EXPENSE,
+            amount=None,
+            amount_evidence=None,
+            description=None,
+            merchant=None,
+            category=ExpenseCategory.OTHER,
+            payment_method=None,
+            expense_date=None,
+            confidence=1,
+            missing_fields=[],
+            reasoning_summary="not an expense",
+        )
 
 
 async def seed_processing_message(
@@ -402,6 +422,16 @@ async def test_postgres_concurrent_delete_confirmations_delete_once() -> None:
             assert saved is not None and saved.deleted_at is not None
             assert history_count == 1
             assert confirmation_count == 1
+            state_values = (
+                await session.execute(
+                    text(
+                        "SELECT context IS NULL, context::text, active_expense_id IS NULL, "
+                        "expires_at IS NULL FROM conversation_states WHERE user_id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                )
+            ).one()
+            assert state_values == (True, None, True, True)
     finally:
         async with factory() as session, session.begin():
             await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
@@ -417,4 +447,84 @@ async def test_postgres_concurrent_delete_confirmations_delete_once() -> None:
             )
             await session.execute(delete(User).where(User.id == user_id))
             await session.execute(delete(Category).where(Category.slug == f"delete-{unique}"))
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("incoming_text", ["cancelar", "mensagem normal sem gasto"])
+async def test_postgres_idle_resets_store_sql_nulls(incoming_text: str) -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    unique = uuid4().hex
+    now = datetime.now(UTC)
+    async with factory() as session, session.begin():
+        user = User(phone_number=f"reset-{unique[:20]}")
+        category = Category(name=f"Reset test {unique}", slug=f"reset-{unique}")
+        session.add_all([user, category])
+        await session.flush()
+        expense = Expense(
+            user_id=user.id,
+            category_id=category.id,
+            amount=Decimal("10.00"),
+            description="Pending deletion",
+            expense_date=date.today(),
+        )
+        session.add(expense)
+        await session.flush()
+        state = ConversationState(
+            user_id=user.id,
+            status=ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM,
+            active_expense_id=expense.id,
+            context={"action": "DELETE", "expense_id": str(expense.id)},
+            expires_at=now + timedelta(minutes=10),
+        )
+        message = ProcessedMessage(
+            provider="postgres-reset-test",
+            instance_id=unique,
+            external_message_id=unique,
+            user_id=user.id,
+            accepted_text=incoming_text,
+            message_timestamp=now,
+            status=ProcessedMessageStatus.PROCESSING,
+            available_at=now,
+            locked_at=now,
+            processing_attempts=1,
+        )
+        session.add_all([state, message])
+        await session.flush()
+        user_id, expense_id, message_id = user.id, expense.id, message.id
+
+    async with factory() as session:
+        stored_context = await session.scalar(
+            text("SELECT context->>'action' FROM conversation_states WHERE user_id = :user_id"),
+            {"user_id": user_id},
+        )
+        assert stored_context == "DELETE"
+
+    processor = ExpenseProcessingService(factory, lambda _: NotExpenseInterpreter())
+    try:
+        await processor.process(message_id)
+        async with factory() as session:
+            state_values = (
+                await session.execute(
+                    text(
+                        "SELECT status::text, context IS NULL, context::text, "
+                        "active_expense_id IS NULL, expires_at IS NULL "
+                        "FROM conversation_states WHERE user_id = :user_id"
+                    ),
+                    {"user_id": user_id},
+                )
+            ).one()
+            assert state_values == ("IDLE", True, None, True, True)
+    finally:
+        async with factory() as session, session.begin():
+            await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
+            await session.execute(
+                delete(ConversationState).where(ConversationState.user_id == user_id)
+            )
+            await session.execute(delete(Expense).where(Expense.id == expense_id))
+            await session.execute(
+                delete(ProcessedMessage).where(ProcessedMessage.user_id == user_id)
+            )
+            await session.execute(delete(User).where(User.id == user_id))
+            await session.execute(delete(Category).where(Category.slug == f"reset-{unique}"))
         await engine.dispose()

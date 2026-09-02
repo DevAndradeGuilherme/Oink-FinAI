@@ -20,6 +20,7 @@ from oink_finai.providers.whatsapp.evolution import (
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
+from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
 
@@ -65,7 +66,13 @@ async def evolution_webhook(
     message = decision.message
 
     settings = get_settings()
-    accepted_text = (message.text_content or "").strip()
+    if message.interaction_id is not None:
+        command = parse_expense_action(message.interaction_id)
+        if command is None:
+            return WebhookResponse(status="ignored")
+        accepted_text = expense_command_text(command)
+    else:
+        accepted_text = (message.text_content or "").strip()
     if not accepted_text:
         return WebhookResponse(status="ignored")
     accepted_text = accepted_text[: settings.inbound_message_max_length]

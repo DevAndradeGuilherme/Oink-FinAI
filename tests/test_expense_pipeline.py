@@ -29,7 +29,13 @@ from oink_finai.domain.enums import (
     PaymentMethod,
     ProcessedMessageStatus,
 )
-from oink_finai.providers.whatsapp import EvolutionProviderError, WhatsAppProvider
+from oink_finai.providers.whatsapp import (
+    EvolutionProviderError,
+    InteractiveAction,
+    InteractiveMessage,
+    InteractiveMessageUnsupportedError,
+    WhatsAppProvider,
+)
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
@@ -167,17 +173,24 @@ async def test_create_expense_is_idempotent_and_uses_user_timezone(
         assert saved.last_error_code is None
         assert saved.processing_attempts == 1
         assert outbox[0].content == (
-            "✅ Gasto registrado\n\n"
-            " Valor: R$ 42,50\n"
+            "✅ Novo Gasto Registrado!\n\n"
             " Descrição: Mercado\n"
-            f" Categoria: {ExpenseCategory.FOOD.value}\n"
+            f"️ Categoria: {ExpenseCategory.FOOD.value}\n"
+            " Valor: R$ 42,50\n\n"
             " Data: 01/09/2026\n"
-            " Pagamento: Pix\n\n"
-            "✏️ Para editar:\n"
-            f"editar {expenses[0].id}\n\n"
-            "🗑️ Para remover:\n"
-            f"remover {expenses[0].id}"
+            f"⚙️ ID: {str(expenses[0].id)[:8]}\n\n"
+            "Use os botões abaixo para\n"
+            "excluir ou editar."
         )
+        assert outbox[0].content_type == "BUTTONS"
+        assert [action["label"] for action in outbox[0].actions or []] == [
+            "✏️ Editar",
+            "↩️ Excluir",
+        ]
+        assert str(expenses[0].id) not in outbox[0].content
+        assert outbox[0].fallback_content is not None
+        assert f"editar {expenses[0].id}" in outbox[0].fallback_content
+        assert f"remover {expenses[0].id}" in outbox[0].fallback_content
 
     provider = FakeProvider()
     delivery = OutboxDeliveryService(factory, provider)
@@ -820,6 +833,26 @@ class FakeProvider(WhatsAppProvider):
         return self.result
 
 
+class InteractiveFakeProvider(FakeProvider):
+    def __init__(self, interactive_result: str | Exception) -> None:
+        super().__init__("fallback-provider-id")
+        self.interactive_result = interactive_result
+        self.interactive_calls = 0
+        self.text_calls = 0
+        self.interactive_message: InteractiveMessage | None = None
+
+    async def send_text(self, phone_number: str, text: str) -> str | None:
+        self.text_calls += 1
+        return await super().send_text(phone_number, text)
+
+    async def send_interactive(self, phone_number: str, message: InteractiveMessage) -> str | None:
+        self.interactive_calls += 1
+        self.interactive_message = message
+        if isinstance(self.interactive_result, Exception):
+            raise self.interactive_result
+        return self.interactive_result
+
+
 async def seed_outbox(
     factory: async_sessionmaker[AsyncSession],
     status: OutboundMessageStatus = OutboundMessageStatus.PENDING,
@@ -843,7 +876,21 @@ async def seed_outbox(
         )
         session.add(message)
         await session.flush()
-        return message
+    return message
+
+
+async def seed_interactive_outbox(
+    factory: async_sessionmaker[AsyncSession], *, suffix: str
+) -> OutboundMessage:
+    message = await seed_outbox(factory, suffix=suffix)
+    async with factory() as session, session.begin():
+        saved = await session.get(OutboundMessage, message.id)
+        assert saved is not None
+        saved.content = "Title\n\nBody"
+        saved.content_type = "BUTTONS"
+        saved.actions = [{"id": "opaque-id", "label": "Action"}]
+        saved.fallback_content = "Fallback text"
+    return message
 
 
 async def test_outbox_success(factory: async_sessionmaker[AsyncSession]) -> None:
@@ -886,6 +933,44 @@ async def test_ambiguous_timeout_becomes_unknown(
     async with factory() as session:
         saved = await session.get(OutboundMessage, message.id)
         assert saved is not None and saved.status == OutboundMessageStatus.UNKNOWN
+        assert await delivery.claim(1) == []
+
+
+async def test_interactive_deterministic_rejection_falls_back_to_text(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    message = await seed_interactive_outbox(factory, suffix="buttons-fallback")
+    provider = InteractiveFakeProvider(InteractiveMessageUnsupportedError())
+    delivery = OutboxDeliveryService(factory, provider)
+
+    await delivery.send((await delivery.claim(1))[0])
+
+    async with factory() as session:
+        saved = await session.get(OutboundMessage, message.id)
+        assert saved is not None and saved.status is OutboundMessageStatus.SENT
+        assert provider.interactive_calls == 1
+        assert provider.text_calls == 1
+        assert provider.interactive_message == InteractiveMessage(
+            title="Title",
+            body="Body",
+            actions=(InteractiveAction(id="opaque-id", label="Action"),),
+        )
+
+
+async def test_interactive_ambiguous_timeout_is_unknown_without_fallback(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    message = await seed_interactive_outbox(factory, suffix="buttons-timeout")
+    provider = InteractiveFakeProvider(EvolutionProviderError("sanitized", outcome_unknown=True))
+    delivery = OutboxDeliveryService(factory, provider)
+
+    await delivery.send((await delivery.claim(1))[0])
+
+    async with factory() as session:
+        saved = await session.get(OutboundMessage, message.id)
+        assert saved is not None and saved.status is OutboundMessageStatus.UNKNOWN
+        assert provider.interactive_calls == 1
+        assert provider.text_calls == 0
         assert await delivery.claim(1) == []
 
 

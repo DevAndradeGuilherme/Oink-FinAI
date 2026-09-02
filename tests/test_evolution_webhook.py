@@ -3,6 +3,7 @@ import copy
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +21,11 @@ from oink_finai.database.session import get_session
 from oink_finai.domain.enums import ProcessedMessageStatus
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
+from oink_finai.services.expense_commands import (
+    ExpenseCommand,
+    ExpenseCommandType,
+    encode_expense_action,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "evolution"
 SECRET = "sanitized-webhook-secret"
@@ -183,6 +189,62 @@ async def test_webhook_only_persists_accepted_text_and_never_waits_for_gemini(
     original_text = payload["data"]["message"]["conversation"]
     assert saved.accepted_text == original_text[len("!oink ") :]
     assert "must-not-be-persisted" not in repr(saved.__dict__)
+
+
+async def test_interactive_click_is_normalized_before_persistence(
+    webhook_client: TestClient, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WHATSAPP_SELF_TEST_ENABLED", "false")
+    get_settings.cache_clear()
+    expense_id = uuid4()
+    action_id = encode_expense_action(ExpenseCommand(ExpenseCommandType.REMOVE, expense_id))
+    payload = dedicated_payload()
+    payload["data"]["message"] = {
+        "interactiveResponseMessage": {
+            "nativeFlowResponseMessage": {
+                "name": "quick_reply",
+                "paramsJson": json.dumps({"id": action_id, "display_text": "ignored"}),
+            }
+        }
+    }
+    payload["data"]["messageType"] = "interactiveResponseMessage"
+
+    response = post(webhook_client, payload)
+
+    saved = await session.scalar(select(ProcessedMessage))
+    assert response.json() == {"status": "accepted"}
+    assert saved is not None
+    assert saved.accepted_text == f"remover {expense_id}"
+    assert action_id not in repr(saved.__dict__)
+
+
+@pytest.mark.parametrize(
+    "params_json",
+    ["{", "{}", json.dumps({"id": "unknown-action"})],
+)
+async def test_malformed_or_unknown_interactive_click_is_ignored(
+    webhook_client: TestClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    params_json: str,
+) -> None:
+    monkeypatch.setenv("WHATSAPP_SELF_TEST_ENABLED", "false")
+    get_settings.cache_clear()
+    payload = dedicated_payload()
+    payload["data"]["message"] = {
+        "interactiveResponseMessage": {
+            "nativeFlowResponseMessage": {
+                "name": "quick_reply",
+                "paramsJson": params_json,
+            }
+        }
+    }
+    payload["data"]["messageType"] = "interactiveResponseMessage"
+
+    response = post(webhook_client, payload)
+
+    assert response.json() == {"status": "ignored"}
+    assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 0
 
 
 @pytest.mark.parametrize(

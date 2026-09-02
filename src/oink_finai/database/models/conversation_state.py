@@ -21,7 +21,7 @@ class ConversationState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("expenses.id", ondelete="SET NULL")
     )
     context: Mapped[dict[str, object] | None] = mapped_column(
-        JSON().with_variant(JSONB, "postgresql")
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

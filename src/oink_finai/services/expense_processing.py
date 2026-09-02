@@ -39,6 +39,7 @@ from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_commands import (
     ExpenseCommand,
     ExpenseCommandType,
+    encode_expense_action,
     parse_expense_command,
 )
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
@@ -342,6 +343,8 @@ class ExpenseProcessingService:
             content=format_expense_confirmation(expense, category.name),
             kind=OutboundMessageKind.EXPENSE_CONFIRMATION,
             expense=expense,
+            actions=expense_confirmation_actions(expense.id),
+            fallback_content=format_expense_confirmation_fallback(expense, category.name),
         )
 
     @staticmethod
@@ -359,6 +362,8 @@ class ExpenseProcessingService:
         content: str,
         kind: OutboundMessageKind,
         expense: Expense | None,
+        actions: list[dict[str, str]] | None = None,
+        fallback_content: str | None = None,
     ) -> None:
         session.add(
             OutboundMessage(
@@ -366,6 +371,9 @@ class ExpenseProcessingService:
                 expense_id=expense.id if expense else None,
                 destination=message.user.phone_number,
                 content=content,
+                content_type="BUTTONS" if actions else "TEXT",
+                actions=actions,
+                fallback_content=fallback_content,
                 kind=kind,
                 dedup_key=f"processed-message:{message.id}:{kind.value}",
                 status=OutboundMessageStatus.PENDING,
@@ -524,6 +532,8 @@ class ExpenseProcessingService:
             format_delete_confirmation_request(expense),
             OutboundMessageKind.DELETE_CONFIRMATION_REQUEST,
             expense=expense,
+            actions=delete_confirmation_actions(expense.id),
+            fallback_content=format_delete_confirmation_fallback(expense),
         )
 
     async def _confirm_delete(
@@ -625,6 +635,8 @@ class ExpenseProcessingService:
         kind: OutboundMessageKind,
         *,
         expense: Expense | None = None,
+        actions: list[dict[str, str]] | None = None,
+        fallback_content: str | None = None,
     ) -> None:
         self._create_outbox(
             session,
@@ -632,6 +644,8 @@ class ExpenseProcessingService:
             content=content,
             kind=kind,
             expense=expense,
+            actions=actions,
+            fallback_content=fallback_content,
         )
         self._complete_successfully(message, ProcessedMessageStatus.PROCESSED)
 
@@ -704,22 +718,30 @@ class ExpenseProcessingService:
 
 def format_expense_confirmation(expense: Expense, category_name: str) -> str:
     amount = f"{expense.amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
-    payment = expense.payment_method or "Não informado"
     return (
-        "✅ Gasto registrado\n\n"
-        f" Valor: R$ {amount}\n"
+        "✅ Novo Gasto Registrado!\n\n"
         f" Descrição: {expense.description}\n"
-        f" Categoria: {category_name}\n"
+        f"️ Categoria: {category_name}\n"
+        f" Valor: R$ {amount}\n\n"
         f" Data: {expense.expense_date.strftime('%d/%m/%Y')}\n"
-        f" Pagamento: {payment}\n\n"
-        "✏️ Para editar:\n"
-        f"editar {expense.id}\n\n"
-        "🗑️ Para remover:\n"
-        f"remover {expense.id}"
+        f"⚙️ ID: {str(expense.id)[:8]}\n\n"
+        "Use os botões abaixo para\n"
+        "excluir ou editar."
     )
 
 
 def format_delete_confirmation_request(expense: Expense) -> str:
+    amount = f"{expense.amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return (
+        "⚠️ Confirmar remoção?\n\n"
+        f"Valor: R$ {amount}\n"
+        f"Descrição: {expense.description}\n"
+        f"Data: {expense.expense_date.strftime('%d/%m/%Y')}\n\n"
+        "Use os botões abaixo para confirmar ou cancelar."
+    )
+
+
+def format_delete_confirmation_fallback(expense: Expense) -> str:
     amount = f"{expense.amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
     return (
         "⚠️ Confirmar remoção?\n\n"
@@ -731,6 +753,44 @@ def format_delete_confirmation_request(expense: Expense) -> str:
         "Para cancelar:\n"
         "cancelar"
     )
+
+
+def format_expense_confirmation_fallback(expense: Expense, category_name: str) -> str:
+    return (
+        f"{format_expense_confirmation(expense, category_name)}\n\n"
+        "Para editar:\n"
+        f"editar {expense.id}\n\n"
+        "Para remover:\n"
+        f"remover {expense.id}"
+    )
+
+
+def expense_confirmation_actions(expense_id: UUID) -> list[dict[str, str]]:
+    return [
+        {
+            "id": encode_expense_action(ExpenseCommand(ExpenseCommandType.EDIT, expense_id)),
+            "label": "✏️ Editar",
+        },
+        {
+            "id": encode_expense_action(ExpenseCommand(ExpenseCommandType.REMOVE, expense_id)),
+            "label": "↩️ Excluir",
+        },
+    ]
+
+
+def delete_confirmation_actions(expense_id: UUID) -> list[dict[str, str]]:
+    return [
+        {
+            "id": encode_expense_action(
+                ExpenseCommand(ExpenseCommandType.CONFIRM_REMOVE, expense_id)
+            ),
+            "label": "️ Confirmar exclusão",
+        },
+        {
+            "id": encode_expense_action(ExpenseCommand(ExpenseCommandType.CANCEL)),
+            "label": "Cancelar",
+        },
+    ]
 
 
 def expense_history_data(expense: Expense) -> dict[str, object]:

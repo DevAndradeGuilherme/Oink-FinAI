@@ -6,6 +6,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from oink_finai.providers.whatsapp import InteractiveAction, InteractiveMessage
+from oink_finai.providers.whatsapp.base import InteractiveMessageUnsupportedError
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionProviderError,
     EvolutionWebhookInstanceError,
@@ -90,6 +92,61 @@ async def test_parse_supported_text_messages(
     assert message.text_content == expected_text
 
 
+@pytest.mark.parametrize(
+    "interactive_message",
+    [
+        {
+            "interactiveResponseMessage": {
+                "nativeFlowResponseMessage": {
+                    "name": "quick_reply",
+                    "paramsJson": json.dumps({"id": "oink:v1:c", "display_text": "Cancelar"}),
+                }
+            }
+        },
+        {"buttonsResponseMessage": {"selectedButtonId": "oink:v1:c"}},
+        {"templateButtonReplyMessage": {"selectedId": "oink:v1:c"}},
+    ],
+)
+async def test_parse_v237_interactive_responses(interactive_message: dict[str, object]) -> None:
+    payload = load_payload("messages_upsert_conversation.json")
+    payload["data"]["message"] = interactive_message
+    payload["data"]["messageType"] = next(iter(interactive_message))
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid", "sanitized-key", "finance-instance"
+    )
+
+    message = await provider.parse_webhook(payload)
+    await provider.aclose()
+
+    assert message is not None
+    assert message.text_content is None
+    assert message.interaction_id == "oink:v1:c"
+
+
+@pytest.mark.parametrize(
+    "interactive_message",
+    [
+        {"interactiveResponseMessage": {"nativeFlowResponseMessage": {"paramsJson": "{"}}},
+        {"interactiveResponseMessage": {"nativeFlowResponseMessage": {"paramsJson": "{}"}}},
+        {"buttonsResponseMessage": {"selectedButtonId": 7}},
+        {"templateButtonReplyMessage": {}},
+    ],
+)
+async def test_malformed_interactive_responses_have_no_action(
+    interactive_message: dict[str, object],
+) -> None:
+    payload = load_payload("messages_upsert_conversation.json")
+    payload["data"]["message"] = interactive_message
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid", "sanitized-key", "finance-instance"
+    )
+
+    message = await provider.parse_webhook(payload)
+    await provider.aclose()
+
+    assert message is not None and message.interaction_id is None
+
+
 async def test_parse_lid_message_uses_remote_jid_alt_as_phone_number() -> None:
     payload = load_payload("messages_upsert_conversation.json")
     payload["data"]["key"].update(
@@ -152,6 +209,94 @@ async def test_send_text_uses_v237_contract() -> None:
     assert "apikey" not in client.headers
     assert not client.is_closed
     await client.aclose()
+
+
+async def test_send_interactive_uses_v237_baileys_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"key": {"id": "sent-id"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid", "sanitized-key", "finance-instance", client=client
+    )
+    message = InteractiveMessage(
+        title="Título",
+        body="Corpo",
+        actions=(
+            InteractiveAction(id="opaque-edit", label="✏️ Editar"),
+            InteractiveAction(id="opaque-delete", label="↩️ Excluir"),
+        ),
+    )
+
+    result = await provider.send_interactive("5511999999999", message)
+    await client.aclose()
+
+    assert result == "sent-id"
+    assert requests[0].url == httpx.URL(
+        "https://evolution.invalid/message/sendButtons/finance-instance"
+    )
+    assert json.loads(requests[0].content) == {
+        "number": "5511999999999",
+        "title": "Título",
+        "description": "Corpo",
+        "buttons": [
+            {"type": "reply", "displayText": "✏️ Editar", "id": "opaque-edit"},
+            {"type": "reply", "displayText": "↩️ Excluir", "id": "opaque-delete"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 405, 422])
+async def test_send_interactive_reports_deterministic_rejection(status_code: int) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid", "sanitized-key", "finance-instance", client=client
+    )
+    message = InteractiveMessage(
+        title="Title",
+        body="Body",
+        actions=(InteractiveAction(id="opaque", label="Action"),),
+    )
+
+    with pytest.raises(InteractiveMessageUnsupportedError):
+        await provider.send_interactive("5511999999999", message)
+    await client.aclose()
+
+
+async def test_send_interactive_timeout_is_ambiguous_without_retry() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("ambiguous", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = EvolutionWhatsAppProvider(
+        "https://evolution.invalid",
+        "sanitized-key",
+        "finance-instance",
+        max_retries=3,
+        client=client,
+    )
+    message = InteractiveMessage(
+        title="Title",
+        body="Body",
+        actions=(InteractiveAction(id="opaque", label="Action"),),
+    )
+
+    with pytest.raises(EvolutionProviderError) as caught:
+        await provider.send_interactive("5511999999999", message)
+    await client.aclose()
+
+    assert attempts == 1
+    assert caught.value.outcome_unknown is True
 
 
 async def test_provider_closes_client_it_creates() -> None:

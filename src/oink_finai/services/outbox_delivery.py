@@ -8,13 +8,29 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from oink_finai.database.models import OutboundMessage
 from oink_finai.domain.enums import OutboundMessageStatus
-from oink_finai.providers.whatsapp import EvolutionProviderError, WhatsAppProvider
+from oink_finai.providers.whatsapp import (
+    EvolutionProviderError,
+    InteractiveAction,
+    InteractiveMessage,
+    InteractiveMessageUnsupportedError,
+    WhatsAppProvider,
+)
 
 
 @dataclass(frozen=True)
 class OutboundMessageClaim:
     message_id: UUID
     claim_token: UUID
+
+
+@dataclass(frozen=True)
+class OutboundDeliveryData:
+    destination: str
+    content: str
+    content_type: str
+    actions: tuple[InteractiveAction, ...]
+    fallback_content: str | None
+    attempt_count: int
 
 
 class OutboxDeliveryService:
@@ -59,10 +75,8 @@ class OutboxDeliveryService:
         message = await self._start_sending(claim)
         if message is None:
             return
-        destination, content, attempt_count = message
-
         try:
-            provider_message_id = await self._provider.send_text(destination, content)
+            provider_message_id = await self._deliver(message)
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
@@ -71,8 +85,8 @@ class OutboxDeliveryService:
         except EvolutionProviderError as exc:
             if exc.outcome_unknown:
                 await self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
-            elif attempt_count < self._max_attempts:
-                await self._retry(claim, attempt_count)
+            elif message.attempt_count < self._max_attempts:
+                await self._retry(claim, message.attempt_count)
             else:
                 await self._finish(claim, OutboundMessageStatus.FAILED, "SEND_UNAVAILABLE")
             return
@@ -97,7 +111,23 @@ class OutboxDeliveryService:
                 )
             )
 
-    async def _start_sending(self, claim: OutboundMessageClaim) -> tuple[str, str, int] | None:
+    async def _deliver(self, message: OutboundDeliveryData) -> str | None:
+        if message.content_type != "BUTTONS":
+            return await self._provider.send_text(message.destination, message.content)
+        title, separator, body = message.content.partition("\n\n")
+        interactive = InteractiveMessage(
+            title=title,
+            body=body if separator else "",
+            actions=message.actions,
+        )
+        try:
+            return await self._provider.send_interactive(message.destination, interactive)
+        except InteractiveMessageUnsupportedError:
+            if message.fallback_content is None:
+                raise EvolutionProviderError("Interactive message is unsupported") from None
+            return await self._provider.send_text(message.destination, message.fallback_content)
+
+    async def _start_sending(self, claim: OutboundMessageClaim) -> OutboundDeliveryData | None:
         async with self._session_factory() as session, session.begin():
             message = await session.scalar(
                 select(OutboundMessage)
@@ -113,7 +143,18 @@ class OutboxDeliveryService:
             message.status = OutboundMessageStatus.SENDING
             message.sending_at = datetime.now(UTC)
             message.attempt_count += 1
-            return message.destination, message.content, message.attempt_count
+            actions = tuple(
+                InteractiveAction(id=action["id"], label=action["label"])
+                for action in (message.actions or [])
+            )
+            return OutboundDeliveryData(
+                destination=message.destination,
+                content=message.content,
+                content_type=message.content_type,
+                actions=actions,
+                fallback_content=message.fallback_content,
+                attempt_count=message.attempt_count,
+            )
 
     async def _retry(self, claim: OutboundMessageClaim, attempt_count: int) -> None:
         await self._transition(

@@ -88,3 +88,5 @@ async def test_conversation_state_defaults_to_idle(session: AsyncSession) -> Non
 
     assert state.status is ConversationStatus.IDLE
     assert state.active_expense_id is None
+    assert state.context is None
+    assert state.expires_at is None

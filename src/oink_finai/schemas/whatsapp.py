@@ -16,4 +16,5 @@ class InboundWhatsAppMessage(BaseModel):
     from_me: bool
     message_type: str
     text_content: str | None
+    interaction_id: str | None = None
     timestamp: datetime

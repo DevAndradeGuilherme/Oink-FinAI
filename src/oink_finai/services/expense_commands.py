@@ -22,6 +22,14 @@ COMMANDS_WITH_UUID = {
     "confirmar-remocao": ExpenseCommandType.CONFIRM_REMOVE,
     "editar": ExpenseCommandType.EDIT,
 }
+ACTION_ID_PREFIX = "oink:v1"
+ACTION_CODES = {
+    ExpenseCommandType.EDIT: "e",
+    ExpenseCommandType.REMOVE: "r",
+    ExpenseCommandType.CONFIRM_REMOVE: "rc",
+    ExpenseCommandType.CANCEL: "c",
+}
+ACTION_TYPES = {code: command_type for command_type, code in ACTION_CODES.items()}
 
 
 def parse_expense_command(text: str) -> ExpenseCommand | None:
@@ -45,3 +53,52 @@ def parse_expense_command(text: str) -> ExpenseCommand | None:
     if str(expense_id) != parts[1].lower():
         return ExpenseCommand(ExpenseCommandType.INVALID)
     return ExpenseCommand(command_type, expense_id)
+
+
+def encode_expense_action(command: ExpenseCommand) -> str:
+    code = ACTION_CODES.get(command.type)
+    if code is None:
+        raise ValueError("unsupported interactive action")
+    if command.type is ExpenseCommandType.CANCEL:
+        if command.expense_id is not None:
+            raise ValueError("cancel action must not contain an expense id")
+        return f"{ACTION_ID_PREFIX}:{code}"
+    if command.expense_id is None:
+        raise ValueError("interactive action requires an expense id")
+    return f"{ACTION_ID_PREFIX}:{code}:{command.expense_id}"
+
+
+def parse_expense_action(action_id: str) -> ExpenseCommand | None:
+    parts = action_id.split(":")
+    if len(parts) not in {3, 4} or parts[:2] != ["oink", "v1"]:
+        return None
+    command_type = ACTION_TYPES.get(parts[2])
+    if command_type is None:
+        return None
+    if command_type is ExpenseCommandType.CANCEL:
+        return ExpenseCommand(command_type) if len(parts) == 3 else None
+    if len(parts) != 4:
+        return None
+    try:
+        expense_id = UUID(parts[3])
+    except ValueError:
+        return None
+    if str(expense_id) != parts[3].lower():
+        return None
+    return ExpenseCommand(command_type, expense_id)
+
+
+def expense_command_text(command: ExpenseCommand) -> str:
+    if command.type is ExpenseCommandType.CANCEL:
+        return "cancelar"
+    if command.expense_id is None:
+        raise ValueError("command requires an expense id")
+    keywords = {
+        ExpenseCommandType.REMOVE: "remover",
+        ExpenseCommandType.CONFIRM_REMOVE: "confirmar-remocao",
+        ExpenseCommandType.EDIT: "editar",
+    }
+    keyword = keywords.get(command.type)
+    if keyword is None:
+        raise ValueError("unsupported command")
+    return f"{keyword} {command.expense_id}"
