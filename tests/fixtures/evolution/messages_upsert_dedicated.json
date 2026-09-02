@@ -1,0 +1,19 @@
+{
+  "event": "messages.upsert",
+  "instance": "finance-instance",
+  "data": {
+    "key": {
+      "remoteJid": "5511999999999@s.whatsapp.net",
+      "remoteJidAlt": "5511999999999@s.whatsapp.net",
+      "fromMe": false,
+      "id": "DEDICATED-INBOUND-001"
+    },
+    "message": {
+      "conversation": "Almoco 42,50"
+    },
+    "messageType": "conversation",
+    "messageTimestamp": 1788278400,
+    "instanceId": "finance-instance"
+  },
+  "date_time": "2026-09-01T12:00:00.000Z"
+}

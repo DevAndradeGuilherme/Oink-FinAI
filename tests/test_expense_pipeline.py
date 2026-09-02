@@ -175,6 +175,16 @@ async def test_create_expense_is_idempotent_and_uses_user_timezone(
             " Pagamento: Pix"
         )
 
+    provider = FakeProvider()
+    delivery = OutboxDeliveryService(factory, provider)
+    claim = (await delivery.claim(1))[0]
+    await delivery.send(claim)
+    await delivery.send(claim)
+
+    async with factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Expense)) == 1
+        assert provider.calls == 1
+
 
 @pytest.mark.parametrize(
     ("changes", "error_code"),

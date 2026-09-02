@@ -129,7 +129,9 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         if not all(isinstance(value, str) and value for value in (external_id, remote_jid)):
             return None
 
-        from_me = bool(key.get("fromMe", False))
+        from_me = key.get("fromMe")
+        if not isinstance(from_me, bool):
+            return None
         remote_jid_alt = self._first_string(
             key, data, names=("remoteJidAlt", "remoteJidAlternative")
         )
