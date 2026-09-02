@@ -70,7 +70,7 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         if self._owns_client:
             await self._client.aclose()
 
-    async def send_text(self, phone_number: str, text: str) -> None:
+    async def send_text(self, phone_number: str, text: str) -> str | None:
         url = f"{self._base_url}/message/sendText/{quote(self._instance, safe='')}"
         for attempt in range(self._max_retries + 1):
             try:
@@ -81,7 +81,12 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
                     timeout=self._timeout_seconds,
                 )
                 response.raise_for_status()
-                return
+                try:
+                    body = response.json()
+                except ValueError:
+                    return None
+                key = body.get("key") if isinstance(body, dict) else None
+                return key.get("id") if isinstance(key, dict) else None
             except httpx.HTTPStatusError:
                 raise EvolutionProviderError(
                     "Evolution send result is unknown after an HTTP response",

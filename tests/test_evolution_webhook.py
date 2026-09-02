@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from oink_finai.config.settings import get_settings
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
+from oink_finai.domain.enums import ProcessedMessageStatus
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
 
@@ -85,6 +87,34 @@ async def test_accepts_supported_text_and_records_processed_message(
     assert response.json() == {"status": "accepted"}
     count = await session.scalar(select(func.count()).select_from(ProcessedMessage))
     assert count == 1
+
+
+async def test_webhook_only_persists_accepted_text_and_never_waits_for_gemini(
+    webhook_client: TestClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def forbidden_interpretation(*_args: object, **_kwargs: object) -> None:
+        await asyncio.sleep(10)
+        raise AssertionError("webhook called Gemini")
+
+    monkeypatch.setattr(
+        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        forbidden_interpretation,
+    )
+    payload = authorized_payload()
+    payload["private_raw_field"] = "must-not-be-persisted"
+
+    response = post(webhook_client, payload)
+
+    saved = await session.scalar(select(ProcessedMessage))
+    assert response.status_code == 200
+    assert response.json() == {"status": "accepted"}
+    assert saved is not None
+    assert saved.status == ProcessedMessageStatus.PENDING
+    original_text = payload["data"]["message"]["conversation"]
+    assert saved.accepted_text == original_text[len("!oink ") :]
+    assert "must-not-be-persisted" not in repr(saved.__dict__)
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     whatsapp_self_test_enabled: bool = False
     whatsapp_self_test_number: str | None = Field(default=None, repr=False)
     whatsapp_self_test_prefix: str = "!oink"
+    inbound_message_max_length: int = Field(default=2000, ge=1, le=10000)
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    worker_batch_size: int = Field(default=10, ge=1, le=100)
+    worker_processing_lock_timeout_seconds: float = Field(default=300.0, gt=0)
+    gemini_max_attempts: int = Field(default=3, ge=1, le=5)
+    gemini_retry_base_seconds: float = Field(default=0.5, gt=0)
+    gemini_retry_max_seconds: float = Field(default=5.0, gt=0)
+    outbox_max_attempts: int = Field(default=3, ge=1, le=10)
+    outbox_retry_base_seconds: float = Field(default=1.0, gt=0)
+    outbox_state_timeout_seconds: float = Field(default=300.0, gt=0)
+    evolution_timeout_seconds: float = Field(default=10.0, gt=0)
 
     @property
     def whatsapp_allowed_number_set(self) -> frozenset[str]:

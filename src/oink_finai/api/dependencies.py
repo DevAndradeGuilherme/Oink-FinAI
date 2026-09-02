@@ -19,6 +19,8 @@ async def get_evolution_provider() -> AsyncIterator[EvolutionWhatsAppProvider]:
         base_url=settings.evolution_base_url,
         api_key=settings.evolution_api_key,
         instance=settings.evolution_instance,
+        timeout_seconds=settings.evolution_timeout_seconds,
+        max_retries=0,
     )
     try:
         yield provider

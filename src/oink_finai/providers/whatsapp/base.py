@@ -9,5 +9,5 @@ class WhatsAppProvider(ABC):
         """Convert provider payload into the internal message contract."""
 
     @abstractmethod
-    async def send_text(self, phone_number: str, text: str) -> None:
+    async def send_text(self, phone_number: str, text: str) -> str | None:
         """Send a text message through the configured provider."""

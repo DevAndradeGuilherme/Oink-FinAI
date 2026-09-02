@@ -43,3 +43,26 @@ class PaymentMethod(StrEnum):
     TRANSFER = "Transferência"
     BOLETO = "Boleto"
     OTHER = "Outro"
+
+
+class ProcessedMessageStatus(StrEnum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    PROCESSED = "PROCESSED"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    NOT_EXPENSE = "NOT_EXPENSE"
+    FAILED = "FAILED"
+
+
+class OutboundMessageStatus(StrEnum):
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    UNKNOWN = "UNKNOWN"
+    FAILED = "FAILED"
+
+
+class OutboundMessageKind(StrEnum):
+    EXPENSE_CONFIRMATION = "EXPENSE_CONFIRMATION"
+    CLARIFICATION = "CLARIFICATION"

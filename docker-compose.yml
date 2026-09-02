@@ -14,6 +14,16 @@ services:
       redis:
         condition: service_healthy
 
+  worker:
+    build: .
+    env_file: .env
+    command: python -m oink_finai.worker
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
     env_file: .env
@@ -39,4 +49,3 @@ services:
 
 volumes:
   postgres_data:
-

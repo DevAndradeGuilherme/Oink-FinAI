@@ -18,17 +18,23 @@ async def persist_expense_dependencies(session: AsyncSession) -> tuple[User, Cat
 
 
 @pytest.mark.asyncio
-async def test_expense_requires_decimal_and_normalizes_scale(session: AsyncSession) -> None:
+async def test_expense_requires_decimal_and_rejects_excess_scale(session: AsyncSession) -> None:
     user, category = await persist_expense_dependencies(session)
+    with pytest.raises(ValueError, match="decimal places"):
+        Expense(
+            user_id=user.id,
+            category_id=category.id,
+            amount=Decimal("12.345"),
+            description="Almoço",
+            expense_date=date(2026, 9, 1),
+        )
     expense = Expense(
         user_id=user.id,
         category_id=category.id,
-        amount=Decimal("12.345"),
+        amount=Decimal("12.34"),
         description="Almoço",
         expense_date=date(2026, 9, 1),
     )
-
-    assert expense.amount == Decimal("12.34")
 
     with pytest.raises(TypeError, match="Decimal"):
         expense.amount = 12.34  # type: ignore[assignment]
