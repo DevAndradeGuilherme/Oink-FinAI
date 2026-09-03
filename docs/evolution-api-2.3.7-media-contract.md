@@ -31,3 +31,15 @@ Arquivos oficiais inspecionados: `src/api/types/wa.types.ts`,
 `src/api/dto/chat.dto.ts`, `src/api/routes/chat.router.ts`, `src/api/guards/auth.guard.ts`,
 `src/api/guards/instance.guard.ts` e
 `src/api/integrations/event/webhook/webhook.controller.ts`.
+
+## Retenção para processamento durável
+
+O webhook persiste somente o `id` externo, o `remoteJid` original exigido pela recuperação,
+`fromMe=false`, MIME, duração e indicação PTT. Essa referência existe exclusivamente para o
+worker recuperar a mídia depois da resposta do webhook. Payload bruto, `mediaKey`, bytes,
+base64, URLs, `remoteJidAlt` e `participant` não são persistidos.
+
+O `remoteJid` é removido após o transcript ser confirmado no banco, em falhas terminais e no
+esgotamento de tentativas. Ele permanece apenas durante retries duráveis de download ou
+transcrição. O transcript, limitado a 10.000 caracteres, ocupa `accepted_text`; o checkpoint
+`transcribed_at` impede novo download ou nova transcrição após uma retomada.

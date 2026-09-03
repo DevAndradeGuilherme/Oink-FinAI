@@ -14,9 +14,10 @@ from oink_finai.database.models.conversation_state import ConversationState
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import ProcessedMessageStatus
+from oink_finai.domain.enums import MessageSourceType, ProcessedMessageStatus
 from oink_finai.providers.whatsapp.access import filter_inbound_message
 from oink_finai.providers.whatsapp.evolution import (
+    EvolutionMediaReference,
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
@@ -65,20 +66,25 @@ async def evolution_webhook(
         return WebhookResponse(status="ignored")
     message = decision.message
 
-    # Phase 1 recognizes audio but intentionally keeps it outside persistence, workers,
-    # financial interpretation, and the outbound response pipeline.
-    if message.media is not None:
-        return WebhookResponse(status="ignored")
-
     settings = get_settings()
-    if message.interaction_id is not None:
+    media = message.media
+    media_reference: EvolutionMediaReference | None = None
+    if media is not None:
+        if not isinstance(media.reference, EvolutionMediaReference):
+            return WebhookResponse(status="ignored")
+        media_reference = media.reference
+        accepted_text = ""
+        source_type = MessageSourceType.AUDIO
+    elif message.interaction_id is not None:
         command = parse_expense_action(message.interaction_id)
         if command is None:
             return WebhookResponse(status="ignored")
         accepted_text = expense_command_text(command)
+        source_type = MessageSourceType.TEXT
     else:
         accepted_text = (message.text_content or "").strip()
-    if not accepted_text:
+        source_type = MessageSourceType.TEXT
+    if source_type is MessageSourceType.TEXT and not accepted_text:
         return WebhookResponse(status="ignored")
     accepted_text = accepted_text[: settings.inbound_message_max_length]
 
@@ -106,6 +112,13 @@ async def evolution_webhook(
                 external_message_id=message.external_message_id,
                 user_id=user.id,
                 accepted_text=accepted_text,
+                source_type=source_type,
+                media_remote_jid=(media_reference.remote_jid if media_reference else None),
+                media_mime_type=(
+                    media.declared_mime_type.partition(";")[0].strip().lower() if media else None
+                ),
+                media_duration_seconds=(media.declared_duration_seconds if media else None),
+                media_is_voice_note=(media.is_voice_note if media else None),
                 message_timestamp=message.timestamp,
                 status=ProcessedMessageStatus.PENDING,
                 available_at=datetime.now(UTC),

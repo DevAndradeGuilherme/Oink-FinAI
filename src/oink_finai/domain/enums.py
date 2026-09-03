@@ -56,6 +56,11 @@ class ProcessedMessageStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class MessageSourceType(StrEnum):
+    TEXT = "TEXT"
+    AUDIO = "AUDIO"
+
+
 class OutboundMessageStatus(StrEnum):
     PENDING = "PENDING"
     CLAIMED = "CLAIMED"

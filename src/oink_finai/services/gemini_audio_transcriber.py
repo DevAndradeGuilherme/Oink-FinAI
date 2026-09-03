@@ -67,6 +67,7 @@ class GeminiAudioTranscriber(AudioTranscriber):
         self._timeout_seconds = timeout_seconds
         self._max_audio_bytes = max_audio_bytes
         self._max_duration_seconds = max_duration_seconds
+        self._owns_client = client is None
         self._client = client or genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
@@ -74,6 +75,10 @@ class GeminiAudioTranscriber(AudioTranscriber):
                 retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aio.aclose()
 
     async def transcribe(self, audio: ValidatedAudio) -> AudioTranscription:
         mime_type = self._validate_audio(audio)

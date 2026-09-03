@@ -278,7 +278,7 @@ async def test_download_timeout_is_single_transient_attempt() -> None:
     assert "private content" not in str(caught.value)
 
 
-async def test_audio_webhook_is_not_persisted_or_sent(
+async def test_audio_webhook_persists_only_durable_pending_reference(
     audio_webhook_client: TestClient, session: AsyncSession
 ) -> None:
     response = audio_webhook_client.post(
@@ -286,9 +286,18 @@ async def test_audio_webhook_is_not_persisted_or_sent(
         json=load_audio(),
         headers={"X-Evolution-Webhook-Secret": "sanitized-webhook-secret"},
     )
-    assert response.status_code == 200 and response.json() == {"status": "ignored"}
-    for model in (User, ProcessedMessage, Expense, OutboundMessage):
-        assert await session.scalar(select(func.count()).select_from(model)) == 0
+    assert response.status_code == 200 and response.json() == {"status": "accepted"}
+    assert await session.scalar(select(func.count()).select_from(User)) == 1
+    assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 1
+    assert await session.scalar(select(func.count()).select_from(Expense)) == 0
+    assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 0
+    message = await session.scalar(select(ProcessedMessage))
+    assert message is not None
+    assert message.source_type == "AUDIO"
+    assert message.accepted_text == ""
+    assert message.media_remote_jid == "5511999999999@s.whatsapp.net"
+    assert message.media_mime_type == "audio/ogg"
+    assert message.transcribed_at is None
 
 
 @pytest.mark.parametrize(
