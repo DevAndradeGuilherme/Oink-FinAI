@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     outbox_retry_base_seconds: float = Field(default=1.0, gt=0)
     outbox_state_timeout_seconds: float = Field(default=300.0, gt=0)
     evolution_timeout_seconds: float = Field(default=10.0, gt=0)
+    evolution_media_timeout_seconds: float = Field(default=15.0, gt=0)
+    media_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    media_max_duration_seconds: int = Field(default=300, gt=0)
     expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0)
 
     @property

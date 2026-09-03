@@ -7,6 +7,7 @@ from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
 from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
 from oink_finai.services.expense_processing import ExpenseProcessingService
+from oink_finai.services.gemini_audio_transcriber import GeminiAudioTranscriber
 from oink_finai.services.gemini_expense_interpreter import GeminiExpenseInterpreter
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 
@@ -34,6 +35,23 @@ async def run_worker() -> None:
         except NotImplementedError:
             signal.signal(signal_name, lambda *_: loop.call_soon_threadsafe(stop.set))
 
+    provider = EvolutionWhatsAppProvider(
+        settings.evolution_base_url,
+        settings.evolution_api_key,
+        settings.evolution_instance,
+        timeout_seconds=settings.evolution_timeout_seconds,
+        media_timeout_seconds=settings.evolution_media_timeout_seconds,
+        media_max_bytes=settings.media_max_bytes,
+        media_max_duration_seconds=settings.media_max_duration_seconds,
+        max_retries=0,
+    )
+    audio_transcriber = GeminiAudioTranscriber(
+        api_key=settings.gemini_api_key,
+        model=settings.gemini_model,
+        timeout_seconds=settings.gemini_timeout_seconds,
+        max_audio_bytes=settings.media_max_bytes,
+        max_duration_seconds=settings.media_max_duration_seconds,
+    )
     processing = ExpenseProcessingService(
         SessionFactory,
         lambda timezone: GeminiExpenseInterpreter(
@@ -46,13 +64,8 @@ async def run_worker() -> None:
         retry_base_seconds=settings.expense_retry_base_seconds,
         retry_max_seconds=settings.expense_retry_max_seconds,
         delete_confirmation_ttl_seconds=settings.expense_delete_confirmation_ttl_seconds,
-    )
-    provider = EvolutionWhatsAppProvider(
-        settings.evolution_base_url,
-        settings.evolution_api_key,
-        settings.evolution_instance,
-        timeout_seconds=settings.evolution_timeout_seconds,
-        max_retries=0,
+        media_provider=provider,
+        audio_transcriber_factory=lambda: audio_transcriber,
     )
     delivery = OutboxDeliveryService(
         SessionFactory,
@@ -84,6 +97,7 @@ async def run_worker() -> None:
             except TimeoutError:
                 pass
     finally:
+        await audio_transcriber.aclose()
         await provider.aclose()
         await engine.dispose()
 

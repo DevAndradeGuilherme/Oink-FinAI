@@ -1,0 +1,25 @@
+{
+  "event": "messages.upsert",
+  "instance": "finance-instance",
+  "data": {
+    "key": {
+      "remoteJid": "5511999999999@s.whatsapp.net",
+      "fromMe": false,
+      "id": "AUDIO-WRAPPED-001"
+    },
+    "message": {
+      "ephemeralMessage": {
+        "message": {
+          "audioMessage": {
+            "mimetype": "audio/ogg; codecs=opus",
+            "seconds": 8,
+            "ptt": true,
+            "mediaKey": {"0": 77}
+          }
+        }
+      }
+    },
+    "messageType": "ephemeralMessage",
+    "messageTimestamp": 1700000002
+  }
+}

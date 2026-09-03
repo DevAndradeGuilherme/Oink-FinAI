@@ -24,6 +24,7 @@ from oink_finai.domain.enums import (
     ConversationStatus,
     ExpenseHistoryAction,
     ExpenseIntent,
+    MessageSourceType,
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
@@ -35,7 +36,12 @@ from oink_finai.domain.expense_limits import (
     EXPENSE_MERCHANT_MAX_LENGTH,
     EXPENSE_PAYMENT_METHOD_MAX_LENGTH,
 )
+from oink_finai.providers.whatsapp.base import WhatsAppProvider
+from oink_finai.providers.whatsapp.evolution import EvolutionMediaReference
+from oink_finai.providers.whatsapp.media_errors import MediaError
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
+from oink_finai.schemas.whatsapp import InboundMedia
+from oink_finai.services.audio_transcriber import AudioTranscriber, ValidatedAudio
 from oink_finai.services.expense_commands import (
     ExpenseCommand,
     ExpenseCommandType,
@@ -55,10 +61,17 @@ from oink_finai.services.gemini_errors import (
     GeminiTimeoutError,
     GeminiUnavailableError,
 )
+from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
 
 CLARIFICATION_TEXT = "Não encontrei o valor. Envie novamente incluindo o valor do gasto."
 PROCESSING_FAILURE_TEXT = (
     "⚠️ Não consegui registrar esse gasto agora. Envie a mensagem novamente em alguns minutos."
+)
+AUDIO_NO_SPEECH_TEXT = (
+    "Não consegui identificar uma fala nesse áudio. Envie outro áudio ou escreva o gasto."
+)
+AUDIO_INVALID_TEXT = (
+    "Não consegui processar esse áudio. Envie novamente como mensagem de voz ou escreva o gasto."
 )
 EXPENSE_NOT_FOUND_TEXT = "Gasto não encontrado ou indisponível."
 INVALID_COMMAND_TEXT = "Comando inválido. Use o UUID completo, sem texto adicional."
@@ -93,6 +106,8 @@ class ExpenseProcessingService:
         jitter: Callable[[], float] = random.random,
         clock: Callable[[], datetime] = utc_now,
         delete_confirmation_ttl_seconds: float = 600.0,
+        media_provider: WhatsAppProvider | None = None,
+        audio_transcriber_factory: Callable[[], AudioTranscriber] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._interpreter_factory = interpreter_factory
@@ -102,6 +117,8 @@ class ExpenseProcessingService:
         self._jitter = jitter
         self._clock = clock
         self._delete_confirmation_ttl = timedelta(seconds=delete_confirmation_ttl_seconds)
+        self._media_provider = media_provider
+        self._audio_transcriber_factory = audio_transcriber_factory
 
     async def recover_stale(self, older_than: datetime) -> int:
         now = self._now()
@@ -180,6 +197,7 @@ class ExpenseProcessingService:
         message.last_error_code = "PROCESSING_ATTEMPTS_EXHAUSTED"
         message.locked_at = None
         message.next_attempt_at = None
+        message.media_remote_jid = None
         user = await session.get(User, message.user_id)
         await self._create_failure_notification(session, message, user)
 
@@ -195,6 +213,20 @@ class ExpenseProcessingService:
             text = message.accepted_text
             timestamp = message.message_timestamp
             timezone = user.timezone
+            source_type = message.source_type
+            transcribed_at = message.transcribed_at
+
+        if source_type == MessageSourceType.AUDIO and transcribed_at is None:
+            text = await self._transcribe_audio(message_id)
+            if text is None:
+                return
+        if not text:
+            await self._mark_audio_failed(
+                message_id,
+                "TRANSCRIPTION_INVALID_RESPONSE",
+                AUDIO_INVALID_TEXT,
+            )
+            return
 
         command = parse_expense_command(text)
         if command is not None:
@@ -324,6 +356,7 @@ class ExpenseProcessingService:
             expense_date=expense_date,
             merchant=result.merchant,
             payment_method=result.payment_method.value if result.payment_method else None,
+            source_type=message.source_type,
         )
         session.add(expense)
         await session.flush()
@@ -388,6 +421,7 @@ class ExpenseProcessingService:
                 message.last_error_code = code
                 message.locked_at = None
                 message.next_attempt_at = None
+                message.media_remote_jid = None
                 message.attempt_count += 1
 
     async def _retry_or_fail(self, message_id: UUID, code: str) -> None:
@@ -402,11 +436,99 @@ class ExpenseProcessingService:
             if message.processing_attempts >= self._max_attempts:
                 message.status = ProcessedMessageStatus.FAILED
                 message.next_attempt_at = None
+                message.media_remote_jid = None
                 user = await session.get(User, message.user_id)
                 await self._create_failure_notification(session, message, user)
                 return
             message.status = ProcessedMessageStatus.PENDING
             message.next_attempt_at = self._now() + self._retry_delay(message.processing_attempts)
+
+    async def _transcribe_audio(self, message_id: UUID) -> str | None:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return None
+            if message.transcribed_at is not None:
+                return message.accepted_text
+            if (
+                self._media_provider is None
+                or self._audio_transcriber_factory is None
+                or not message.media_remote_jid
+                or not message.media_mime_type
+            ):
+                await self._mark_audio_failed(
+                    message_id, "MEDIA_CONFIGURATION_ERROR", AUDIO_INVALID_TEXT
+                )
+                return None
+            reference = EvolutionMediaReference(
+                message.external_message_id,
+                message.media_remote_jid,
+                False,
+            )
+            media = InboundMedia(
+                media_type="audio",
+                declared_mime_type=message.media_mime_type,
+                declared_duration_seconds=message.media_duration_seconds,
+                is_voice_note=bool(message.media_is_voice_note),
+                reference=reference,
+            )
+
+        try:
+            content = await self._media_provider.download_media(media)
+            transcription = await self._audio_transcriber_factory().transcribe(
+                ValidatedAudio(
+                    content=content,
+                    mime_type=media.declared_mime_type,
+                    declared_duration_seconds=media.declared_duration_seconds,
+                    is_voice_note=media.is_voice_note,
+                )
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._retry_or_fail(message_id, "AUDIO_PROCESSING_INTERRUPTED"))
+            raise
+        except MediaError as exc:
+            if exc.transient:
+                await self._retry_or_fail(message_id, exc.code.value)
+            else:
+                await self._mark_audio_failed(message_id, exc.code.value, AUDIO_INVALID_TEXT)
+            return None
+        except NoSpeechError as exc:
+            await self._mark_audio_failed(message_id, exc.code.value, AUDIO_NO_SPEECH_TEXT)
+            return None
+        except TranscriptionError as exc:
+            if exc.transient:
+                await self._retry_or_fail(message_id, exc.code.value)
+            else:
+                await self._mark_audio_failed(message_id, exc.code.value, AUDIO_INVALID_TEXT)
+            return None
+
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return None
+            if message.transcribed_at is None:
+                message.accepted_text = transcription.transcript
+                message.transcribed_at = self._now()
+                message.media_remote_jid = None
+            return message.accepted_text
+
+    async def _mark_audio_failed(self, message_id: UUID, code: str, content: str) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return
+            message.status = ProcessedMessageStatus.FAILED
+            message.error_code = code
+            message.last_error_code = code
+            message.locked_at = None
+            message.next_attempt_at = None
+            message.media_remote_jid = None
+            message.attempt_count += 1
+            await self._create_failure_notification(session, message, message.user, content=content)
 
     @staticmethod
     def _locked_message_statement(message_id: UUID) -> Select[tuple[ProcessedMessage]]:
@@ -417,7 +539,12 @@ class ExpenseProcessingService:
         )
 
     async def _create_failure_notification(
-        self, session: AsyncSession, message: ProcessedMessage, user: User | None
+        self,
+        session: AsyncSession,
+        message: ProcessedMessage,
+        user: User | None,
+        *,
+        content: str = PROCESSING_FAILURE_TEXT,
     ) -> None:
         if user is None or message.user_id is None:
             return
@@ -432,7 +559,7 @@ class ExpenseProcessingService:
                 user_id=message.user_id,
                 expense_id=None,
                 destination=user.phone_number,
-                content=PROCESSING_FAILURE_TEXT,
+                content=content,
                 kind=OutboundMessageKind.PROCESSING_FAILURE,
                 dedup_key=dedup_key,
                 status=OutboundMessageStatus.PENDING,

@@ -7,6 +7,7 @@ from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Numeric, Str
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from oink_finai.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from oink_finai.domain.enums import MessageSourceType
 from oink_finai.domain.expense_limits import (
     EXPENSE_AMOUNT_MAX,
     EXPENSE_AMOUNT_PRECISION,
@@ -25,7 +26,10 @@ if TYPE_CHECKING:
 
 class Expense(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "expenses"
-    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint("source_type IN ('TEXT', 'AUDIO')", name="expense_source_type_valid"),
+    )
 
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     processed_message_id: Mapped[UUID | None] = mapped_column(
@@ -39,6 +43,9 @@ class Expense(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     expense_date: Mapped[date] = mapped_column(Date)
     merchant: Mapped[str | None] = mapped_column(String(EXPENSE_MERCHANT_MAX_LENGTH))
     payment_method: Mapped[str | None] = mapped_column(String(EXPENSE_PAYMENT_METHOD_MAX_LENGTH))
+    source_type: Mapped[MessageSourceType] = mapped_column(
+        String(10), default=MessageSourceType.TEXT
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     user: Mapped["User"] = relationship(back_populates="expenses")

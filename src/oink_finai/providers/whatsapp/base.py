@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from oink_finai.schemas.whatsapp import InboundWhatsAppMessage
+from oink_finai.schemas.whatsapp import InboundMedia, InboundWhatsAppMessage
 
 
 @dataclass(frozen=True)
@@ -33,3 +33,7 @@ class WhatsAppProvider(ABC):
     async def send_interactive(self, phone_number: str, message: InteractiveMessage) -> str | None:
         """Send provider-neutral reply actions when supported."""
         raise InteractiveMessageUnsupportedError
+
+    async def download_media(self, media: InboundMedia) -> bytes:
+        """Download provider-owned media without exposing its reference to financial services."""
+        raise NotImplementedError

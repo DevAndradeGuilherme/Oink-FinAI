@@ -1,0 +1,23 @@
+{
+  "event": "messages.upsert",
+  "instance": "finance-instance",
+  "data": {
+    "key": {
+      "remoteJid": "5511999999999@s.whatsapp.net",
+      "fromMe": false,
+      "id": "AUDIO-PTT-001"
+    },
+    "message": {
+      "audioMessage": {
+        "url": "https://untrusted.invalid/encrypted",
+        "mimetype": "audio/ogg; codecs=opus",
+        "seconds": 12,
+        "ptt": true,
+        "mediaKey": {"0": 99},
+        "directPath": "/opaque/path"
+      }
+    },
+    "messageType": "audioMessage",
+    "messageTimestamp": 1700000000
+  }
+}
