@@ -65,6 +65,11 @@ async def evolution_webhook(
         return WebhookResponse(status="ignored")
     message = decision.message
 
+    # Phase 1 recognizes audio but intentionally keeps it outside persistence, workers,
+    # financial interpretation, and the outbound response pipeline.
+    if message.media is not None:
+        return WebhookResponse(status="ignored")
+
     settings = get_settings()
     if message.interaction_id is not None:
         command = parse_expense_action(message.interaction_id)

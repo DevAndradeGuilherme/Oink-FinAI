@@ -20,6 +20,9 @@ async def get_evolution_provider() -> AsyncIterator[EvolutionWhatsAppProvider]:
         api_key=settings.evolution_api_key,
         instance=settings.evolution_instance,
         timeout_seconds=settings.evolution_timeout_seconds,
+        media_timeout_seconds=settings.evolution_media_timeout_seconds,
+        media_max_bytes=settings.media_max_bytes,
+        media_max_duration_seconds=settings.media_max_duration_seconds,
         max_retries=0,
     )
     try:

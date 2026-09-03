@@ -1,0 +1,21 @@
+{
+  "event": "messages.upsert",
+  "instance": "finance-instance",
+  "data": {
+    "key": {
+      "remoteJid": "5511999999999@s.whatsapp.net",
+      "fromMe": false,
+      "id": "AUDIO-FILE-001"
+    },
+    "message": {
+      "audioMessage": {
+        "mimetype": "audio/mpeg",
+        "seconds": 42,
+        "ptt": false,
+        "mediaKey": {"0": 88}
+      }
+    },
+    "messageType": "audioMessage",
+    "messageTimestamp": 1700000001
+  }
+}
