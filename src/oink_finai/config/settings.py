@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     evolution_api_url: str | None = None
     evolution_api_key: str | None = Field(default=None, repr=False)
     evolution_instance_id: str | None = None
+    evolution_webhook_secret: str | None = Field(default=None, repr=False)
+    whatsapp_allowed_numbers: str = ""
+    media_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    media_max_duration_seconds: int = Field(default=5 * 60, gt=0)
+    evolution_media_timeout_seconds: float = Field(default=15.0, gt=0)
+
+    @property
+    def allowed_numbers(self) -> frozenset[str]:
+        return frozenset(
+            value.strip() for value in self.whatsapp_allowed_numbers.split(",") if value.strip()
+        )
 
 
 @lru_cache

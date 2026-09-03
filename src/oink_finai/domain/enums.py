@@ -11,3 +11,12 @@ class ExpenseHistoryAction(StrEnum):
     CREATED = "CREATED"
     UPDATED = "UPDATED"
     DELETED = "DELETED"
+
+
+class MessageType(StrEnum):
+    TEXT = "text"
+    AUDIO = "audio"
+
+
+class MediaType(StrEnum):
+    AUDIO = "audio"

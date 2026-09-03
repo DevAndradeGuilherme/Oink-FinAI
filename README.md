@@ -14,6 +14,9 @@ O código fica em `src/oink_finai/`:
 - `services/` e `repositories/`: casos de uso e persistência;
 - `providers/whatsapp/`: contrato `WhatsAppProvider`, independente da Evolution API.
 
+O contrato de áudio confirmado para a Evolution API 2.3.7 está documentado em
+[`docs/evolution-api-2.3.7-media-contract.md`](docs/evolution-api-2.3.7-media-contract.md).
+
 Migrações ficam em `migrations/`; testes, em `tests/`.
 
 ## Execução com Docker
