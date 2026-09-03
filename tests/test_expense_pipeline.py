@@ -174,23 +174,19 @@ async def test_create_expense_is_idempotent_and_uses_user_timezone(
         assert saved.processing_attempts == 1
         assert outbox[0].content == (
             "✅ Novo Gasto Registrado!\n\n"
-            " Descrição: Mercado\n"
-            f"️ Categoria: {ExpenseCategory.FOOD.value}\n"
-            " Valor: R$ 42,50\n\n"
-            " Data: 01/09/2026\n"
-            f"⚙️ ID: {str(expenses[0].id)[:8]}\n\n"
-            "Use os botões abaixo para\n"
-            "excluir ou editar."
+            "📝 Descrição: Mercado\n"
+            f"🛍️ Categoria: {ExpenseCategory.FOOD.value}\n"
+            "💵 Valor: R$ 42,50\n\n"
+            "📅 Data: 01/09/2026\n"
+            f"⚙️ ID: {str(expenses[0].id)[:8]}"
         )
-        assert outbox[0].content_type == "BUTTONS"
-        assert [action["label"] for action in outbox[0].actions or []] == [
-            "✏️ Editar",
-            "↩️ Excluir",
-        ]
+        assert outbox[0].content_type == "TEXT"
+        assert not outbox[0].actions
         assert str(expenses[0].id) not in outbox[0].content
-        assert outbox[0].fallback_content is not None
-        assert f"editar {expenses[0].id}" in outbox[0].fallback_content
-        assert f"remover {expenses[0].id}" in outbox[0].fallback_content
+        assert "editar" not in outbox[0].content.lower()
+        assert "remover" not in outbox[0].content.lower()
+        assert "botões" not in outbox[0].content.lower()
+        assert outbox[0].fallback_content is None
 
     provider = FakeProvider()
     delivery = OutboxDeliveryService(factory, provider)
@@ -201,6 +197,34 @@ async def test_create_expense_is_idempotent_and_uses_user_timezone(
     async with factory() as session:
         assert await session.scalar(select(func.count()).select_from(Expense)) == 1
         assert provider.calls == 1
+
+
+async def test_expense_confirmation_delivery_uses_only_persisted_text(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    message = await seed(factory)
+    processor = service(factory, FakeInterpreter([interpretation()]))
+    await processor.claim(1)
+    await processor.process(message.id)
+
+    provider = InteractiveFakeProvider("must-not-be-used")
+    delivery = OutboxDeliveryService(factory, provider)
+    await delivery.send((await delivery.claim(1))[0])
+
+    async with factory() as session:
+        expense = await session.scalar(select(Expense))
+        outbox = await session.scalar(select(OutboundMessage))
+        assert expense is not None and outbox is not None
+        assert outbox.content == (
+            "✅ Novo Gasto Registrado!\n\n"
+            f"📝 Descrição: {expense.description}\n"
+            f"🛍️ Categoria: {ExpenseCategory.FOOD.value}\n"
+            f"💵 Valor: R$ {str(expense.amount).replace('.', ',')}\n\n"
+            f"📅 Data: {expense.expense_date.strftime('%d/%m/%Y')}\n"
+            f"⚙️ ID: {str(expense.id)[:8]}"
+        )
+        assert provider.text_calls == 1
+        assert provider.interactive_calls == 0
 
 
 @pytest.mark.parametrize(

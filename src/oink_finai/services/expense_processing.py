@@ -343,8 +343,6 @@ class ExpenseProcessingService:
             content=format_expense_confirmation(expense, category.name),
             kind=OutboundMessageKind.EXPENSE_CONFIRMATION,
             expense=expense,
-            actions=expense_confirmation_actions(expense.id),
-            fallback_content=format_expense_confirmation_fallback(expense, category.name),
         )
 
     @staticmethod
@@ -720,13 +718,11 @@ def format_expense_confirmation(expense: Expense, category_name: str) -> str:
     amount = f"{expense.amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
     return (
         "✅ Novo Gasto Registrado!\n\n"
-        f" Descrição: {expense.description}\n"
-        f"️ Categoria: {category_name}\n"
-        f" Valor: R$ {amount}\n\n"
-        f" Data: {expense.expense_date.strftime('%d/%m/%Y')}\n"
-        f"⚙️ ID: {str(expense.id)[:8]}\n\n"
-        "Use os botões abaixo para\n"
-        "excluir ou editar."
+        f"📝 Descrição: {expense.description}\n"
+        f"🛍️ Categoria: {category_name}\n"
+        f"💵 Valor: R$ {amount}\n\n"
+        f"📅 Data: {expense.expense_date.strftime('%d/%m/%Y')}\n"
+        f"⚙️ ID: {str(expense.id)[:8]}"
     )
 
 

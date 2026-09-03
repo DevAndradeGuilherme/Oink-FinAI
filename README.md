@@ -1,8 +1,9 @@
 # Oink FinAI
 
-Backend de controle financeiro cuja interface principal será o WhatsApp. A integração inicial com
-Evolution API recebe webhooks de texto com idempotência e permite o envio de mensagens; ainda não
-cria gastos nem conecta IA.
+Backend de controle financeiro cuja interface principal é o WhatsApp. O registro de gastos por
+texto está disponível e a confirmação também é enviada como texto. Edição e remoção foram adiadas
+para depois do MVP. Botões interativos não estão habilitados no engine Baileys atual da Evolution
+API 2.3.7.
 
 ## Arquitetura
 

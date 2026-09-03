@@ -187,7 +187,27 @@ def test_invalid_interactive_action_is_rejected(action_id: str) -> None:
     assert parse_expense_action(action_id) is None
 
 
-async def test_confirmation_contains_uuid_commands_without_self_test_prefix(
+def test_expense_confirmation_exact_text_and_brazilian_formatting() -> None:
+    expense = Expense(
+        id=UUID("12345678-1234-5678-9abc-123456789abc"),
+        user_id=uuid4(),
+        category_id=uuid4(),
+        amount=Decimal("1234.56"),
+        description="Mercado do bairro",
+        expense_date=date(2026, 9, 2),
+    )
+
+    assert format_expense_confirmation(expense, "Alimentação") == (
+        "✅ Novo Gasto Registrado!\n\n"
+        "📝 Descrição: Mercado do bairro\n"
+        "🛍️ Categoria: Alimentação\n"
+        "💵 Valor: R$ 1.234,56\n\n"
+        "📅 Data: 02/09/2026\n"
+        "⚙️ ID: 12345678"
+    )
+
+
+async def test_confirmation_contains_visual_short_id_without_commands(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     _, expense = await seed_expense(factory)
@@ -195,6 +215,9 @@ async def test_confirmation_contains_uuid_commands_without_self_test_prefix(
     assert str(expense.id) not in text
     assert f"⚙️ ID: {str(expense.id)[:8]}" in text
     assert "!oink" not in text
+    assert "editar" not in text.lower()
+    assert "remover" not in text.lower()
+    assert "botões" not in text.lower()
 
 
 async def test_remove_requests_confirmation_without_deleting_or_calling_interpreter(
