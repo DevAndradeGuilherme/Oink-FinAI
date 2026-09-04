@@ -10,6 +10,7 @@ from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.gemini_audio_transcriber import GeminiAudioTranscriber
 from oink_finai.services.gemini_expense_interpreter import GeminiExpenseInterpreter
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
+from oink_finai.services.pipeline_timing import PipelineTiming
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ async def run_worker() -> None:
         max_audio_bytes=settings.media_max_bytes,
         max_duration_seconds=settings.media_max_duration_seconds,
     )
+    timing = PipelineTiming(settings.pipeline_timing_enabled)
     processing = ExpenseProcessingService(
         SessionFactory,
         lambda timezone: GeminiExpenseInterpreter(
@@ -66,12 +68,14 @@ async def run_worker() -> None:
         delete_confirmation_ttl_seconds=settings.expense_delete_confirmation_ttl_seconds,
         media_provider=provider,
         audio_transcriber_factory=lambda: audio_transcriber,
+        timing=timing,
     )
     delivery = OutboxDeliveryService(
         SessionFactory,
         provider,
         max_attempts=settings.outbox_max_attempts,
         retry_base_seconds=settings.outbox_retry_base_seconds,
+        timing=timing,
     )
     try:
         outbox_cutoff = datetime.now(UTC) - timedelta(seconds=settings.outbox_state_timeout_seconds)

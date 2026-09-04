@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -47,6 +48,7 @@ from oink_finai.services.gemini_errors import (
     GeminiUnavailableError,
 )
 from oink_finai.services.outbox_delivery import OutboundMessageClaim, OutboxDeliveryService
+from oink_finai.services.pipeline_timing import PipelineTiming
 
 
 @pytest_asyncio.fixture
@@ -146,6 +148,50 @@ def service(
         retry_max_seconds=0.001,
         jitter=lambda: 0,
     )
+
+
+async def test_timing_correlation_crosses_processing_and_outbox_without_extra_calls(
+    factory: async_sessionmaker[AsyncSession], caplog: pytest.LogCaptureFixture
+) -> None:
+    message = await seed(factory)
+    timing = PipelineTiming(True)
+    interpreter = FakeInterpreter([interpretation()])
+    processor = ExpenseProcessingService(
+        factory,
+        lambda _timezone: interpreter,
+        retry_base_seconds=0.001,
+        retry_max_seconds=0.001,
+        jitter=lambda: 0,
+        timing=timing,
+    )
+    provider = FakeProvider()
+    delivery = OutboxDeliveryService(factory, provider, timing=timing)
+
+    with caplog.at_level(logging.INFO):
+        await processor.claim(1)
+        await processor.process(message.id)
+        await delivery.send((await delivery.claim(1))[0])
+
+    timing_records = [
+        record for record in caplog.records if record.name == "oink_finai.pipeline_timing"
+    ]
+    assert {record.correlation_id for record in timing_records} == {str(message.id)}
+    assert {
+        "processing_claimed",
+        "queue_wait_completed",
+        "interpretation_started",
+        "interpretation_completed",
+        "expense_persistence_started",
+        "expense_persistence_completed",
+        "processing_completed",
+        "outbox_claimed",
+        "outbox_queue_wait_completed",
+        "outbound_send_started",
+        "outbound_send_completed",
+        "outbound_accepted",
+    } <= {record.event for record in timing_records}
+    assert interpreter.calls == 1
+    assert provider.calls == 1
 
 
 async def test_create_expense_is_idempotent_and_uses_user_timezone(

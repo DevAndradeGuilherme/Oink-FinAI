@@ -15,12 +15,15 @@ from oink_finai.providers.whatsapp import (
     InteractiveMessageUnsupportedError,
     WhatsAppProvider,
 )
+from oink_finai.services.pipeline_timing import PipelineTiming
 
 
 @dataclass(frozen=True)
 class OutboundMessageClaim:
     message_id: UUID
     claim_token: UUID
+    correlation_id: UUID | None = None
+    attempt_number: int = 0
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class OutboundDeliveryData:
     actions: tuple[InteractiveAction, ...]
     fallback_content: str | None
     attempt_count: int
+    correlation_id: UUID
 
 
 class OutboxDeliveryService:
@@ -41,11 +45,13 @@ class OutboxDeliveryService:
         *,
         max_attempts: int = 3,
         retry_base_seconds: float = 1.0,
+        timing: PipelineTiming | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._provider = provider
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
+        self._timing = timing or PipelineTiming(False)
 
     async def claim(self, batch_size: int) -> list[OutboundMessageClaim]:
         now = datetime.now(UTC)
@@ -68,31 +74,71 @@ class OutboxDeliveryService:
                 message.status = OutboundMessageStatus.CLAIMED
                 message.claimed_at = now
                 message.claim_token = token
-                claims.append(OutboundMessageClaim(message.id, token))
-            return claims
+                correlation_id = self._correlation_id(message.dedup_key, message.id)
+                claims.append(
+                    OutboundMessageClaim(
+                        message.id, token, correlation_id, message.attempt_count + 1
+                    )
+                )
+            timing_data = [
+                (
+                    claim.correlation_id,
+                    claim.attempt_number,
+                    message.available_at,
+                )
+                for claim, message in zip(claims, messages, strict=True)
+            ]
+        for correlation_id, attempt_number, available_at in timing_data:
+            assert correlation_id is not None
+            self._timing.event("outbox_claimed", correlation_id, attempt_number=attempt_number)
+            self._timing.event(
+                "outbox_queue_wait_completed",
+                correlation_id,
+                duration_ms=self._timing.elapsed_ms(available_at, now),
+                attempt_number=attempt_number,
+            )
+        return claims
 
     async def send(self, claim: OutboundMessageClaim) -> None:
         message = await self._start_sending(claim)
         if message is None:
             return
-        try:
-            provider_message_id = await self._deliver(message)
-        except asyncio.CancelledError:
-            await asyncio.shield(
-                self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
-            )
-            raise
-        except EvolutionProviderError as exc:
-            if exc.outcome_unknown:
+        send_span = self._timing.span(
+            "outbound_send_started",
+            "outbound_send_completed",
+            message.correlation_id,
+            attempt_number=message.attempt_count,
+            stage="send",
+        )
+        async with send_span:
+            try:
+                provider_message_id = await self._deliver(message)
+                send_span.result(outcome="success")
+            except asyncio.CancelledError:
+                send_span.result(outcome="transient_failure", error_code="OUTCOME_UNKNOWN")
+                await asyncio.shield(
+                    self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
+                )
+                raise
+            except EvolutionProviderError as exc:
+                if exc.outcome_unknown:
+                    send_span.result(outcome="terminal_failure", error_code="OUTCOME_UNKNOWN")
+                    await self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
+                elif message.attempt_count < self._max_attempts:
+                    next_attempt_at = await self._retry(claim, message.attempt_count)
+                    send_span.result(
+                        outcome="transient_failure",
+                        error_code="SEND_UNAVAILABLE",
+                        next_attempt_at=next_attempt_at,
+                    )
+                else:
+                    send_span.result(outcome="terminal_failure", error_code="SEND_UNAVAILABLE")
+                    await self._finish(claim, OutboundMessageStatus.FAILED, "SEND_UNAVAILABLE")
+                return
+            except Exception:
+                send_span.result(outcome="terminal_failure", error_code="OUTCOME_UNKNOWN")
                 await self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
-            elif message.attempt_count < self._max_attempts:
-                await self._retry(claim, message.attempt_count)
-            else:
-                await self._finish(claim, OutboundMessageStatus.FAILED, "SEND_UNAVAILABLE")
-            return
-        except Exception:
-            await self._finish(claim, OutboundMessageStatus.UNKNOWN, "OUTCOME_UNKNOWN")
-            return
+                return
 
         async with self._session_factory() as session, session.begin():
             await session.execute(
@@ -110,6 +156,12 @@ class OutboxDeliveryService:
                     error_code=None,
                 )
             )
+        self._timing.event(
+            "outbound_accepted",
+            message.correlation_id,
+            attempt_number=message.attempt_count,
+            outcome="success",
+        )
 
     async def _deliver(self, message: OutboundDeliveryData) -> str | None:
         if message.content_type != "BUTTONS":
@@ -154,16 +206,30 @@ class OutboxDeliveryService:
                 actions=actions,
                 fallback_content=message.fallback_content,
                 attempt_count=message.attempt_count,
+                correlation_id=self._correlation_id(message.dedup_key, message.id),
             )
 
-    async def _retry(self, claim: OutboundMessageClaim, attempt_count: int) -> None:
+    async def _retry(self, claim: OutboundMessageClaim, attempt_count: int) -> datetime:
+        next_attempt_at = datetime.now(UTC) + timedelta(
+            seconds=self._retry_base_seconds * (2 ** (attempt_count - 1))
+        )
         await self._transition(
             claim,
             OutboundMessageStatus.PENDING,
             "SEND_UNAVAILABLE",
-            available_at=datetime.now(UTC)
-            + timedelta(seconds=self._retry_base_seconds * (2 ** (attempt_count - 1))),
+            available_at=next_attempt_at,
         )
+        return next_attempt_at
+
+    @staticmethod
+    def _correlation_id(dedup_key: str, fallback: UUID) -> UUID:
+        parts = dedup_key.split(":", 2)
+        if len(parts) == 3 and parts[0] == "processed-message":
+            try:
+                return UUID(parts[1])
+            except ValueError:
+                pass
+        return fallback
 
     async def _finish(
         self, claim: OutboundMessageClaim, status: OutboundMessageStatus, error_code: str

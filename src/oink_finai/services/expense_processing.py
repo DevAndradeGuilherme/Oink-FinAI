@@ -61,6 +61,7 @@ from oink_finai.services.gemini_errors import (
     GeminiTimeoutError,
     GeminiUnavailableError,
 )
+from oink_finai.services.pipeline_timing import PipelineTiming
 from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
 
 CLARIFICATION_TEXT = "Não encontrei o valor. Envie novamente incluindo o valor do gasto."
@@ -88,6 +89,10 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def source_type_value(value: MessageSourceType | str) -> str:
+    return value.value if isinstance(value, MessageSourceType) else value
+
+
 class InterpretationLimitError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -108,6 +113,7 @@ class ExpenseProcessingService:
         delete_confirmation_ttl_seconds: float = 600.0,
         media_provider: WhatsAppProvider | None = None,
         audio_transcriber_factory: Callable[[], AudioTranscriber] | None = None,
+        timing: PipelineTiming | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._interpreter_factory = interpreter_factory
@@ -119,6 +125,7 @@ class ExpenseProcessingService:
         self._delete_confirmation_ttl = timedelta(seconds=delete_confirmation_ttl_seconds)
         self._media_provider = media_provider
         self._audio_transcriber_factory = audio_transcriber_factory
+        self._timing = timing or PipelineTiming(False)
 
     async def recover_stale(self, older_than: datetime) -> int:
         now = self._now()
@@ -171,7 +178,23 @@ class ExpenseProcessingService:
                 message.status = ProcessedMessageStatus.PROCESSING
                 message.locked_at = now
                 message.processing_attempts += 1
-            return [message.id for message in messages]
+            claimed = [
+                (message.id, message.created_at, message.source_type, message.processing_attempts)
+                for message in messages
+            ]
+        for message_id, created_at, source_type, attempt_number in claimed:
+            fields = {
+                "attempt_number": attempt_number,
+                "source_type": source_type_value(source_type),
+            }
+            self._timing.event("processing_claimed", message_id, **fields)
+            self._timing.event(
+                "queue_wait_completed",
+                message_id,
+                duration_ms=self._timing.elapsed_ms(created_at, now),
+                **fields,
+            )
+        return [message_id for message_id, *_ in claimed]
 
     async def _reconcile_exhausted_pending(self, session: AsyncSession, batch_size: int) -> None:
         messages = list(
@@ -202,6 +225,39 @@ class ExpenseProcessingService:
         await self._create_failure_notification(session, message, user)
 
     async def process(self, message_id: UUID) -> None:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None:
+                return
+            attempt_number = message.processing_attempts
+            source_type = source_type_value(message.source_type)
+        async with self._timing.span(
+            None,
+            "processing_completed",
+            message_id,
+            attempt_number=attempt_number,
+            source_type=source_type,
+        ) as span:
+            try:
+                await self._process(message_id)
+            finally:
+                async with self._session_factory() as session:
+                    saved = await session.get(ProcessedMessage, message_id)
+                    if saved is not None:
+                        if saved.status is ProcessedMessageStatus.PENDING:
+                            outcome = "transient_failure"
+                        elif saved.status is ProcessedMessageStatus.FAILED:
+                            outcome = "terminal_failure"
+                        else:
+                            outcome = "success"
+                        span.result(
+                            outcome=outcome,
+                            stage=self._timing_stage(saved.last_error_code),
+                            error_code=saved.last_error_code if outcome != "success" else None,
+                            next_attempt_at=saved.next_attempt_at,
+                        )
+
+    async def _process(self, message_id: UUID) -> None:
         async with self._session_factory() as session:
             message = await session.get(ProcessedMessage, message_id)
             if message is None or message.status != ProcessedMessageStatus.PROCESSING:
@@ -239,8 +295,15 @@ class ExpenseProcessingService:
 
         try:
             interpreter = self._interpreter_factory(timezone)
-            interpretation = await interpreter.interpret(text, reference_timestamp=timestamp)
-            self._validate_interpretation(interpretation)
+            async with self._timing.span(
+                "interpretation_started",
+                "interpretation_completed",
+                message_id,
+                attempt_number=message.processing_attempts,
+                source_type=source_type_value(source_type),
+            ):
+                interpretation = await interpreter.interpret(text, reference_timestamp=timestamp)
+                self._validate_interpretation(interpretation)
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "GEMINI_TIMEOUT"))
             raise
@@ -255,7 +318,17 @@ class ExpenseProcessingService:
             return
 
         try:
-            async with self._session_factory() as session, session.begin():
+            async with (
+                self._timing.span(
+                    "expense_persistence_started",
+                    "expense_persistence_completed",
+                    message_id,
+                    attempt_number=message.processing_attempts,
+                    source_type=source_type_value(source_type),
+                ),
+                self._session_factory() as session,
+                session.begin(),
+            ):
                 message = await session.scalar(
                     self._locked_message_statement(message_id).options(
                         selectinload(ProcessedMessage.user)
@@ -474,15 +547,35 @@ class ExpenseProcessingService:
             )
 
         try:
-            content = await self._media_provider.download_media(media)
-            transcription = await self._audio_transcriber_factory().transcribe(
-                ValidatedAudio(
-                    content=content,
-                    mime_type=media.declared_mime_type,
-                    declared_duration_seconds=media.declared_duration_seconds,
-                    is_voice_note=media.is_voice_note,
+            async with self._timing.span(
+                "media_download_started",
+                "media_download_completed",
+                message_id,
+                attempt_number=message.processing_attempts,
+                source_type=source_type_value(message.source_type),
+                mime_type=media.declared_mime_type,
+                audio_duration_seconds=media.declared_duration_seconds,
+            ) as download_span:
+                content = await self._media_provider.download_media(media)
+                download_span.result(size_bytes=len(content))
+            async with self._timing.span(
+                "transcription_started",
+                "transcription_completed",
+                message_id,
+                attempt_number=message.processing_attempts,
+                source_type=source_type_value(message.source_type),
+                size_bytes=len(content),
+                mime_type=media.declared_mime_type,
+                audio_duration_seconds=media.declared_duration_seconds,
+            ):
+                transcription = await self._audio_transcriber_factory().transcribe(
+                    ValidatedAudio(
+                        content=content,
+                        mime_type=media.declared_mime_type,
+                        declared_duration_seconds=media.declared_duration_seconds,
+                        is_voice_note=media.is_voice_note,
+                    )
                 )
-            )
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "AUDIO_PROCESSING_INTERRUPTED"))
             raise
@@ -502,7 +595,17 @@ class ExpenseProcessingService:
                 await self._mark_audio_failed(message_id, exc.code.value, AUDIO_INVALID_TEXT)
             return None
 
-        async with self._session_factory() as session, session.begin():
+        async with (
+            self._timing.span(
+                "transcript_checkpoint_started",
+                "transcript_checkpoint_completed",
+                message_id,
+                attempt_number=message.processing_attempts,
+                source_type=source_type_value(message.source_type),
+            ),
+            self._session_factory() as session,
+            session.begin(),
+        ):
             message = await session.scalar(self._locked_message_statement(message_id))
             if message is None or message.status != ProcessedMessageStatus.PROCESSING:
                 return None
@@ -832,6 +935,20 @@ class ExpenseProcessingService:
     def _is_data_exception(exc: DBAPIError) -> bool:
         sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
         return isinstance(sqlstate, str) and sqlstate.startswith("22")
+
+    @staticmethod
+    def _timing_stage(error_code: str | None) -> str:
+        if error_code is None:
+            return "processing"
+        if error_code.startswith("MEDIA_"):
+            return "media_download"
+        if error_code.startswith(("TRANSCRIPTION_", "AUDIO_")):
+            return "transcription"
+        if error_code.startswith("GEMINI_"):
+            return "interpretation"
+        if error_code.startswith("PERSISTENCE_"):
+            return "expense_persistence"
+        return "processing"
 
     @staticmethod
     def _timezone(name: str) -> ZoneInfo:

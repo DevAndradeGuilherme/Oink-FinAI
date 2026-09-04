@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import uuid4
@@ -85,6 +86,31 @@ async def assert_no_business_records(session: AsyncSession) -> None:
     assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 0
     assert await session.scalar(select(func.count()).select_from(Expense)) == 0
     assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 0
+
+
+async def test_enabled_webhook_timing_uses_persisted_internal_id(
+    webhook_client: TestClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("PIPELINE_TIMING_ENABLED", "true")
+    get_settings.cache_clear()
+
+    with caplog.at_level(logging.INFO):
+        response = post(webhook_client, authorized_payload())
+
+    saved = await session.scalar(select(ProcessedMessage))
+    records = [record for record in caplog.records if record.name == "oink_finai.pipeline_timing"]
+    assert response.json() == {"status": "accepted"}
+    assert saved is not None
+    assert {record.correlation_id for record in records} == {str(saved.id)}
+    assert {record.event for record in records} == {
+        "webhook_received",
+        "access_filter_completed",
+        "inbound_persisted",
+        "webhook_completed",
+    }
 
 
 @pytest.mark.parametrize("self_test_enabled", ["false", "true"])
