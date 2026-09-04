@@ -117,3 +117,15 @@ usuario pode ser maior.
 `GeminiImageAnalyzer` recebe somente bytes e metadados técnicos já validados, além de legenda
 opcional não confiável. Retorna observações estruturadas e evidências literais do texto visível.
 Não cria gasto, não persiste mídia e não participa do webhook ou worker nesta fase.
+
+O grounding preserva `visible_text` e evidências originais. Para comparar representações visuais
+equivalentes, aplica somente composição Unicode NFC, remoção de variation selectors, normalização
+de sequências de whitespace e comparação sem diferença de caixa para merchant e pagamento.
+Dígitos, acentos e pontuação não são removidos; separadores monetários e limites de token continuam
+significativos. Assim, `20` nunca fundamenta `120`, valores diferentes nunca são aproximados e a
+legenda nunca participa da busca por evidência.
+
+`amount_candidate.value` usa `Decimal` no domínio. O modelo recebe instrução para produzir decimal
+canônico sem moeda ou milhar; o parser defensivo também aceita representações brasileiras
+inequívocas com `R$`, vírgula decimal e ponto de milhar. `evidence` continua sendo transcrição
+visual separada. Nenhum formato é arredondado, truncado ou limpo por remoção permissiva.
