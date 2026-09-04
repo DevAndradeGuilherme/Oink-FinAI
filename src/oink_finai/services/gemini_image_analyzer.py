@@ -33,6 +33,8 @@ from oink_finai.schemas.image_analysis import (
 )
 from oink_finai.services.gemini_errors import GeminiErrorMetadata
 from oink_finai.services.image_analysis_errors import (
+    GroundingCandidateKind,
+    GroundingFailureReason,
     ImageAnalysisError,
     ImageAnalysisErrorCode,
 )
@@ -53,6 +55,7 @@ _REQUEST_ID_HEADERS = frozenset({"x-request-id", "x-goog-request-id"})
 _GENERIC_EVIDENCE = frozenset(
     {"evidence", "evidencia", "evidência", "texto", "valor", "data", "loja", "pagamento"}
 )
+_VARIATION_SELECTOR_RANGES = ((0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
 
 _IMAGE_ANALYSIS_INSTRUCTION = """Analise somente o conteúdo visual da imagem enviada.
 Retorne o JSON solicitado.
@@ -80,8 +83,23 @@ def _has_unsafe_control(value: str) -> bool:
     )
 
 
+def _is_variation_selector(character: str) -> bool:
+    codepoint = ord(character)
+    return any(start <= codepoint <= end for start, end in _VARIATION_SELECTOR_RANGES)
+
+
+def _structural_normalize(value: str, *, casefold: bool = False) -> str:
+    """Normalize representation only; digits and punctuation remain significant."""
+    normalized = unicodedata.normalize("NFC", value)
+    normalized = "".join(
+        character for character in normalized if not _is_variation_selector(character)
+    )
+    normalized = " ".join(normalized.split())
+    return normalized.casefold() if casefold else normalized
+
+
 def _parse_money_token(token: str) -> Decimal | None:
-    normalized = re.sub(r"^R\$[ \t]*", "", token)
+    normalized = re.sub(r"^R\$ *", "", token)
     if not normalized or normalized.startswith("-"):
         return None
     if "," in normalized:
@@ -107,24 +125,44 @@ def _parse_money_token(token: str) -> Decimal | None:
     return value if value.is_finite() else None
 
 
-def _amount_is_grounded(visible_text: str, evidence: str, amount: Decimal) -> bool:
-    start = visible_text.find(evidence)
+def _amount_grounding_reason(
+    visible_text: str, evidence: str, amount: Decimal
+) -> GroundingFailureReason | None:
+    normalized_text = _structural_normalize(visible_text)
+    normalized_evidence = _structural_normalize(evidence)
+    start = normalized_text.find(normalized_evidence)
+    if start < 0:
+        return GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND
+    partial_token = False
+    value_mismatch = False
     while start >= 0:
-        end = start + len(evidence)
-        before = visible_text[start - 1] if start else ""
-        after = visible_text[end] if end < len(visible_text) else ""
-        cuts_number = (evidence[0].isdigit() and (before.isdigit() or before in ".,")) or (
-            evidence[-1].isdigit() and (after.isdigit() or after in ".,")
+        end = start + len(normalized_evidence)
+        before = normalized_text[start - 1] if start else ""
+        after = normalized_text[end] if end < len(normalized_text) else ""
+        cuts_number = (
+            normalized_evidence[0].isdigit()
+            and bool(before)
+            and (before.isdigit() or before in ".,")
+        ) or (
+            normalized_evidence[-1].isdigit() and bool(after) and (after.isdigit() or after in ".,")
         )
         values = {
             parsed
-            for match in _MONEY_TOKEN_PATTERN.finditer(evidence)
+            for match in _MONEY_TOKEN_PATTERN.finditer(normalized_evidence)
             if (parsed := _parse_money_token(match.group())) is not None
         }
-        if not cuts_number and values == {amount}:
-            return True
-        start = visible_text.find(evidence, start + 1)
-    return False
+        if cuts_number:
+            partial_token = True
+        elif values == {amount}:
+            return None
+        else:
+            value_mismatch = True
+        start = normalized_text.find(normalized_evidence, start + 1)
+    if value_mismatch:
+        return GroundingFailureReason.AMOUNT_VALUE_MISMATCH
+    if partial_token:
+        return GroundingFailureReason.AMOUNT_PARTIAL_TOKEN
+    return GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND
 
 
 class GeminiImageAnalyzer(ImageAnalyzer):
@@ -288,16 +326,44 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         if any(len(values) > limit for values, limit in limits):
             raise ImageAnalysisError(ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False)
 
+        candidate_groups = (
+            (GroundingCandidateKind.AMOUNT, transport.amount_candidates),
+            (GroundingCandidateKind.DATE, transport.date_candidates),
+            (GroundingCandidateKind.MERCHANT, transport.merchant_candidates),
+            (GroundingCandidateKind.PAYMENT_METHOD, transport.payment_method_candidates),
+        )
+        has_candidates = any(candidates for _, candidates in candidate_groups)
+        if not transport.is_legible and has_candidates:
+            self._raise_grounding(GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES)
+        if not transport.is_financial_document and has_candidates:
+            self._raise_grounding(GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES)
+        self._validate_result_coherence(transport)
+        for kind, candidates in candidate_groups:
+            self._reject_duplicate_candidates(kind, candidates)
+
         amount_candidates: list[AmountCandidate] = []
         try:
-            for candidate in transport.amount_candidates:
-                amount = self._parse_amount(candidate.value)
+            for index, candidate in enumerate(transport.amount_candidates):
+                kind = GroundingCandidateKind.AMOUNT
+                amount = self._parse_amount(candidate.value, kind, index)
                 self._validate_evidence(
-                    transport.visible_text, candidate.evidence, candidate.value, monetary=True
+                    transport.visible_text,
+                    candidate.evidence,
+                    kind,
+                    index,
+                    invalid_reason=GroundingFailureReason.AMOUNT_EVIDENCE_INVALID,
+                    not_found_reason=GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND,
                 )
-                if not _amount_is_grounded(transport.visible_text, candidate.evidence, amount):
-                    self._grounding_error()
-                self._validate_label(candidate.label)
+                if reason := _amount_grounding_reason(
+                    transport.visible_text, candidate.evidence, amount
+                ):
+                    self._raise_grounding(reason, kind, index)
+                self._validate_label(
+                    candidate.label,
+                    kind,
+                    index,
+                    GroundingFailureReason.AMOUNT_LABEL_INVALID,
+                )
                 amount_candidates.append(
                     AmountCandidate(
                         value=amount,
@@ -305,34 +371,23 @@ class GeminiImageAnalyzer(ImageAnalyzer):
                         label=candidate.label,
                     )
                 )
-            date_candidates = [
-                DateCandidate(
-                    value=self._validate_value(candidate.value),
-                    evidence=self._grounded_evidence(
-                        transport.visible_text, candidate.evidence, candidate.value
-                    ),
-                    label=self._validated_label(candidate.label),
-                )
-                for candidate in transport.date_candidates
-            ]
-            merchant_candidates = [
-                EvidenceCandidate(
-                    value=self._validate_value(candidate.value),
-                    evidence=self._grounded_evidence(
-                        transport.visible_text, candidate.evidence, candidate.value
-                    ),
-                )
-                for candidate in transport.merchant_candidates
-            ]
-            payment_candidates = [
-                EvidenceCandidate(
-                    value=self._validate_value(candidate.value),
-                    evidence=self._grounded_evidence(
-                        transport.visible_text, candidate.evidence, candidate.value
-                    ),
-                )
-                for candidate in transport.payment_method_candidates
-            ]
+            date_candidates = self._convert_date_candidates(transport)
+            merchant_candidates = self._convert_evidence_candidates(
+                transport.visible_text,
+                transport.merchant_candidates,
+                GroundingCandidateKind.MERCHANT,
+                GroundingFailureReason.MERCHANT_VALUE_INVALID,
+                GroundingFailureReason.MERCHANT_EVIDENCE_INVALID,
+                GroundingFailureReason.MERCHANT_EVIDENCE_NOT_FOUND,
+            )
+            payment_candidates = self._convert_evidence_candidates(
+                transport.visible_text,
+                transport.payment_method_candidates,
+                GroundingCandidateKind.PAYMENT_METHOD,
+                GroundingFailureReason.PAYMENT_METHOD_VALUE_INVALID,
+                GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_INVALID,
+                GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND,
+            )
             return ImageAnalysis(
                 document_type=transport.document_type,
                 visible_text=transport.visible_text,
@@ -349,61 +404,219 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         except ImageAnalysisError:
             raise
         except (ValidationError, TypeError, ValueError, InvalidOperation):
-            raise ImageAnalysisError(
-                ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False
-            ) from None
+            self._raise_grounding(GroundingFailureReason.CONTRADICTORY_RESULT)
 
-    @staticmethod
-    def _parse_amount(value: str) -> Decimal:
+    def _convert_date_candidates(
+        self, transport: GeminiImageAnalysisTransport
+    ) -> list[DateCandidate]:
+        converted: list[DateCandidate] = []
+        for index, candidate in enumerate(transport.date_candidates):
+            kind = GroundingCandidateKind.DATE
+            converted.append(
+                DateCandidate(
+                    value=self._validate_value(
+                        candidate.value,
+                        kind,
+                        index,
+                        GroundingFailureReason.DATE_VALUE_INVALID,
+                    ),
+                    evidence=self._grounded_evidence(
+                        transport.visible_text,
+                        candidate.evidence,
+                        kind,
+                        index,
+                        GroundingFailureReason.DATE_EVIDENCE_INVALID,
+                        GroundingFailureReason.DATE_EVIDENCE_NOT_FOUND,
+                        casefold=False,
+                    ),
+                    label=self._validated_label(
+                        candidate.label,
+                        kind,
+                        index,
+                        GroundingFailureReason.DATE_LABEL_INVALID,
+                    ),
+                )
+            )
+        return converted
+
+    def _convert_evidence_candidates(
+        self,
+        visible_text: str,
+        candidates: list[Any],
+        kind: GroundingCandidateKind,
+        value_reason: GroundingFailureReason,
+        invalid_evidence_reason: GroundingFailureReason,
+        missing_evidence_reason: GroundingFailureReason,
+    ) -> list[EvidenceCandidate]:
+        converted: list[EvidenceCandidate] = []
+        for index, candidate in enumerate(candidates):
+            converted.append(
+                EvidenceCandidate(
+                    value=self._validate_value(candidate.value, kind, index, value_reason),
+                    evidence=self._grounded_evidence(
+                        visible_text,
+                        candidate.evidence,
+                        kind,
+                        index,
+                        invalid_evidence_reason,
+                        missing_evidence_reason,
+                        casefold=True,
+                    ),
+                )
+            )
+        return converted
+
+    def _parse_amount(self, value: str, kind: GroundingCandidateKind, index: int) -> Decimal:
         if not _DECIMAL_PATTERN.fullmatch(value):
-            GeminiImageAnalyzer._grounding_error()
+            self._raise_grounding(GroundingFailureReason.AMOUNT_VALUE_INVALID, kind, index)
         amount = Decimal(value)
         if not amount.is_finite() or amount <= 0 or amount > IMAGE_ANALYSIS_AMOUNT_MAX:
-            GeminiImageAnalyzer._grounding_error()
+            self._raise_grounding(GroundingFailureReason.AMOUNT_VALUE_INVALID, kind, index)
         return amount
 
-    @staticmethod
-    def _validate_value(value: str) -> str:
+    def _validate_value(
+        self,
+        value: str,
+        kind: GroundingCandidateKind,
+        index: int,
+        reason: GroundingFailureReason,
+    ) -> str:
         if not value.strip() or len(value) > 200 or _has_unsafe_control(value):
-            GeminiImageAnalyzer._grounding_error()
+            self._raise_grounding(reason, kind, index)
         return value
 
-    @staticmethod
-    def _validate_label(label: str) -> None:
+    def _validate_label(
+        self,
+        label: str,
+        kind: GroundingCandidateKind,
+        index: int,
+        reason: GroundingFailureReason,
+    ) -> None:
         if (
             not label.strip()
             or len(label) > IMAGE_ANALYSIS_LABEL_MAX_LENGTH
             or _has_unsafe_control(label)
         ):
-            GeminiImageAnalyzer._grounding_error()
+            self._raise_grounding(reason, kind, index)
 
-    @staticmethod
-    def _validated_label(label: str) -> str:
-        GeminiImageAnalyzer._validate_label(label)
+    def _validated_label(
+        self,
+        label: str,
+        kind: GroundingCandidateKind,
+        index: int,
+        reason: GroundingFailureReason,
+    ) -> str:
+        self._validate_label(label, kind, index, reason)
         return label
 
-    @staticmethod
     def _validate_evidence(
-        visible_text: str, evidence: str, value: str, *, monetary: bool = False
+        self,
+        visible_text: str,
+        evidence: str,
+        kind: GroundingCandidateKind,
+        index: int,
+        *,
+        invalid_reason: GroundingFailureReason,
+        not_found_reason: GroundingFailureReason,
+        casefold: bool = False,
     ) -> None:
-        normalized = evidence.strip().casefold()
+        normalized = _structural_normalize(evidence, casefold=casefold)
         if (
             not normalized
-            or normalized in _GENERIC_EVIDENCE
+            or normalized.casefold() in _GENERIC_EVIDENCE
             or len(evidence) > IMAGE_ANALYSIS_EVIDENCE_MAX_LENGTH
             or _has_unsafe_control(evidence)
-            or evidence not in visible_text
         ):
-            GeminiImageAnalyzer._grounding_error()
+            self._raise_grounding(invalid_reason, kind, index)
+        normalized_text = _structural_normalize(visible_text, casefold=casefold)
+        if normalized not in normalized_text:
+            self._raise_grounding(not_found_reason, kind, index)
 
-    @staticmethod
-    def _grounded_evidence(visible_text: str, evidence: str, value: str) -> str:
-        GeminiImageAnalyzer._validate_evidence(visible_text, evidence, value)
+    def _grounded_evidence(
+        self,
+        visible_text: str,
+        evidence: str,
+        kind: GroundingCandidateKind,
+        index: int,
+        invalid_reason: GroundingFailureReason,
+        not_found_reason: GroundingFailureReason,
+        *,
+        casefold: bool,
+    ) -> str:
+        self._validate_evidence(
+            visible_text,
+            evidence,
+            kind,
+            index,
+            invalid_reason=invalid_reason,
+            not_found_reason=not_found_reason,
+            casefold=casefold,
+        )
         return evidence
 
-    @staticmethod
-    def _grounding_error() -> None:
-        raise ImageAnalysisError(ImageAnalysisErrorCode.GROUNDING, transient=False)
+    def _validate_result_coherence(self, transport: GeminiImageAnalysisTransport) -> None:
+        warnings = transport.warnings
+        financial_types = {
+            "RECEIPT",
+            "INVOICE",
+            "PAYMENT_RECEIPT",
+            "BANK_TRANSFER",
+            "CARD_RECEIPT",
+        }
+        contradictory = (
+            ("NONE" in warnings and len(warnings) != 1)
+            or len(set(warnings)) != len(warnings)
+            or (len(transport.amount_candidates) > 1 and "MULTIPLE_AMOUNTS" not in warnings)
+            or (len(transport.date_candidates) > 1 and "MULTIPLE_DATES" not in warnings)
+            or (
+                transport.document_type.value in financial_types
+                and not transport.is_financial_document
+            )
+        )
+        if contradictory:
+            self._raise_grounding(GroundingFailureReason.CONTRADICTORY_RESULT)
+
+    def _reject_duplicate_candidates(
+        self, kind: GroundingCandidateKind, candidates: list[Any]
+    ) -> None:
+        seen: set[tuple[str, ...]] = set()
+        for index, candidate in enumerate(candidates):
+            values = [
+                _structural_normalize(str(candidate.value), casefold=True),
+                _structural_normalize(candidate.evidence, casefold=True),
+            ]
+            label = getattr(candidate, "label", None)
+            if label is not None:
+                values.append(_structural_normalize(label, casefold=True))
+            fingerprint = tuple(values)
+            if fingerprint in seen:
+                self._raise_grounding(GroundingFailureReason.DUPLICATE_CANDIDATE, kind, index)
+            seen.add(fingerprint)
+
+    def _raise_grounding(
+        self,
+        reason: GroundingFailureReason,
+        kind: GroundingCandidateKind | None = None,
+        index: int | None = None,
+    ) -> None:
+        logger.warning(
+            "Gemini image grounding failed",
+            extra={
+                "gemini_operation": "image_analysis_grounding",
+                "gemini_model": self._safe_model,
+                "image_analysis_code": ImageAnalysisErrorCode.GROUNDING.value,
+                "grounding_reason": reason.value,
+                "candidate_kind": kind.value if kind is not None else None,
+                "candidate_index": index,
+            },
+        )
+        raise ImageAnalysisError(
+            ImageAnalysisErrorCode.GROUNDING,
+            transient=False,
+            grounding_reason=reason,
+            candidate_kind=kind,
+            candidate_index=index,
+        )
 
     def _raise_api_error(self, error: errors.APIError, started_at: float) -> None:
         status = getattr(error, "code", None)

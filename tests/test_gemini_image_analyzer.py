@@ -21,6 +21,8 @@ from oink_finai.schemas.image_analysis import (
 )
 from oink_finai.services.gemini_image_analyzer import GeminiImageAnalyzer
 from oink_finai.services.image_analysis_errors import (
+    GroundingCandidateKind,
+    GroundingFailureReason,
     ImageAnalysisError,
     ImageAnalysisErrorCode,
 )
@@ -316,7 +318,13 @@ async def test_rejects_candidates_for_non_financial_or_illegible_result(flag: st
     instance, _ = analyzer(response(**overrides))
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
-    assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
+    assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
+    expected = (
+        GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES
+        if flag == "financial"
+        else GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES
+    )
+    assert caught.value.grounding_reason is expected
 
 
 @pytest.mark.parametrize(
@@ -330,12 +338,22 @@ async def test_rejects_empty_invalid_or_additional_fields(response_text: str | N
     assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
 
 
-@pytest.mark.parametrize("warnings", [["INVALID"], ["NONE", "CROPPED"]])
-async def test_rejects_invalid_or_contradictory_warnings(warnings: list[str]) -> None:
+@pytest.mark.parametrize(
+    ("warnings", "code"),
+    [
+        (["INVALID"], ImageAnalysisErrorCode.INVALID_RESPONSE),
+        (["NONE", "CROPPED"], ImageAnalysisErrorCode.GROUNDING),
+    ],
+)
+async def test_rejects_invalid_or_contradictory_warnings(
+    warnings: list[str], code: ImageAnalysisErrorCode
+) -> None:
     instance, _ = analyzer(response(warnings=warnings))
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
-    assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
+    assert caught.value.code is code
+    if code is ImageAnalysisErrorCode.GROUNDING:
+        assert caught.value.grounding_reason is GroundingFailureReason.CONTRADICTORY_RESULT
 
 
 async def test_rejects_excessive_lists_and_visible_text() -> None:
@@ -493,3 +511,305 @@ def test_analyzer_has_no_persistence_or_pipeline_imports() -> None:
     source = Path("src/oink_finai/services/gemini_image_analyzer.py").read_text(encoding="utf-8")
     for forbidden in ("sqlalchemy", "database", "worker", "repositories", "outbox"):
         assert forbidden not in source.lower()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason", "kind"),
+    [
+        (
+            {"amount_candidates": [{"value": "20,00", "evidence": "R$ 20,00", "label": "TOTAL"}]},
+            GroundingFailureReason.AMOUNT_VALUE_INVALID,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {"amount_candidates": [{"value": "20.00", "evidence": " ", "label": "TOTAL"}]},
+            GroundingFailureReason.AMOUNT_EVIDENCE_INVALID,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {"amount_candidates": [{"value": "20.00", "evidence": "R$ 20,00", "label": "TOTAL"}]},
+            GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {"amount_candidates": [{"value": "43.00", "evidence": "R$ 42,50", "label": "TOTAL"}]},
+            GroundingFailureReason.AMOUNT_VALUE_MISMATCH,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {
+                "visible_text": "TOTAL R$ 120,00\n04/09/2026\nMERCADO OINK\nPIX",
+                "amount_candidates": [{"value": "20.00", "evidence": "20", "label": "TOTAL"}],
+            },
+            GroundingFailureReason.AMOUNT_PARTIAL_TOKEN,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {"amount_candidates": [{"value": "42.50", "evidence": "R$ 42,50", "label": ""}]},
+            GroundingFailureReason.AMOUNT_LABEL_INVALID,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {"date_candidates": [{"value": "", "evidence": "04/09/2026", "label": "EMISSÃO"}]},
+            GroundingFailureReason.DATE_VALUE_INVALID,
+            GroundingCandidateKind.DATE,
+        ),
+        (
+            {"date_candidates": [{"value": "2026-09-04", "evidence": "data", "label": "EMISSÃO"}]},
+            GroundingFailureReason.DATE_EVIDENCE_INVALID,
+            GroundingCandidateKind.DATE,
+        ),
+        (
+            {
+                "date_candidates": [
+                    {"value": "2026-09-05", "evidence": "05/09/2026", "label": "EMISSÃO"}
+                ]
+            },
+            GroundingFailureReason.DATE_EVIDENCE_NOT_FOUND,
+            GroundingCandidateKind.DATE,
+        ),
+        (
+            {"date_candidates": [{"value": "2026-09-04", "evidence": "04/09/2026", "label": ""}]},
+            GroundingFailureReason.DATE_LABEL_INVALID,
+            GroundingCandidateKind.DATE,
+        ),
+        (
+            {"merchant_candidates": [{"value": "", "evidence": "MERCADO OINK"}]},
+            GroundingFailureReason.MERCHANT_VALUE_INVALID,
+            GroundingCandidateKind.MERCHANT,
+        ),
+        (
+            {"merchant_candidates": [{"value": "MERCADO OINK", "evidence": "loja"}]},
+            GroundingFailureReason.MERCHANT_EVIDENCE_INVALID,
+            GroundingCandidateKind.MERCHANT,
+        ),
+        (
+            {"merchant_candidates": [{"value": "OUTRA LOJA", "evidence": "OUTRA LOJA"}]},
+            GroundingFailureReason.MERCHANT_EVIDENCE_NOT_FOUND,
+            GroundingCandidateKind.MERCHANT,
+        ),
+        (
+            {"payment_method_candidates": [{"value": "", "evidence": "PIX"}]},
+            GroundingFailureReason.PAYMENT_METHOD_VALUE_INVALID,
+            GroundingCandidateKind.PAYMENT_METHOD,
+        ),
+        (
+            {"payment_method_candidates": [{"value": "PIX", "evidence": "pagamento"}]},
+            GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_INVALID,
+            GroundingCandidateKind.PAYMENT_METHOD,
+        ),
+        (
+            {"payment_method_candidates": [{"value": "DINHEIRO", "evidence": "DINHEIRO"}]},
+            GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND,
+            GroundingCandidateKind.PAYMENT_METHOD,
+        ),
+    ],
+)
+async def test_reports_sanitized_candidate_grounding_reasons(
+    overrides: dict[str, object],
+    reason: GroundingFailureReason,
+    kind: GroundingCandidateKind,
+) -> None:
+    instance, _ = analyzer(response(**overrides))
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    error = caught.value
+    assert error.code is ImageAnalysisErrorCode.GROUNDING
+    assert error.grounding_reason is reason
+    assert error.candidate_kind is kind
+    assert error.candidate_index == 0
+
+
+async def test_reports_duplicate_candidate_reason() -> None:
+    duplicate = {"value": "42.50", "evidence": "TOTAL R$ 42,50", "label": "TOTAL"}
+    instance, _ = analyzer(
+        response(
+            amount_candidates=[duplicate, duplicate],
+            warnings=["MULTIPLE_AMOUNTS"],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.DUPLICATE_CANDIDATE
+    assert caught.value.candidate_kind is GroundingCandidateKind.AMOUNT
+    assert caught.value.candidate_index == 1
+
+
+@pytest.mark.parametrize(
+    ("visible", "evidence"),
+    [
+        ("TOTAL R$\u00a01.234,56", "TOTAL R$\u202f1.234,56"),
+        ("TOTAL\nR$\t1.234,56", "TOTAL   R$ 1.234,56"),
+        ("TOTAL R$ 1.234,56\ufe0f", "TOTAL R$ 1.234,56"),
+    ],
+)
+async def test_safe_structural_normalization_grounds_brazilian_amount(
+    visible: str, evidence: str
+) -> None:
+    instance, _ = analyzer(
+        response(
+            visible_text=visible,
+            amount_candidates=[{"value": "1234.56", "evidence": evidence, "label": "TOTAL"}],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.visible_text == visible
+    assert result.amount_candidates[0].evidence == evidence
+    assert str(result.amount_candidates[0].value) == "1234.56"
+
+
+@pytest.mark.parametrize(
+    ("visible", "evidence"),
+    [("R$ 20,00", "R$ 20,00"), ("TOTAL R$ 20,00", "R$ 20,00")],
+)
+async def test_amount_at_text_boundary_is_not_mistaken_for_partial_token(
+    visible: str, evidence: str
+) -> None:
+    instance, _ = analyzer(
+        response(
+            visible_text=visible,
+            amount_candidates=[{"value": "20.00", "evidence": evidence, "label": "TOTAL"}],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+        )
+    )
+    result = await instance.analyze(image())
+    assert str(result.amount_candidates[0].value) == "20.00"
+
+
+@pytest.mark.parametrize("separator", ["/", "-", "."])
+async def test_date_separators_and_line_whitespace_are_grounded(separator: str) -> None:
+    visual_date = separator.join(("04", "09", "2026"))
+    visible = f"EMISSÃO\n{visual_date}"
+    evidence = f"EMISSÃO  {visual_date}"
+    instance, _ = analyzer(
+        response(
+            visible_text=visible,
+            amount_candidates=[],
+            date_candidates=[{"value": "2026-09-04", "evidence": evidence, "label": "EMISSÃO"}],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.visible_text == visible
+    assert result.date_candidates[0].evidence == evidence
+
+
+async def test_merchant_accepts_case_and_canonical_unicode_only() -> None:
+    visible = "CAFÉ\ufe0f OINK"
+    evidence = "cafe\u0301 oink"
+    instance, _ = analyzer(
+        response(
+            visible_text=visible,
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[{"value": "Café Oink", "evidence": evidence}],
+            payment_method_candidates=[],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.visible_text == visible
+    assert result.merchant_candidates[0].evidence == evidence
+
+    instance, _ = analyzer(
+        response(
+            visible_text="CAFÉ OINK",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[{"value": "Café Oink", "evidence": "CAFE OINK"}],
+            payment_method_candidates=[],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.MERCHANT_EVIDENCE_NOT_FOUND
+
+
+async def test_payment_method_accepts_case_but_not_removed_accent() -> None:
+    instance, _ = analyzer(
+        response(
+            visible_text="DÉBITO",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[{"value": "Débito", "evidence": "débito"}],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.payment_method_candidates[0].evidence == "débito"
+
+    instance, _ = analyzer(
+        response(
+            visible_text="CARTÃO",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[{"value": "Cartão", "evidence": "CARTAO"}],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND
+
+
+async def test_different_date_separator_is_not_approximately_matched() -> None:
+    instance, _ = analyzer(
+        response(
+            visible_text="04/09/2026",
+            amount_candidates=[],
+            date_candidates=[{"value": "2026-09-04", "evidence": "04-09-2026", "label": "EMISSÃO"}],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.DATE_EVIDENCE_NOT_FOUND
+
+
+async def test_grounding_logs_and_exception_contain_only_sanitized_metadata(caplog) -> None:
+    private_text = "private merchant account 123456789"
+    instance, _ = analyzer(
+        response(
+            merchant_candidates=[{"value": private_text, "evidence": private_text}],
+        )
+    )
+    with caplog.at_level(logging.WARNING), pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image(), private_text)
+    record = next(record for record in caplog.records if hasattr(record, "grounding_reason"))
+    rendered = caplog.text + repr(caught.value) + str(caught.value)
+    assert record.grounding_reason == "MERCHANT_EVIDENCE_NOT_FOUND"
+    assert record.candidate_kind == "MERCHANT"
+    assert record.candidate_index == 0
+    assert private_text not in rendered
+
+
+def test_every_grounding_reason_has_explicit_test_case() -> None:
+    candidate_reasons = {
+        GroundingFailureReason.AMOUNT_VALUE_INVALID,
+        GroundingFailureReason.AMOUNT_EVIDENCE_INVALID,
+        GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND,
+        GroundingFailureReason.AMOUNT_VALUE_MISMATCH,
+        GroundingFailureReason.AMOUNT_PARTIAL_TOKEN,
+        GroundingFailureReason.AMOUNT_LABEL_INVALID,
+        GroundingFailureReason.DATE_VALUE_INVALID,
+        GroundingFailureReason.DATE_EVIDENCE_INVALID,
+        GroundingFailureReason.DATE_EVIDENCE_NOT_FOUND,
+        GroundingFailureReason.DATE_LABEL_INVALID,
+        GroundingFailureReason.MERCHANT_VALUE_INVALID,
+        GroundingFailureReason.MERCHANT_EVIDENCE_INVALID,
+        GroundingFailureReason.MERCHANT_EVIDENCE_NOT_FOUND,
+        GroundingFailureReason.PAYMENT_METHOD_VALUE_INVALID,
+        GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_INVALID,
+        GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND,
+        GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES,
+        GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES,
+        GroundingFailureReason.DUPLICATE_CANDIDATE,
+        GroundingFailureReason.CONTRADICTORY_RESULT,
+    }
+    assert candidate_reasons == set(GroundingFailureReason)
