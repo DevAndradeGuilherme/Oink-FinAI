@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     app_name: str = "Oink FinAI"
     app_env: str = "development"
     app_debug: bool = False
+    pipeline_timing_enabled: bool = False
     database_url: str = "postgresql+asyncpg://oink:oink@localhost:5432/oink"
     redis_url: str = "redis://localhost:6379/0"
     default_timezone: str = "America/Sao_Paulo"
@@ -58,6 +59,9 @@ class Settings(BaseSettings):
     evolution_media_timeout_seconds: float = Field(default=15.0, gt=0)
     media_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     media_max_duration_seconds: int = Field(default=300, gt=0)
+    image_max_width: int = Field(default=4096, gt=0)
+    image_max_height: int = Field(default=4096, gt=0)
+    image_max_pixels: int = Field(default=16_000_000, gt=0)
     expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0)
 
     @property

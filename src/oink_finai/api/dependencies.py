@@ -23,6 +23,9 @@ async def get_evolution_provider() -> AsyncIterator[EvolutionWhatsAppProvider]:
         media_timeout_seconds=settings.evolution_media_timeout_seconds,
         media_max_bytes=settings.media_max_bytes,
         media_max_duration_seconds=settings.media_max_duration_seconds,
+        image_max_width=settings.image_max_width,
+        image_max_height=settings.image_max_height,
+        image_max_pixels=settings.image_max_pixels,
         max_retries=0,
     )
     try:

@@ -1,6 +1,7 @@
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
@@ -9,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from oink_finai.api.dependencies import get_evolution_provider
-from oink_finai.config.settings import get_settings
+from oink_finai.config.settings import Settings, get_settings
 from oink_finai.database.models.conversation_state import ConversationState
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
@@ -22,6 +23,7 @@ from oink_finai.providers.whatsapp.evolution import (
     EvolutionWhatsAppProvider,
 )
 from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
+from oink_finai.services.pipeline_timing import PipelineTiming
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
 
@@ -52,6 +54,24 @@ async def evolution_webhook(
     session: Annotated[AsyncSession, Depends(get_session)],
     provider: Annotated[EvolutionWhatsAppProvider, Depends(get_evolution_provider)],
 ) -> WebhookResponse:
+    settings = get_settings()
+    correlation_id = uuid4()
+    timing = PipelineTiming(settings.pipeline_timing_enabled)
+    timing.event("webhook_received", correlation_id)
+    async with timing.span(None, "webhook_completed", correlation_id):
+        return await _handle_evolution_webhook(
+            payload, session, provider, correlation_id, timing, settings
+        )
+
+
+async def _handle_evolution_webhook(
+    payload: dict[str, Any],
+    session: AsyncSession,
+    provider: EvolutionWhatsAppProvider,
+    correlation_id: UUID,
+    timing: PipelineTiming,
+    settings: Settings,
+) -> WebhookResponse:
     try:
         message = await provider.parse_webhook(payload)
     except EvolutionWebhookInstanceError:
@@ -61,13 +81,17 @@ async def evolution_webhook(
         ) from None
     if message is None:
         return WebhookResponse(status="ignored")
-    decision = filter_inbound_message(message, get_settings())
+    async with timing.span(None, "access_filter_completed", correlation_id):
+        decision = filter_inbound_message(message, settings)
     if not decision.accepted or decision.message is None:
         return WebhookResponse(status="ignored")
     message = decision.message
 
-    settings = get_settings()
     media = message.media
+    if media is not None and media.media_type == "image":
+        # Phase 1 deliberately stops after authentication and access control. The opaque
+        # reference and untrusted caption remain request-scoped until worker integration.
+        return WebhookResponse(status="accepted")
     media_reference: EvolutionMediaReference | None = None
     if media is not None:
         if not isinstance(media.reference, EvolutionMediaReference):
@@ -105,26 +129,36 @@ async def evolution_webhook(
                 )
                 if user is None:
                     raise
-        session.add(
-            ProcessedMessage(
-                provider=message.provider,
-                instance_id=message.instance_id,
-                external_message_id=message.external_message_id,
-                user_id=user.id,
-                accepted_text=accepted_text,
-                source_type=source_type,
-                media_remote_jid=(media_reference.remote_jid if media_reference else None),
-                media_mime_type=(
-                    media.declared_mime_type.partition(";")[0].strip().lower() if media else None
-                ),
-                media_duration_seconds=(media.declared_duration_seconds if media else None),
-                media_is_voice_note=(media.is_voice_note if media else None),
-                message_timestamp=message.timestamp,
-                status=ProcessedMessageStatus.PENDING,
-                available_at=datetime.now(UTC),
-            )
+        processed_message = ProcessedMessage(
+            id=correlation_id,
+            provider=message.provider,
+            instance_id=message.instance_id,
+            external_message_id=message.external_message_id,
+            user_id=user.id,
+            accepted_text=accepted_text,
+            source_type=source_type,
+            media_remote_jid=(media_reference.remote_jid if media_reference else None),
+            media_mime_type=(
+                media.declared_mime_type.partition(";")[0].strip().lower() if media else None
+            ),
+            media_duration_seconds=(media.declared_duration_seconds if media else None),
+            media_is_voice_note=(media.is_voice_note if media else None),
+            message_timestamp=message.timestamp,
+            status=ProcessedMessageStatus.PENDING,
+            available_at=datetime.now(UTC),
         )
-        await session.commit()
+        session.add(processed_message)
+        async with timing.span(
+            None,
+            "inbound_persisted",
+            correlation_id,
+            source_type=source_type.value,
+            mime_type=(
+                media.declared_mime_type.partition(";")[0].strip().lower() if media else None
+            ),
+            audio_duration_seconds=(media.declared_duration_seconds if media else None),
+        ):
+            await session.commit()
     except IntegrityError:
         await session.rollback()
         return WebhookResponse(status="duplicate")

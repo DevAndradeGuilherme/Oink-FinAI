@@ -9,10 +9,11 @@ class InboundMedia(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    media_type: Literal["audio"]
+    media_type: Literal["audio", "image"]
     declared_mime_type: str
-    declared_duration_seconds: int | None
-    is_voice_note: bool
+    caption: str | None = None
+    declared_duration_seconds: int | None = None
+    is_voice_note: bool = False
     reference: object = Field(exclude=True, repr=False)
 
 
