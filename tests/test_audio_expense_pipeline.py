@@ -3,8 +3,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
+from openai import AsyncOpenAI
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -30,6 +32,7 @@ from oink_finai.services.expense_processing import (
     ExpenseProcessingService,
 )
 from oink_finai.services.gemini_errors import GeminiRateLimitError
+from oink_finai.services.openai_audio_transcriber import OpenAIAudioTranscriber
 from oink_finai.services.transcription_errors import (
     NoSpeechError,
     TranscriptionError,
@@ -155,7 +158,7 @@ async def seed_audio(
 def processor(
     factory: async_sessionmaker[AsyncSession],
     provider: FakeProvider,
-    transcriber: FakeTranscriber,
+    transcriber: AudioTranscriber,
     interpreter: FakeAudioInterpreter,
     *,
     max_attempts: int = 3,
@@ -198,6 +201,87 @@ async def test_audio_success_checkpoints_transcript_and_creates_text_confirmatio
         assert outbox is not None and outbox.content_type == "TEXT" and outbox.actions is None
         assert outbox.content.startswith("✅ Novo Gasto Registrado!")
     assert (provider.download_calls, transcriber.calls, interpreter.calls) == (1, 1, 1)
+    assert provider.send_text_calls == 0 and provider.send_interactive_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "transient"),
+    [
+        (400, TranscriptionErrorCode.INVALID_RESPONSE, False),
+        (401, TranscriptionErrorCode.AUTHENTICATION, False),
+        (403, TranscriptionErrorCode.AUTHENTICATION, False),
+        (404, TranscriptionErrorCode.MODEL_UNAVAILABLE, False),
+        (429, TranscriptionErrorCode.QUOTA_EXCEEDED, True),
+        (500, TranscriptionErrorCode.UNAVAILABLE, True),
+        (503, TranscriptionErrorCode.UNAVAILABLE, True),
+    ],
+)
+async def test_openai_failures_use_durable_retry_and_reuse_successful_checkpoint(
+    audio_factory: async_sessionmaker[AsyncSession],
+    status: int,
+    code: TranscriptionErrorCode,
+    transient: bool,
+) -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(status, json={"error": {"message": "synthetic failure"}})
+        return httpx.Response(200, json={"text": "Mercado quarenta e dois e cinquenta"})
+
+    message = await seed_audio(audio_factory)
+    provider = FakeProvider([b"OggSvalid"])
+    interpreter = FakeAudioInterpreter([GeminiRateLimitError("synthetic retry"), expense_result()])
+    async with AsyncOpenAI(
+        api_key="synthetic-key",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        transcriber = OpenAIAudioTranscriber(api_key="synthetic-key", client=client)
+        service = processor(audio_factory, provider, transcriber, interpreter, max_attempts=4)
+        assert await service.claim(1) == [message.id]
+        await service.process(message.id)
+
+        async with audio_factory() as session:
+            saved = await session.get(ProcessedMessage, message.id)
+            assert saved.last_error_code == code.value
+            assert saved.transcribed_at is None
+            assert saved.processing_attempts == 1
+            assert await session.scalar(select(func.count()).select_from(Expense)) == 0
+            if transient:
+                assert saved.status is ProcessedMessageStatus.PENDING
+                assert saved.media_remote_jid and saved.next_attempt_at
+                assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 0
+            else:
+                assert saved.status is ProcessedMessageStatus.FAILED
+                assert saved.media_remote_jid is None and saved.next_attempt_at is None
+                assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+        assert calls == 1 and provider.download_calls == 1 and interpreter.calls == 0
+
+        if transient:
+            assert await service.claim(1) == [message.id]
+            await service.process(message.id)
+            async with audio_factory() as session:
+                saved = await session.get(ProcessedMessage, message.id)
+                assert saved.status is ProcessedMessageStatus.PENDING
+                assert saved.accepted_text == "Mercado quarenta e dois e cinquenta"
+                assert saved.transcribed_at is not None and saved.media_remote_jid is None
+            assert calls == 2 and provider.download_calls == 2 and interpreter.calls == 1
+
+            assert await service.claim(1) == [message.id]
+            await service.process(message.id)
+            assert calls == 2 and provider.download_calls == 2 and interpreter.calls == 2
+            async with audio_factory() as session:
+                saved = await session.get(ProcessedMessage, message.id)
+                assert saved.status is ProcessedMessageStatus.PROCESSED
+                assert await session.scalar(select(func.count()).select_from(Expense)) == 1
+                assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+        else:
+            assert await service.claim(1) == []
+            await service.process(message.id)
+            assert calls == 1
+        await transcriber.aclose()
     assert provider.send_text_calls == 0 and provider.send_interactive_calls == 0
 
 

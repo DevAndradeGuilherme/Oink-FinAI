@@ -19,7 +19,7 @@ class AudioTranscription(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    transcript: str = Field(max_length=MAX_TRANSCRIPT_CHARACTERS)
+    transcript: str = Field(max_length=MAX_TRANSCRIPT_CHARACTERS, repr=False)
     has_speech: bool
     detected_language: str | None = Field(default=None, max_length=MAX_LANGUAGE_CHARACTERS)
 

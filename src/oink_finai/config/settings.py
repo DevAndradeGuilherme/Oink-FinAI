@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, repr=False)
     gemini_model: str = "gemini-3.1-flash-lite"
     gemini_timeout_seconds: float = Field(default=90.0, gt=0)
+    audio_transcription_provider: Literal["gemini", "openai"] = "gemini"
+    openai_api_key: str | None = Field(default=None, repr=False)
+    openai_audio_transcription_model: str = "gpt-4o-mini-transcribe"
+    openai_audio_transcription_timeout_seconds: float = Field(
+        default=90.0, gt=0, allow_inf_nan=False
+    )
+    openai_audio_transcription_language: str = Field(default="pt", pattern=r"^[a-z]{2}$")
     evolution_base_url: str | None = None
     evolution_api_key: str | None = Field(default=None, repr=False)
     evolution_instance: str | None = None

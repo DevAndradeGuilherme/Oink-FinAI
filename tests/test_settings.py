@@ -131,3 +131,58 @@ def test_all_documented_retry_variables_are_consumed() -> None:
             name in getattr(field.validation_alias, "choices", ())
             for field in Settings.model_fields.values()
         )
+
+
+def test_audio_provider_defaults_and_private_key_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AUDIO_TRANSCRIPTION_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_AUDIO_TRANSCRIPTION_MODEL",
+        "OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS",
+        "OPENAI_AUDIO_TRANSCRIPTION_LANGUAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.audio_transcription_provider == "gemini"
+    assert settings.openai_api_key is None
+    assert settings.openai_audio_transcription_model == "gpt-4o-mini-transcribe"
+    assert settings.openai_audio_transcription_timeout_seconds == 90.0
+    assert settings.openai_audio_transcription_language == "pt"
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-private-key")
+    settings = Settings(_env_file=None)
+    assert "synthetic-private-key" not in repr(settings)
+    assert Settings.model_fields["openai_api_key"].repr is False
+
+
+def test_openai_audio_environment_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "AUDIO_TRANSCRIPTION_PROVIDER": "openai",
+        "OPENAI_API_KEY": "synthetic-private-key",
+        "OPENAI_AUDIO_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+        "OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS": "15.5",
+        "OPENAI_AUDIO_TRANSCRIPTION_LANGUAGE": "en",
+    }.items():
+        monkeypatch.setenv(name, value)
+    settings = Settings(_env_file=None)
+    assert settings.audio_transcription_provider == "openai"
+    assert settings.openai_api_key == "synthetic-private-key"
+    assert settings.openai_audio_transcription_model == "gpt-4o-mini-transcribe"
+    assert settings.openai_audio_transcription_timeout_seconds == 15.5
+    assert settings.openai_audio_transcription_language == "en"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AUDIO_TRANSCRIPTION_PROVIDER", "unsupported"),
+        ("OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "0"),
+        ("OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "-1"),
+        ("OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "nan"),
+        ("OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "inf"),
+        ("OPENAI_AUDIO_TRANSCRIPTION_LANGUAGE", "pt-BR"),
+    ],
+)
+def test_invalid_openai_audio_settings_are_rejected(monkeypatch, name, value) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

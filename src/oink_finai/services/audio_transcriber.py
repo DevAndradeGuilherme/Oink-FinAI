@@ -24,3 +24,7 @@ class AudioTranscriber(ABC):
     @abstractmethod
     async def transcribe(self, audio: ValidatedAudio) -> AudioTranscription:
         """Transcribe validated audio without interpreting its meaning."""
+
+    async def aclose(self) -> None:
+        """Release owned resources; implementations without resources need no cleanup."""
+        return None

@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
 from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
+from oink_finai.services.audio_transcriber_factory import create_audio_transcriber
 from oink_finai.services.expense_processing import ExpenseProcessingService
-from oink_finai.services.gemini_audio_transcriber import GeminiAudioTranscriber
 from oink_finai.services.gemini_expense_interpreter import GeminiExpenseInterpreter
 from oink_finai.services.gemini_image_analyzer import GeminiImageAnalyzer
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
@@ -50,13 +50,7 @@ async def run_worker() -> None:
         image_max_pixels=settings.image_max_pixels,
         max_retries=0,
     )
-    audio_transcriber = GeminiAudioTranscriber(
-        api_key=settings.gemini_api_key,
-        model=settings.gemini_model,
-        timeout_seconds=settings.gemini_timeout_seconds,
-        max_audio_bytes=settings.media_max_bytes,
-        max_duration_seconds=settings.media_max_duration_seconds,
-    )
+    audio_transcriber = create_audio_transcriber(settings)
     image_analyzer = GeminiImageAnalyzer(
         api_key=settings.gemini_api_key,
         model=settings.gemini_model,
