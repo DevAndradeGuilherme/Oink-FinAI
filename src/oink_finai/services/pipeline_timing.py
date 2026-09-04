@@ -38,6 +38,12 @@ TIMING_EVENTS = frozenset(
         "queue_wait_completed",
         "media_download_started",
         "media_download_completed",
+        "image_download_started",
+        "image_download_completed",
+        "image_analysis_started",
+        "image_analysis_completed",
+        "image_checkpoint_started",
+        "image_checkpoint_completed",
         "transcription_started",
         "transcription_completed",
         "transcript_checkpoint_started",
@@ -61,6 +67,9 @@ _STAGES = frozenset(
         "processing",
         "media_download",
         "transcription",
+        "image_download",
+        "image_analysis",
+        "image_checkpoint",
         "interpretation",
         "expense_persistence",
         "send",
@@ -112,7 +121,7 @@ class PipelineTiming:
                 "terminal_failure",
             }:
                 continue
-            elif name == "source_type" and value not in {"TEXT", "AUDIO"}:
+            elif name == "source_type" and value not in {"TEXT", "AUDIO", "IMAGE"}:
                 continue
             elif name == "stage" and value not in _STAGES:
                 continue

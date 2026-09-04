@@ -19,6 +19,7 @@ from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
+from oink_finai.domain.enums import MessageSourceType, ProcessedMessageStatus
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import (
     MEDIA_MESSAGE_WRAPPERS,
@@ -245,7 +246,7 @@ def webhook_client(
     get_settings.cache_clear()
 
 
-async def test_webhook_authorizes_image_without_persistence_download_or_gemini(
+async def test_webhook_persists_one_pending_image_without_download_or_gemini(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -266,8 +267,44 @@ async def test_webhook_authorizes_image_without_persistence_download_or_gemini(
     )
 
     assert response.status_code == 200 and response.json() == {"status": "accepted"}
-    for model in (User, ProcessedMessage, Expense, OutboundMessage):
-        assert await session.scalar(select(func.count()).select_from(model)) == 0
+    assert await session.scalar(select(func.count()).select_from(User)) == 1
+    saved = await session.scalar(select(ProcessedMessage))
+    assert saved is not None
+    assert saved.status is ProcessedMessageStatus.PENDING
+    assert saved.source_type == MessageSourceType.IMAGE
+    assert saved.media_remote_jid is not None
+    assert saved.image_analysis is None and saved.image_analyzed_at is None
+    assert await session.scalar(select(func.count()).select_from(Expense)) == 0
+    assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 0
+
+
+async def test_image_webhook_normalizes_caption_and_is_idempotent(
+    webhook_client: TestClient, session: AsyncSession
+) -> None:
+    payload = image_payload(caption="  contexto do usuário  ")
+    headers = {"X-Evolution-Webhook-Secret": SECRET}
+
+    first = webhook_client.post("/api/v1/webhooks/evolution", json=payload, headers=headers)
+    duplicate = webhook_client.post("/api/v1/webhooks/evolution", json=payload, headers=headers)
+
+    assert first.json() == {"status": "accepted"}
+    assert duplicate.json() == {"status": "duplicate"}
+    saved = list(await session.scalars(select(ProcessedMessage)))
+    assert len(saved) == 1 and saved[0].media_caption == "contexto do usuário"
+
+
+@pytest.mark.parametrize("caption", ["x" * 2001, "controle\x00invalido"])
+async def test_image_webhook_rejects_unsafe_caption_before_persistence(
+    webhook_client: TestClient, session: AsyncSession, caption: str
+) -> None:
+    response = webhook_client.post(
+        "/api/v1/webhooks/evolution",
+        json=image_payload(caption=caption),
+        headers={"X-Evolution-Webhook-Secret": SECRET},
+    )
+
+    assert response.json() == {"status": "ignored"}
+    assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 0
 
 
 @pytest.mark.parametrize(

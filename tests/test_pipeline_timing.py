@@ -117,6 +117,28 @@ def test_negative_clock_delta_is_clamped() -> None:
     assert PipelineTiming.elapsed_ms(now, now - timedelta(seconds=1)) == 0
 
 
+def test_image_timing_events_accept_only_sanitized_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    timing = PipelineTiming(True)
+    correlation_id = uuid4()
+
+    with caplog.at_level(logging.INFO):
+        with timing.span(
+            "image_analysis_started",
+            "image_analysis_completed",
+            correlation_id,
+            attempt_number=2,
+            source_type="IMAGE",
+        ) as span:
+            span.result(outcome="terminal_failure", error_code="IMAGE_ANALYSIS_INVALID_RESPONSE")
+
+    completed = records(caplog)[-1]
+    assert completed.event == "image_analysis_completed"
+    assert completed.source_type == "IMAGE" and completed.attempt_number == 2
+    assert completed.error_code == "IMAGE_ANALYSIS_INVALID_RESPONSE"
+
+
 def test_unknown_or_sensitive_fields_never_enter_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -9,6 +9,7 @@ from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
 from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.gemini_audio_transcriber import GeminiAudioTranscriber
 from oink_finai.services.gemini_expense_interpreter import GeminiExpenseInterpreter
+from oink_finai.services.gemini_image_analyzer import GeminiImageAnalyzer
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
 
@@ -44,6 +45,9 @@ async def run_worker() -> None:
         media_timeout_seconds=settings.evolution_media_timeout_seconds,
         media_max_bytes=settings.media_max_bytes,
         media_max_duration_seconds=settings.media_max_duration_seconds,
+        image_max_width=settings.image_max_width,
+        image_max_height=settings.image_max_height,
+        image_max_pixels=settings.image_max_pixels,
         max_retries=0,
     )
     audio_transcriber = GeminiAudioTranscriber(
@@ -52,6 +56,12 @@ async def run_worker() -> None:
         timeout_seconds=settings.gemini_timeout_seconds,
         max_audio_bytes=settings.media_max_bytes,
         max_duration_seconds=settings.media_max_duration_seconds,
+    )
+    image_analyzer = GeminiImageAnalyzer(
+        api_key=settings.gemini_api_key,
+        model=settings.gemini_model,
+        timeout_seconds=settings.gemini_timeout_seconds,
+        max_image_bytes=settings.media_max_bytes,
     )
     timing = PipelineTiming(settings.pipeline_timing_enabled)
     processing = ExpenseProcessingService(
@@ -68,6 +78,7 @@ async def run_worker() -> None:
         delete_confirmation_ttl_seconds=settings.expense_delete_confirmation_ttl_seconds,
         media_provider=provider,
         audio_transcriber_factory=lambda: audio_transcriber,
+        image_analyzer_factory=lambda: image_analyzer,
         timing=timing,
     )
     delivery = OutboxDeliveryService(
@@ -102,6 +113,7 @@ async def run_worker() -> None:
                 pass
     finally:
         await audio_transcriber.aclose()
+        await image_analyzer.aclose()
         await provider.aclose()
         await engine.dispose()
 

@@ -43,7 +43,11 @@ from oink_finai.services.image_analysis_errors import (
     ImageAnalysisError,
     ImageAnalysisErrorCode,
 )
-from oink_finai.services.image_analyzer import ImageAnalyzer, ValidatedImage
+from oink_finai.services.image_analyzer import (
+    ImageAnalyzer,
+    ValidatedImage,
+    normalize_image_caption,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -307,12 +311,13 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         return mime_type
 
     def _validate_caption(self, caption: str | None) -> str | None:
-        if caption is None:
-            return None
-        if not isinstance(caption, str):
-            raise ImageAnalysisError(ImageAnalysisErrorCode.UNSUPPORTED_INPUT, transient=False)
-        normalized = caption.strip()
-        if len(normalized) > self._max_caption_characters or _has_unsafe_control(normalized):
+        try:
+            normalized = normalize_image_caption(caption)
+        except ValueError:
+            raise ImageAnalysisError(
+                ImageAnalysisErrorCode.UNSUPPORTED_INPUT, transient=False
+            ) from None
+        if normalized is not None and len(normalized) > self._max_caption_characters:
             raise ImageAnalysisError(ImageAnalysisErrorCode.UNSUPPORTED_INPUT, transient=False)
         return normalized
 

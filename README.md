@@ -93,7 +93,9 @@ Eventos emitidos: `webhook_received`, `access_filter_completed`, `inbound_persis
 `webhook_completed`, `processing_claimed`, `queue_wait_completed`, `media_download_started`,
 `media_download_completed`, `transcription_started`, `transcription_completed`,
 `transcript_checkpoint_started`, `transcript_checkpoint_completed`, `interpretation_started`,
-`interpretation_completed`, `expense_persistence_started`, `expense_persistence_completed`,
+`interpretation_completed`, `image_download_started`, `image_download_completed`,
+`image_analysis_started`, `image_analysis_completed`, `image_checkpoint_started`,
+`image_checkpoint_completed`, `expense_persistence_started`, `expense_persistence_completed`,
 `processing_completed`, `outbox_claimed`, `outbox_queue_wait_completed`,
 `outbound_send_started`, `outbound_send_completed` e `outbound_accepted`.
 
@@ -112,11 +114,21 @@ persistencia, processamento total, espera da outbox, envio, backoff e tempo inte
 HTTP 201 representa aceitacao, nao entrega ao aparelho nem confirmacao visual. Tempo percebido pelo
 usuario pode ser maior.
 
-### Análise isolada de imagens
+### Pipeline durável de imagens
 
 `GeminiImageAnalyzer` recebe somente bytes e metadados técnicos já validados, além de legenda
 opcional não confiável. Retorna observações estruturadas e evidências literais do texto visível.
-Não cria gasto, não persiste mídia e não participa do webhook ou worker nesta fase.
+Webhook persiste somente referência opaca, MIME normalizado e legenda validada. Worker baixa e
+valida mídia, executa análise isolada e confirma checkpoint JSONB em transação própria antes da
+interpretação financeira. Após checkpoint, referência de download é removida; retries reutilizam
+checkpoint sem novo download ou análise. Expense e confirmação textual usam pipeline e outbox
+existentes.
+
+Checkpoint contém exatamente versão, tipo de documento, flags financeiro/legível, confiança,
+warnings e listas limitadas de candidatos de valor, data, estabelecimento e pagamento com suas
+evidências mínimas. Não contém bytes, base64, URL, mediaKey, payload, headers, EXIF, resposta bruta,
+legenda ou `visible_text` integral. Legenda fica em coluna limitada separada, como contexto não
+visual. JSONB é validado novamente antes do uso.
 
 O grounding preserva `visible_text` e evidências originais. Para comparar representações visuais
 equivalentes, aplica somente composição Unicode NFC, remoção de variation selectors, normalização

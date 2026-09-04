@@ -52,3 +52,16 @@ def test_durable_retry_migration_has_safe_backfill_and_terminal_kind() -> None:
         'alter_column("processed_messages", "processing_attempts", server_default=None)' in source
     )
     assert "UPDATE processed_messages SET last_error_code = error_code" in source
+
+
+def test_image_pipeline_migration_is_linear_minimal_and_forward_only() -> None:
+    source = (MIGRATIONS / "20260904_0009_durable_image_pipeline.py").read_text()
+
+    assert 'down_revision: str | None = "20260903_0008"' in source
+    assert source.count("op.add_column") == 3
+    assert 'sa.Column("media_caption", sa.String(2000))' in source
+    assert 'sa.Column("image_analysis", postgresql.JSONB())' in source
+    assert 'sa.Column("image_analyzed_at", sa.DateTime(timezone=True))' in source
+    assert "source_type IN ('TEXT', 'AUDIO', 'IMAGE')" in source
+    downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
+    assert "drop_column" not in downgrade and "drop_table" not in downgrade

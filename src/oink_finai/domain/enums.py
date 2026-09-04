@@ -59,6 +59,7 @@ class ProcessedMessageStatus(StrEnum):
 class MessageSourceType(StrEnum):
     TEXT = "TEXT"
     AUDIO = "AUDIO"
+    IMAGE = "IMAGE"
 
 
 class OutboundMessageStatus(StrEnum):

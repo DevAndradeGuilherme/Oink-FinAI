@@ -1,7 +1,28 @@
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from oink_finai.domain.image_analysis_limits import IMAGE_ANALYSIS_CAPTION_MAX_LENGTH
 from oink_finai.schemas.image_analysis import ImageAnalysis
+
+
+def normalize_image_caption(caption: str | None) -> str | None:
+    """Validate untrusted caption without changing anything except outer whitespace."""
+    if caption is None:
+        return None
+    if not isinstance(caption, str):
+        raise ValueError("image caption must be text")
+    normalized = caption.strip()
+    if not normalized:
+        return None
+    if len(normalized) > IMAGE_ANALYSIS_CAPTION_MAX_LENGTH:
+        raise ValueError("image caption is too long")
+    if any(
+        unicodedata.category(character) == "Cc" and character not in "\n\r\t"
+        for character in normalized
+    ):
+        raise ValueError("image caption contains unsupported control characters")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True, repr=False)

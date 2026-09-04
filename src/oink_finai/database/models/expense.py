@@ -28,7 +28,9 @@ class Expense(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "expenses"
     __table_args__ = (
         CheckConstraint("amount > 0", name="amount_positive"),
-        CheckConstraint("source_type IN ('TEXT', 'AUDIO')", name="expense_source_type_valid"),
+        CheckConstraint(
+            "source_type IN ('TEXT', 'AUDIO', 'IMAGE')", name="expense_source_type_valid"
+        ),
     )
 
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)

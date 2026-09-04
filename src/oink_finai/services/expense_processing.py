@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import ValidationError
 from sqlalchemy import Select, select
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -37,9 +38,13 @@ from oink_finai.domain.expense_limits import (
     EXPENSE_PAYMENT_METHOD_MAX_LENGTH,
 )
 from oink_finai.providers.whatsapp.base import WhatsAppProvider
-from oink_finai.providers.whatsapp.evolution import EvolutionMediaReference
-from oink_finai.providers.whatsapp.media_errors import MediaError
+from oink_finai.providers.whatsapp.evolution import (
+    EvolutionMediaReference,
+    EvolutionWhatsAppProvider,
+)
+from oink_finai.providers.whatsapp.media_errors import MediaError, MediaErrorCode
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
+from oink_finai.schemas.image_checkpoint import ImageAnalysisCheckpoint
 from oink_finai.schemas.whatsapp import InboundMedia
 from oink_finai.services.audio_transcriber import AudioTranscriber, ValidatedAudio
 from oink_finai.services.expense_commands import (
@@ -61,6 +66,12 @@ from oink_finai.services.gemini_errors import (
     GeminiTimeoutError,
     GeminiUnavailableError,
 )
+from oink_finai.services.image_analysis_errors import ImageAnalysisError
+from oink_finai.services.image_analyzer import (
+    ImageAnalyzer,
+    ValidatedImage,
+    normalize_image_caption,
+)
 from oink_finai.services.pipeline_timing import PipelineTiming
 from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
 
@@ -73,6 +84,9 @@ AUDIO_NO_SPEECH_TEXT = (
 )
 AUDIO_INVALID_TEXT = (
     "Não consegui processar esse áudio. Envie novamente como mensagem de voz ou escreva o gasto."
+)
+IMAGE_INVALID_TEXT = (
+    "Não consegui processar essa imagem. Envie outra foto legível ou escreva o gasto."
 )
 EXPENSE_NOT_FOUND_TEXT = "Gasto não encontrado ou indisponível."
 INVALID_COMMAND_TEXT = "Comando inválido. Use o UUID completo, sem texto adicional."
@@ -113,6 +127,7 @@ class ExpenseProcessingService:
         delete_confirmation_ttl_seconds: float = 600.0,
         media_provider: WhatsAppProvider | None = None,
         audio_transcriber_factory: Callable[[], AudioTranscriber] | None = None,
+        image_analyzer_factory: Callable[[], ImageAnalyzer] | None = None,
         timing: PipelineTiming | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -125,6 +140,7 @@ class ExpenseProcessingService:
         self._delete_confirmation_ttl = timedelta(seconds=delete_confirmation_ttl_seconds)
         self._media_provider = media_provider
         self._audio_transcriber_factory = audio_transcriber_factory
+        self._image_analyzer_factory = image_analyzer_factory
         self._timing = timing or PipelineTiming(False)
 
     async def recover_stale(self, older_than: datetime) -> int:
@@ -271,11 +287,38 @@ class ExpenseProcessingService:
             timezone = user.timezone
             source_type = message.source_type
             transcribed_at = message.transcribed_at
+            image_analyzed_at = message.image_analyzed_at
+            image_analysis_payload = message.image_analysis
+            media_caption = message.media_caption
 
         if source_type == MessageSourceType.AUDIO and transcribed_at is None:
             text = await self._transcribe_audio(message_id)
             if text is None:
                 return
+        image_checkpoint: ImageAnalysisCheckpoint | None = None
+        if source_type == MessageSourceType.IMAGE:
+            try:
+                media_caption = normalize_image_caption(media_caption)
+            except ValueError:
+                await self._mark_image_failed(
+                    message_id, "IMAGE_ANALYSIS_INVALID_CHECKPOINT", IMAGE_INVALID_TEXT
+                )
+                return
+            if image_analyzed_at is None:
+                image_checkpoint = await self._analyze_image(message_id)
+                if image_checkpoint is None:
+                    return
+            else:
+                try:
+                    image_checkpoint = ImageAnalysisCheckpoint.model_validate(
+                        image_analysis_payload
+                    )
+                except (ValidationError, TypeError, ValueError):
+                    await self._mark_image_failed(
+                        message_id, "IMAGE_ANALYSIS_INVALID_CHECKPOINT", IMAGE_INVALID_TEXT
+                    )
+                    return
+            text = image_checkpoint.interpreter_input(media_caption)
         if not text:
             await self._mark_audio_failed(
                 message_id,
@@ -304,6 +347,10 @@ class ExpenseProcessingService:
             ):
                 interpretation = await interpreter.interpret(text, reference_timestamp=timestamp)
                 self._validate_interpretation(interpretation)
+                if image_checkpoint is not None:
+                    interpretation = self._constrain_image_interpretation(
+                        image_checkpoint, interpretation
+                    )
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "GEMINI_TIMEOUT"))
             raise
@@ -401,6 +448,42 @@ class ExpenseProcessingService:
         if payment_method is not None and len(payment_method) > EXPENSE_PAYMENT_METHOD_MAX_LENGTH:
             raise InterpretationLimitError("PAYMENT_METHOD_TOO_LONG")
 
+    @staticmethod
+    def _constrain_image_interpretation(
+        checkpoint: ImageAnalysisCheckpoint,
+        result: ExpenseInterpretation,
+    ) -> ExpenseInterpretation:
+        if not checkpoint.is_financial_document:
+            intent = ExpenseIntent.NOT_EXPENSE
+        elif not checkpoint.is_legible:
+            intent = ExpenseIntent.UNCLEAR
+        elif len(checkpoint.distinct_amounts()) != 1 or len(checkpoint.distinct_dates()) > 1:
+            intent = ExpenseIntent.UNCLEAR
+        elif result.intent is ExpenseIntent.CREATE_EXPENSE:
+            visual_amount = next(iter(checkpoint.distinct_amounts()))
+            valid_evidence = {
+                candidate.evidence
+                for candidate in checkpoint.amount_candidates
+                if Decimal(candidate.value) == visual_amount
+            }
+            intent = (
+                ExpenseIntent.CREATE_EXPENSE
+                if result.amount == visual_amount and result.amount_evidence in valid_evidence
+                else ExpenseIntent.UNCLEAR
+            )
+        else:
+            intent = result.intent
+        if intent is result.intent:
+            return result
+        return result.model_copy(
+            update={
+                "intent": intent,
+                "amount": None,
+                "amount_evidence": None,
+                "description": None,
+            }
+        )
+
     async def _create_expense(
         self,
         session: AsyncSession,
@@ -487,7 +570,11 @@ class ExpenseProcessingService:
 
     async def _mark_failed(self, message_id: UUID, code: str) -> None:
         async with self._session_factory() as session, session.begin():
-            message = await session.scalar(self._locked_message_statement(message_id))
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
             if message is not None and message.status == ProcessedMessageStatus.PROCESSING:
                 message.status = ProcessedMessageStatus.FAILED
                 message.error_code = code
@@ -496,6 +583,8 @@ class ExpenseProcessingService:
                 message.next_attempt_at = None
                 message.media_remote_jid = None
                 message.attempt_count += 1
+                if message.source_type == MessageSourceType.IMAGE:
+                    await self._create_failure_notification(session, message, message.user)
 
     async def _retry_or_fail(self, message_id: UUID, code: str) -> None:
         async with self._session_factory() as session, session.begin():
@@ -515,6 +604,162 @@ class ExpenseProcessingService:
                 return
             message.status = ProcessedMessageStatus.PENDING
             message.next_attempt_at = self._now() + self._retry_delay(message.processing_attempts)
+
+    async def _analyze_image(self, message_id: UUID) -> ImageAnalysisCheckpoint | None:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return None
+            if message.image_analyzed_at is not None:
+                try:
+                    return ImageAnalysisCheckpoint.model_validate(message.image_analysis)
+                except (ValidationError, TypeError, ValueError):
+                    await self._mark_image_failed(
+                        message_id, "IMAGE_ANALYSIS_INVALID_CHECKPOINT", IMAGE_INVALID_TEXT
+                    )
+                    return None
+            if (
+                self._media_provider is None
+                or self._image_analyzer_factory is None
+                or not message.media_remote_jid
+                or not message.media_mime_type
+            ):
+                await self._mark_image_failed(
+                    message_id, "IMAGE_ANALYSIS_CONFIGURATION_ERROR", IMAGE_INVALID_TEXT
+                )
+                return None
+            attempt_number = message.processing_attempts
+            caption = message.media_caption
+            reference = EvolutionMediaReference(
+                message.external_message_id,
+                message.media_remote_jid,
+                False,
+            )
+            media = InboundMedia(
+                media_type="image",
+                declared_mime_type=message.media_mime_type,
+                caption=caption,
+                reference=reference,
+            )
+
+        try:
+            async with self._timing.span(
+                "image_download_started",
+                "image_download_completed",
+                message_id,
+                attempt_number=attempt_number,
+                source_type=MessageSourceType.IMAGE.value,
+                mime_type=media.declared_mime_type,
+            ) as download_span:
+                try:
+                    content = await self._media_provider.download_media(media)
+                except MediaError as exc:
+                    download_span.result(
+                        outcome=("transient_failure" if exc.transient else "terminal_failure"),
+                        error_code=exc.code.value,
+                    )
+                    raise
+                else:
+                    download_span.result(outcome="success", size_bytes=len(content))
+            mime_type = media.declared_mime_type.partition(";")[0].strip().lower()
+            width, height = EvolutionWhatsAppProvider._image_dimensions(mime_type, content)
+            detected_format = {
+                "image/jpeg": "JPEG",
+                "image/png": "PNG",
+                "image/webp": "WEBP",
+            }.get(mime_type)
+            if detected_format is None:
+                raise MediaError(MediaErrorCode.UNSUPPORTED_TYPE, transient=False)
+            image = ValidatedImage(
+                content=content,
+                mime_type=mime_type,
+                width=width,
+                height=height,
+                detected_format=detected_format,
+            )
+            async with self._timing.span(
+                "image_analysis_started",
+                "image_analysis_completed",
+                message_id,
+                attempt_number=attempt_number,
+                source_type=MessageSourceType.IMAGE.value,
+            ) as analysis_span:
+                try:
+                    analysis = await self._image_analyzer_factory().analyze(image, caption)
+                except ImageAnalysisError as exc:
+                    analysis_span.result(
+                        outcome=("transient_failure" if exc.transient else "terminal_failure"),
+                        error_code=exc.code.value,
+                        http_status=(exc.metadata.http_status if exc.metadata else None),
+                    )
+                    raise
+                else:
+                    analysis_span.result(outcome="success")
+            checkpoint = ImageAnalysisCheckpoint.from_analysis(analysis)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._retry_or_fail(message_id, "IMAGE_ANALYSIS_UNAVAILABLE"))
+            raise
+        except MediaError as exc:
+            if exc.transient:
+                await self._retry_or_fail(message_id, exc.code.value)
+            else:
+                await self._mark_image_failed(message_id, exc.code.value, IMAGE_INVALID_TEXT)
+            return None
+        except ImageAnalysisError as exc:
+            if exc.transient:
+                await self._retry_or_fail(message_id, exc.code.value)
+            else:
+                await self._mark_image_failed(message_id, exc.code.value, IMAGE_INVALID_TEXT)
+            return None
+        except (ValidationError, TypeError, ValueError):
+            await self._mark_image_failed(
+                message_id, "IMAGE_ANALYSIS_INVALID_CHECKPOINT", IMAGE_INVALID_TEXT
+            )
+            return None
+
+        async with (
+            self._timing.span(
+                "image_checkpoint_started",
+                "image_checkpoint_completed",
+                message_id,
+                attempt_number=attempt_number,
+                source_type=MessageSourceType.IMAGE.value,
+            ) as checkpoint_span,
+            self._session_factory() as session,
+            session.begin(),
+        ):
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if (
+                message is None
+                or message.status != ProcessedMessageStatus.PROCESSING
+                or message.processing_attempts != attempt_number
+            ):
+                checkpoint_span.result(outcome="terminal_failure", error_code="STALE_ATTEMPT")
+                return None
+            if message.image_analyzed_at is None:
+                message.image_analysis = checkpoint.payload()
+                message.image_analyzed_at = self._now()
+                message.media_remote_jid = None
+            checkpoint_span.result(outcome="success")
+            return checkpoint
+
+    async def _mark_image_failed(self, message_id: UUID, code: str, content: str) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
+                return
+            message.status = ProcessedMessageStatus.FAILED
+            message.error_code = code
+            message.last_error_code = code
+            message.locked_at = None
+            message.next_attempt_at = None
+            message.media_remote_jid = None
+            message.attempt_count += 1
+            await self._create_failure_notification(session, message, message.user, content=content)
 
     async def _transcribe_audio(self, message_id: UUID) -> str | None:
         async with self._session_factory() as session:
@@ -944,6 +1189,8 @@ class ExpenseProcessingService:
             return "media_download"
         if error_code.startswith(("TRANSCRIPTION_", "AUDIO_")):
             return "transcription"
+        if error_code.startswith("IMAGE_ANALYSIS_"):
+            return "image_analysis"
         if error_code.startswith("GEMINI_"):
             return "interpretation"
         if error_code.startswith("PERSISTENCE_"):

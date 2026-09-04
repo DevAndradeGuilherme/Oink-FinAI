@@ -23,6 +23,7 @@ from oink_finai.providers.whatsapp.evolution import (
     EvolutionWhatsAppProvider,
 )
 from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
+from oink_finai.services.image_analyzer import normalize_image_caption
 from oink_finai.services.pipeline_timing import PipelineTiming
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
@@ -88,25 +89,31 @@ async def _handle_evolution_webhook(
     message = decision.message
 
     media = message.media
-    if media is not None and media.media_type == "image":
-        # Phase 1 deliberately stops after authentication and access control. The opaque
-        # reference and untrusted caption remain request-scoped until worker integration.
-        return WebhookResponse(status="accepted")
     media_reference: EvolutionMediaReference | None = None
     if media is not None:
         if not isinstance(media.reference, EvolutionMediaReference):
             return WebhookResponse(status="ignored")
         media_reference = media.reference
         accepted_text = ""
-        source_type = MessageSourceType.AUDIO
+        if media.media_type == "image":
+            try:
+                media_caption = normalize_image_caption(media.caption)
+            except ValueError:
+                return WebhookResponse(status="ignored")
+            source_type = MessageSourceType.IMAGE
+        else:
+            media_caption = None
+            source_type = MessageSourceType.AUDIO
     elif message.interaction_id is not None:
         command = parse_expense_action(message.interaction_id)
         if command is None:
             return WebhookResponse(status="ignored")
         accepted_text = expense_command_text(command)
+        media_caption = None
         source_type = MessageSourceType.TEXT
     else:
         accepted_text = (message.text_content or "").strip()
+        media_caption = None
         source_type = MessageSourceType.TEXT
     if source_type is MessageSourceType.TEXT and not accepted_text:
         return WebhookResponse(status="ignored")
@@ -143,6 +150,7 @@ async def _handle_evolution_webhook(
             ),
             media_duration_seconds=(media.declared_duration_seconds if media else None),
             media_is_voice_note=(media.is_voice_note if media else None),
+            media_caption=media_caption,
             message_timestamp=message.timestamp,
             status=ProcessedMessageStatus.PENDING,
             available_at=datetime.now(UTC),

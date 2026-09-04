@@ -321,17 +321,37 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         response_mime = body.get("mimetype")
         if isinstance(response_mime, str) and self._mime_for_comparison(response_mime) != mime_type:
             raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
+        if media.media_type == "image":
+            self.validated_image_metadata(media.declared_mime_type, content)
+        elif not self._signature_matches(mime_type, content):
+            raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
+        return content
+
+    def validated_image_metadata(
+        self, declared_mime_type: str, content: bytes
+    ) -> tuple[str, int, int, str]:
+        """Apply phase-1 image validation and return normalized safe metadata."""
+        mime_type = self._mime_for_comparison(declared_mime_type)
+        if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+            raise MediaError(MediaErrorCode.UNSUPPORTED_TYPE, transient=False)
+        if not content or len(content) > self._media_max_bytes:
+            code = MediaErrorCode.TOO_LARGE if content else MediaErrorCode.MALFORMED_IMAGE
+            raise MediaError(code, transient=False)
         if not self._signature_matches(mime_type, content):
             raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
-        if media.media_type == "image":
-            width, height = self._image_dimensions(mime_type, content)
-            if (
-                width > self._image_max_width
-                or height > self._image_max_height
-                or width * height > self._image_max_pixels
-            ):
-                raise MediaError(MediaErrorCode.DIMENSIONS_EXCEEDED, transient=False)
-        return content
+        width, height = self._image_dimensions(mime_type, content)
+        if (
+            width > self._image_max_width
+            or height > self._image_max_height
+            or width * height > self._image_max_pixels
+        ):
+            raise MediaError(MediaErrorCode.DIMENSIONS_EXCEEDED, transient=False)
+        detected_format = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+        }[mime_type]
+        return mime_type, width, height, detected_format
 
     @staticmethod
     def _extract_media(message: dict[str, Any], key: dict[str, Any]) -> InboundMedia | None:
