@@ -28,6 +28,15 @@ cp .env.example .env
 docker compose up --build
 ```
 
+Para manter API e worker como servicos permanentes gerenciados pelo Compose, use:
+
+```bash
+docker compose up -d api worker
+```
+
+Use `docker compose run --rm <servico> <comando>` somente para comandos oneoff. Nunca use
+`docker compose run` para manter API ou worker ativos; isso cria containers temporarios duplicados.
+
 No Windows PowerShell, use `Copy-Item .env.example .env`. Troque os valores `change-me` no `.env`. A API executa as migrations ao iniciar e fica disponível em `http://localhost:8000`. Verifique:
 
 ```bash
@@ -73,3 +82,38 @@ As tentativas e os intervalos do processamento durável de gastos são configura
 `EXPENSE_RETRY_MAX_SECONDS`. Os nomes anteriores `GEMINI_MAX_ATTEMPTS`,
 `GEMINI_RETRY_BASE_SECONDS` e `GEMINI_RETRY_MAX_SECONDS` permanecem aceitos somente como aliases
 de compatibilidade; quando ambos forem definidos, o nome novo tem prioridade.
+
+### Timing seguro do pipeline
+
+A instrumentacao estruturada fica desabilitada por padrao. Para teste supervisionado, defina
+`PIPELINE_TIMING_ENABLED=true` no ambiente da API e do worker e reinicie ambos. Para desabilitar,
+defina `PIPELINE_TIMING_ENABLED=false` e reinicie os processos.
+
+Eventos emitidos: `webhook_received`, `access_filter_completed`, `inbound_persisted`,
+`webhook_completed`, `processing_claimed`, `queue_wait_completed`, `media_download_started`,
+`media_download_completed`, `transcription_started`, `transcription_completed`,
+`transcript_checkpoint_started`, `transcript_checkpoint_completed`, `interpretation_started`,
+`interpretation_completed`, `expense_persistence_started`, `expense_persistence_completed`,
+`processing_completed`, `outbox_claimed`, `outbox_queue_wait_completed`,
+`outbound_send_started`, `outbound_send_completed` e `outbound_accepted`.
+
+Cada evento usa UUID interno de `ProcessedMessage` como `correlation_id`. Demais campos possiveis:
+timestamp UTC ISO 8601, duracao, tentativa, etapa, tipo de origem, resultado, codigo de erro
+sanitizado, status HTTP numerico, tamanho em bytes, MIME normalizado, duracao declarada do audio e
+proxima tentativa. Nunca sao registrados telefone, JID, identificador externo, texto, transcript,
+dados do gasto, prompt, resposta do Gemini, audio/base64, referencia ou URL de midia, segredos,
+chaves, headers, respostas ou payloads brutos.
+
+Duracoes internas ao processo usam relogio monotonico. Timestamps UTC correlacionam API e worker;
+diferencas entre processos nao usam relogio monotonico. Eventos permitem calcular tempo do
+webhook, espera em fila, download e transcricao por tentativa, checkpoint, interpretacao,
+persistencia, processamento total, espera da outbox, envio, backoff e tempo interno entre
+`webhook_received` e `outbound_accepted`. Esse tempo interno termina na aceitacao pela Evolution:
+HTTP 201 representa aceitacao, nao entrega ao aparelho nem confirmacao visual. Tempo percebido pelo
+usuario pode ser maior.
+
+### Análise isolada de imagens
+
+`GeminiImageAnalyzer` recebe somente bytes e metadados técnicos já validados, além de legenda
+opcional não confiável. Retorna observações estruturadas e evidências literais do texto visível.
+Não cria gasto, não persiste mídia e não participa do webhook ou worker nesta fase.
