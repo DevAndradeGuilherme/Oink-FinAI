@@ -23,6 +23,11 @@ from oink_finai.domain.image_analysis_limits import (
     IMAGE_ANALYSIS_MAX_PAYMENT_METHOD_CANDIDATES,
     IMAGE_ANALYSIS_VISIBLE_TEXT_MAX_LENGTH,
 )
+from oink_finai.domain.monetary_value import (
+    MonetaryValueError,
+    MonetaryValueErrorCode,
+    parse_monetary_value,
+)
 from oink_finai.schemas.image_analysis import (
     GEMINI_IMAGE_ANALYSIS_SCHEMA,
     AmountCandidate,
@@ -47,7 +52,6 @@ _ALLOWED_IMAGE_FORMATS = {
     "image/png": "PNG",
     "image/webp": "WEBP",
 }
-_DECIMAL_PATTERN = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d{1,2})?$")
 _MONEY_TOKEN_PATTERN = re.compile(r"(?<![\w.,])(?:R\$[ \t]*)?\d[\d.,]*(?![\w.,])")
 _PROVIDER_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SAFE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
@@ -67,6 +71,11 @@ Regras obrigatórias:
 - Não invente nem complete partes ilegíveis.
 - Não escolha arbitrariamente um total quando houver vários valores ou datas; mantenha candidatos
   distintos e use os warnings correspondentes.
+- Em cada amount_candidate, value deve ser string decimal canônica.
+- value: sem R$; sem separador de milhar.
+- value deve usar ponto decimal e no máximo duas casas. Exemplos: "42.00" e "1234.56".
+- Em cada amount_candidate, evidence deve permanecer exatamente como transcrita em visible_text;
+  value e evidence são representações diferentes e não devem ser copiados um sobre o outro.
 - Não classifique categoria financeira, não crie Expense e não decida qual candidato é o gasto.
 - Não infira forma de pagamento sem evidência visual literal.
 - Evidências devem ser trechos literais de visible_text e conter o dado que sustentam.
@@ -467,12 +476,20 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         return converted
 
     def _parse_amount(self, value: str, kind: GroundingCandidateKind, index: int) -> Decimal:
-        if not _DECIMAL_PATTERN.fullmatch(value):
-            self._raise_grounding(GroundingFailureReason.AMOUNT_VALUE_INVALID, kind, index)
-        amount = Decimal(value)
-        if not amount.is_finite() or amount <= 0 or amount > IMAGE_ANALYSIS_AMOUNT_MAX:
-            self._raise_grounding(GroundingFailureReason.AMOUNT_VALUE_INVALID, kind, index)
-        return amount
+        reason_mapping = {
+            MonetaryValueErrorCode.EMPTY: GroundingFailureReason.AMOUNT_VALUE_EMPTY,
+            MonetaryValueErrorCode.NON_NUMERIC: GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC,
+            MonetaryValueErrorCode.AMBIGUOUS: GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS,
+            MonetaryValueErrorCode.NON_POSITIVE: GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE,
+            MonetaryValueErrorCode.SCALE_EXCEEDED: (
+                GroundingFailureReason.AMOUNT_VALUE_SCALE_EXCEEDED
+            ),
+            MonetaryValueErrorCode.OUT_OF_RANGE: (GroundingFailureReason.AMOUNT_VALUE_OUT_OF_RANGE),
+        }
+        try:
+            return parse_monetary_value(value, maximum=IMAGE_ANALYSIS_AMOUNT_MAX)
+        except MonetaryValueError as error:
+            self._raise_grounding(reason_mapping[error.code], kind, index)
 
     def _validate_value(
         self,

@@ -154,6 +154,17 @@ async def test_analyzes_supported_inline_image_once(mime_type: str) -> None:
     assert call["config"].temperature == 0
     assert call["contents"][0].parts[0].inline_data.data == b"private-image-bytes"
     assert call["contents"][0].parts[0].inline_data.mime_type == mime_type
+    instruction = call["config"].system_instruction.text
+    for required in (
+        "string decimal canônica",
+        "sem R$",
+        "sem separador de milhar",
+        "ponto decimal",
+        "no máximo duas casas",
+        '"42.00"',
+        '"1234.56"',
+    ):
+        assert required in instruction
 
 
 @pytest.mark.parametrize("caption", [None, "  pagamento do almoço  "])
@@ -517,8 +528,8 @@ def test_analyzer_has_no_persistence_or_pipeline_imports() -> None:
     ("overrides", "reason", "kind"),
     [
         (
-            {"amount_candidates": [{"value": "20,00", "evidence": "R$ 20,00", "label": "TOTAL"}]},
-            GroundingFailureReason.AMOUNT_VALUE_INVALID,
+            {"amount_candidates": [{"value": "", "evidence": "R$ 42,50", "label": "TOTAL"}]},
+            GroundingFailureReason.AMOUNT_VALUE_EMPTY,
             GroundingCandidateKind.AMOUNT,
         ),
         (
@@ -791,7 +802,12 @@ async def test_grounding_logs_and_exception_contain_only_sanitized_metadata(capl
 
 def test_every_grounding_reason_has_explicit_test_case() -> None:
     candidate_reasons = {
-        GroundingFailureReason.AMOUNT_VALUE_INVALID,
+        GroundingFailureReason.AMOUNT_VALUE_EMPTY,
+        GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC,
+        GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS,
+        GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE,
+        GroundingFailureReason.AMOUNT_VALUE_SCALE_EXCEEDED,
+        GroundingFailureReason.AMOUNT_VALUE_OUT_OF_RANGE,
         GroundingFailureReason.AMOUNT_EVIDENCE_INVALID,
         GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND,
         GroundingFailureReason.AMOUNT_VALUE_MISMATCH,
@@ -813,3 +829,80 @@ def test_every_grounding_reason_has_explicit_test_case() -> None:
         GroundingFailureReason.CONTRADICTORY_RESULT,
     }
     assert candidate_reasons == set(GroundingFailureReason)
+
+
+@pytest.mark.parametrize(
+    ("value", "evidence", "expected"),
+    [
+        ("42", "42", "42"),
+        ("42.00", "42,00", "42.00"),
+        ("42,00", "R$ 42,00", "42.00"),
+        ("R$ 42,00", "R$ 42,00", "42.00"),
+        ("1.234,56", "R$ 1.234,56", "1234.56"),
+        ("R$ 1.234,56", "R$ 1.234,56", "1234.56"),
+        ("1234.56", "R$ 1.234,56", "1234.56"),
+        ("R$\u00a042,00", "R$\u00a042,00", "42.00"),
+        ("R$\u202f42,00", "R$\u202f42,00", "42.00"),
+    ],
+)
+async def test_accepts_unambiguous_value_formats_and_separate_brazilian_evidence(
+    value: str, evidence: str, expected: str
+) -> None:
+    visible = f"TOTAL {evidence}"
+    instance, _ = analyzer(
+        response(
+            visible_text=visible,
+            amount_candidates=[{"value": value, "evidence": evidence, "label": "TOTAL"}],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+        )
+    )
+    result = await instance.analyze(image())
+    assert str(result.amount_candidates[0].value) == expected
+    assert result.amount_candidates[0].evidence == evidence
+    assert result.visible_text == visible
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("", GroundingFailureReason.AMOUNT_VALUE_EMPTY),
+        ("   ", GroundingFailureReason.AMOUNT_VALUE_EMPTY),
+        ("sem número", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("NaN", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("Infinity", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("1e3", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("USD 42", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("€ 42", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("abc42", GroundingFailureReason.AMOUNT_VALUE_NON_NUMERIC),
+        ("42 43", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("42,00 43,00", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("1.234", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("1,234.56", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("1.234.56", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("42.", GroundingFailureReason.AMOUNT_VALUE_AMBIGUOUS),
+        ("-42", GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE),
+        ("R$ -42,00", GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE),
+        ("0", GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE),
+        ("0.00", GroundingFailureReason.AMOUNT_VALUE_NON_POSITIVE),
+        ("42.1234", GroundingFailureReason.AMOUNT_VALUE_SCALE_EXCEEDED),
+        ("1234.567", GroundingFailureReason.AMOUNT_VALUE_SCALE_EXCEEDED),
+        ("42,123", GroundingFailureReason.AMOUNT_VALUE_SCALE_EXCEEDED),
+        ("1000000000000.00", GroundingFailureReason.AMOUNT_VALUE_OUT_OF_RANGE),
+    ],
+)
+async def test_rejects_invalid_value_formats_with_precise_sanitized_reason(
+    value: str, reason: GroundingFailureReason
+) -> None:
+    instance, _ = analyzer(
+        response(
+            amount_candidates=[{"value": value, "evidence": "TOTAL R$ 42,50", "label": "TOTAL"}],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
+    assert caught.value.grounding_reason is reason
+    assert caught.value.candidate_kind is GroundingCandidateKind.AMOUNT
+    assert caught.value.candidate_index == 0
