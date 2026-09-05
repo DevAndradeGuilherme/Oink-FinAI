@@ -12,7 +12,9 @@ COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
 
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && \
+    pip install . && \
+    python -c "import openai; import oink_finai"
 
 EXPOSE 8000
 
