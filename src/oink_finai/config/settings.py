@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     image_max_height: int = Field(default=4096, gt=0)
     image_max_pixels: int = Field(default=16_000_000, gt=0)
     expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0)
+    expense_clarification_ttl_seconds: float = Field(default=900.0, gt=0)
+    expense_clarification_min_confidence: float = Field(default=0.75, ge=0, le=1)
 
     @property
     def whatsapp_allowed_number_set(self) -> frozenset[str]:

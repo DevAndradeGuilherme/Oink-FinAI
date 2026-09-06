@@ -33,6 +33,8 @@ def test_settings_loads_env_example(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.expense_processing_max_attempts == 3
     assert settings.expense_retry_base_seconds == 0.5
     assert settings.expense_retry_max_seconds == 5.0
+    assert settings.expense_clarification_ttl_seconds == 900.0
+    assert settings.expense_clarification_min_confidence == 0.75
 
 
 def test_default_gemini_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,6 +104,8 @@ def test_canonical_retry_names_take_priority_over_legacy_names(
         ("EXPENSE_PROCESSING_MAX_ATTEMPTS", "invalid"),
         ("EXPENSE_RETRY_BASE_SECONDS", "invalid"),
         ("EXPENSE_RETRY_MAX_SECONDS", "invalid"),
+        ("EXPENSE_CLARIFICATION_TTL_SECONDS", "0"),
+        ("EXPENSE_CLARIFICATION_MIN_CONFIDENCE", "1.1"),
     ],
 )
 def test_invalid_numeric_environment_values_are_rejected(
@@ -114,7 +118,7 @@ def test_invalid_numeric_environment_values_are_rejected(
         Settings(_env_file=None)
 
 
-def test_all_documented_retry_variables_are_consumed() -> None:
+def test_all_documented_expense_variables_are_consumed() -> None:
     documented_names = {
         line.partition("=")[0]
         for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
@@ -125,9 +129,11 @@ def test_all_documented_retry_variables_are_consumed() -> None:
         "EXPENSE_PROCESSING_MAX_ATTEMPTS",
         "EXPENSE_RETRY_BASE_SECONDS",
         "EXPENSE_RETRY_MAX_SECONDS",
+        "EXPENSE_CLARIFICATION_TTL_SECONDS",
+        "EXPENSE_CLARIFICATION_MIN_CONFIDENCE",
     }
     for name in documented_names:
-        assert any(
+        assert name.casefold() in Settings.model_fields or any(
             name in getattr(field.validation_alias, "choices", ())
             for field in Settings.model_fields.values()
         )

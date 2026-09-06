@@ -21,13 +21,16 @@ from oink_finai.database.models import (
 from oink_finai.domain.enums import (
     ConversationStatus,
     ExpenseCategory,
+    ExpenseClarificationField,
     ExpenseHistoryAction,
     ExpenseIntent,
+    MessageSourceType,
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
 )
 from oink_finai.providers.whatsapp import WhatsAppProvider
+from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
@@ -75,6 +78,23 @@ class NotExpenseInterpreter(ExpenseInterpreter):
             confidence=1,
             missing_fields=[],
             reasoning_summary="not an expense",
+        )
+
+
+class CompleteExpenseInterpreter(ExpenseInterpreter):
+    async def interpret(self, message: str, *, reference_timestamp: datetime):
+        return ExpenseInterpretation(
+            intent=ExpenseIntent.CREATE_EXPENSE,
+            amount=Decimal("17.50"),
+            amount_evidence="17,50",
+            description="Synthetic",
+            merchant=None,
+            category=ExpenseCategory.FOOD,
+            payment_method=None,
+            expense_date=None,
+            confidence=1,
+            missing_fields=[],
+            reasoning_summary="synthetic",
         )
 
 
@@ -345,7 +365,127 @@ async def test_postgres_two_workers_do_not_start_attempt_beyond_limit() -> None:
             assert saved.locked_at is not None and saved.locked_at.tzinfo is not None
     finally:
         await cleanup_processing_message(factory, user.id)
-        await engine.dispose()
+    await engine.dispose()
+
+
+async def test_postgres_concurrent_clarification_answers_create_one_expense() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    unique = uuid4().hex
+    now = datetime.now(UTC)
+    async with factory() as session, session.begin():
+        category = await session.scalar(
+            select(Category).where(Category.name == ExpenseCategory.FOOD.value)
+        )
+        if category is None:
+            category = Category(name=ExpenseCategory.FOOD.value, slug=f"food-{unique[:12]}")
+            session.add(category)
+        user = User(phone_number=f"clarification-{unique[:16]}")
+        session.add(user)
+        await session.flush()
+        origin = ProcessedMessage(
+            provider="postgres-test",
+            instance_id=unique,
+            external_message_id=f"origin-{unique}",
+            user_id=user.id,
+            accepted_text="synthetic incomplete",
+            source_type=MessageSourceType.TEXT,
+            message_timestamp=now,
+            status=ProcessedMessageStatus.NEEDS_CLARIFICATION,
+            available_at=now,
+            processing_attempts=1,
+        )
+        session.add(origin)
+        await session.flush()
+        context = ExpenseClarificationContext(
+            origin_message_id=origin.id,
+            source_type=MessageSourceType.TEXT,
+            reference_timestamp=now,
+            requested_field=ExpenseClarificationField.AMOUNT,
+            remaining_fields=(ExpenseClarificationField.AMOUNT,),
+            description="Synthetic",
+            category=ExpenseCategory.FOOD,
+        )
+        session.add(
+            ConversationState(
+                user_id=user.id,
+                status=ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+                context=context.payload(),
+                expires_at=now + timedelta(minutes=5),
+            )
+        )
+        responses = [
+            ProcessedMessage(
+                provider="postgres-test",
+                instance_id=unique,
+                external_message_id=f"response-{index}-{unique}",
+                user_id=user.id,
+                clarification_origin_message_id=origin.id,
+                accepted_text="17,50",
+                source_type=MessageSourceType.TEXT,
+                message_timestamp=now,
+                status=ProcessedMessageStatus.PROCESSING,
+                available_at=now,
+                locked_at=now,
+                processing_attempts=1,
+            )
+            for index in range(2)
+        ]
+        session.add_all(responses)
+        await session.flush()
+        user_id = user.id
+        origin_id = origin.id
+        response_ids = [response.id for response in responses]
+
+    processors = [
+        ExpenseProcessingService(
+            factory,
+            lambda _timezone: CompleteExpenseInterpreter(),
+            clock=lambda: now,
+        )
+        for _ in response_ids
+    ]
+    await asyncio.gather(
+        *(
+            processor.process(message_id)
+            for processor, message_id in zip(processors, response_ids, strict=True)
+        )
+    )
+
+    async with factory() as session:
+        expenses = await session.scalar(
+            select(func.count())
+            .select_from(Expense)
+            .where(Expense.processed_message_id == origin_id)
+        )
+        confirmations = await session.scalar(
+            select(func.count())
+            .select_from(OutboundMessage)
+            .where(
+                OutboundMessage.user_id == user_id,
+                OutboundMessage.kind == OutboundMessageKind.EXPENSE_CONFIRMATION,
+            )
+        )
+        state = await session.scalar(
+            select(ConversationState).where(ConversationState.user_id == user_id)
+        )
+        statuses = list(
+            await session.scalars(
+                select(ProcessedMessage.status).where(ProcessedMessage.id.in_(response_ids))
+            )
+        )
+        assert expenses == 1 and confirmations == 1
+        assert state is not None and state.status is ConversationStatus.IDLE
+        assert state.context is None and state.expires_at is None
+        assert sorted(status.value for status in statuses) == ["NOT_EXPENSE", "PROCESSED"]
+
+    async with factory() as session, session.begin():
+        await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
+        await session.execute(delete(Expense).where(Expense.processed_message_id == origin_id))
+        await session.execute(delete(ConversationState).where(ConversationState.user_id == user_id))
+        await session.execute(delete(ProcessedMessage).where(ProcessedMessage.user_id == user_id))
+        await session.execute(delete(User).where(User.id == user_id))
+    await engine.dispose()
 
 
 async def test_postgres_concurrent_delete_confirmations_delete_once() -> None:

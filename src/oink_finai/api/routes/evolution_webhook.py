@@ -4,7 +4,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,13 +15,14 @@ from oink_finai.database.models.conversation_state import ConversationState
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import MessageSourceType, ProcessedMessageStatus
+from oink_finai.domain.enums import ConversationStatus, MessageSourceType, ProcessedMessageStatus
 from oink_finai.providers.whatsapp.access import filter_inbound_message
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionMediaReference,
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
+from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
 from oink_finai.services.image_analyzer import normalize_image_caption
 from oink_finai.services.pipeline_timing import PipelineTiming
@@ -31,6 +32,32 @@ router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
 
 class WebhookResponse(BaseModel):
     status: str
+
+
+def _clarification_origin(state: ConversationState, now: datetime) -> UUID | None:
+    if state.status is not ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
+        return None
+    expires_at = state.expires_at
+    if expires_at is not None and (expires_at.tzinfo is None or expires_at.utcoffset() is None):
+        expires_at = expires_at.replace(tzinfo=UTC)
+    try:
+        context = ExpenseClarificationContext.model_validate(state.context)
+    except (ValidationError, TypeError, ValueError):
+        context = None
+    if context is None:
+        state.status = ConversationStatus.IDLE
+        state.active_expense_id = None
+        state.context = None
+        state.expires_at = None
+        return None
+    if expires_at is None or expires_at <= now:
+        origin_message_id = context.origin_message_id
+        state.status = ConversationStatus.IDLE
+        state.active_expense_id = None
+        state.context = None
+        state.expires_at = None
+        return origin_message_id
+    return context.origin_message_id
 
 
 def verify_webhook_secret(
@@ -120,6 +147,7 @@ async def _handle_evolution_webhook(
     accepted_text = accepted_text[: settings.inbound_message_max_length]
 
     try:
+        conversation_state: ConversationState | None = None
         user = await session.scalar(select(User).where(User.phone_number == message.phone_number))
         if user is None:
             try:
@@ -129,19 +157,33 @@ async def _handle_evolution_webhook(
                     )
                     session.add(user)
                     await session.flush()
-                    session.add(ConversationState(user_id=user.id))
+                    conversation_state = ConversationState(user_id=user.id)
+                    session.add(conversation_state)
             except IntegrityError:
                 user = await session.scalar(
                     select(User).where(User.phone_number == message.phone_number)
                 )
                 if user is None:
                     raise
+        if conversation_state is None:
+            conversation_state = await session.scalar(
+                select(ConversationState)
+                .where(ConversationState.user_id == user.id)
+                .with_for_update(of=ConversationState)
+            )
+        if conversation_state is None:
+            conversation_state = ConversationState(user_id=user.id)
+            session.add(conversation_state)
+            await session.flush()
+        now = datetime.now(UTC)
+        clarification_origin_message_id = _clarification_origin(conversation_state, now)
         processed_message = ProcessedMessage(
             id=correlation_id,
             provider=message.provider,
             instance_id=message.instance_id,
             external_message_id=message.external_message_id,
             user_id=user.id,
+            clarification_origin_message_id=clarification_origin_message_id,
             accepted_text=accepted_text,
             source_type=source_type,
             media_remote_jid=(media_reference.remote_jid if media_reference else None),
@@ -153,7 +195,7 @@ async def _handle_evolution_webhook(
             media_caption=media_caption,
             message_timestamp=message.timestamp,
             status=ProcessedMessageStatus.PENDING,
-            available_at=datetime.now(UTC),
+            available_at=now,
         )
         session.add(processed_message)
         async with timing.span(

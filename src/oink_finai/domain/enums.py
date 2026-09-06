@@ -6,6 +6,17 @@ class ConversationStatus(StrEnum):
     EDITING_EXPENSE = "EDITING_EXPENSE"
     REMOVING_EXPENSE = "REMOVING_EXPENSE"
     WAITING_EXPENSE_DELETE_CONFIRM = "WAITING_EXPENSE_DELETE_CONFIRM"
+    WAITING_EXPENSE_CLARIFICATION = "WAITING_EXPENSE_CLARIFICATION"
+
+
+class ExpenseClarificationField(StrEnum):
+    AMOUNT = "amount"
+    EXPENSE_DATE = "expense_date"
+    DESCRIPTION = "description"
+    MERCHANT = "merchant"
+    CATEGORY = "category"
+    PAYMENT_METHOD = "payment_method"
+    INTENT = "intent"
 
 
 class ExpenseHistoryAction(StrEnum):

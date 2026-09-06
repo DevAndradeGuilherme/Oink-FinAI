@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,9 +20,16 @@ from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import ProcessedMessageStatus
+from oink_finai.domain.enums import (
+    ConversationStatus,
+    ExpenseCategory,
+    ExpenseClarificationField,
+    MessageSourceType,
+    ProcessedMessageStatus,
+)
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
+from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.services.expense_commands import (
     ExpenseCommand,
     ExpenseCommandType,
@@ -333,6 +341,57 @@ async def test_duplicate_webhook_succeeds_without_processing_twice(
     assert duplicate.json() == {"status": "duplicate"}
     count = await session.scalar(select(func.count()).select_from(ProcessedMessage))
     assert count == 1
+
+
+async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
+    webhook_client: TestClient, session: AsyncSession
+) -> None:
+    now = datetime.now(UTC)
+    user = User(phone_number="5511999999999")
+    session.add(user)
+    await session.flush()
+    origin = ProcessedMessage(
+        provider="synthetic",
+        instance_id="synthetic-instance",
+        external_message_id=uuid4().hex,
+        user_id=user.id,
+        accepted_text="synthetic incomplete",
+        source_type=MessageSourceType.TEXT,
+        message_timestamp=now,
+        status=ProcessedMessageStatus.NEEDS_CLARIFICATION,
+        available_at=now,
+    )
+    session.add(origin)
+    await session.flush()
+    origin_id = origin.id
+    context = ExpenseClarificationContext(
+        origin_message_id=origin_id,
+        source_type=MessageSourceType.TEXT,
+        reference_timestamp=now,
+        requested_field=ExpenseClarificationField.AMOUNT,
+        remaining_fields=(ExpenseClarificationField.AMOUNT,),
+        description="Synthetic",
+        category=ExpenseCategory.OTHER,
+    )
+    session.add(
+        ConversationState(
+            user_id=user.id,
+            status=ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+            context=context.payload(),
+            expires_at=now + timedelta(minutes=5),
+        )
+    )
+    await session.commit()
+    payload = dedicated_payload()
+
+    first = post(webhook_client, payload)
+    duplicate = post(webhook_client, payload)
+
+    reply = await session.scalar(select(ProcessedMessage).where(ProcessedMessage.id != origin_id))
+    assert first.json() == {"status": "accepted"}
+    assert duplicate.json() == {"status": "duplicate"}
+    assert reply is not None and reply.clarification_origin_message_id == origin_id
+    assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 2
 
 
 @pytest.mark.parametrize("identity_case", ["outside_allowlist", "participant_alt_bypass", "lid"])

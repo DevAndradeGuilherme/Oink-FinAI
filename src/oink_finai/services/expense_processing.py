@@ -1,7 +1,9 @@
 import asyncio
 import random
+import re
+import unicodedata
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -23,6 +25,7 @@ from oink_finai.database.models import (
 )
 from oink_finai.domain.enums import (
     ConversationStatus,
+    ExpenseClarificationField,
     ExpenseHistoryAction,
     ExpenseIntent,
     MessageSourceType,
@@ -37,12 +40,14 @@ from oink_finai.domain.expense_limits import (
     EXPENSE_MERCHANT_MAX_LENGTH,
     EXPENSE_PAYMENT_METHOD_MAX_LENGTH,
 )
+from oink_finai.domain.monetary_value import MonetaryValueError, parse_monetary_value
 from oink_finai.providers.whatsapp.base import WhatsAppProvider
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionMediaReference,
     EvolutionWhatsAppProvider,
 )
 from oink_finai.providers.whatsapp.media_errors import MediaError, MediaErrorCode
+from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.schemas.image_checkpoint import ImageAnalysisCheckpoint
 from oink_finai.schemas.whatsapp import InboundMedia
@@ -75,7 +80,27 @@ from oink_finai.services.image_analyzer import (
 from oink_finai.services.pipeline_timing import PipelineTiming
 from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
 
-CLARIFICATION_TEXT = "Não encontrei o valor. Envie novamente incluindo o valor do gasto."
+CLARIFICATION_QUESTIONS = {
+    ExpenseClarificationField.AMOUNT: "Qual foi o valor total do gasto?",
+    ExpenseClarificationField.EXPENSE_DATE: (
+        "Em qual data o gasto aconteceu? Responda no formato DD/MM/AAAA."
+    ),
+    ExpenseClarificationField.DESCRIPTION: "O que foi comprado ou pago?",
+    ExpenseClarificationField.MERCHANT: "Em qual estabelecimento o gasto foi feito?",
+    ExpenseClarificationField.CATEGORY: "Qual é a categoria do gasto?",
+    ExpenseClarificationField.PAYMENT_METHOD: (
+        "Como o gasto foi pago: Pix, débito, crédito, dinheiro, transferência ou boleto?"
+    ),
+    ExpenseClarificationField.INTENT: "Você quer registrar isso como gasto? Responda sim ou não.",
+}
+CLARIFICATION_TEXT = CLARIFICATION_QUESTIONS[ExpenseClarificationField.AMOUNT]
+_NEW_EXPENSE_ACTION = re.compile(
+    r"\b(?:gastei|paguei|comprei|abasteci|custou|desembolsei)\b", re.IGNORECASE
+)
+_MONETARY_REFERENCE = re.compile(r"(?:R\$|\d|\breais?\b)", re.IGNORECASE)
+_EXPLICIT_MONETARY_VALUE = re.compile(
+    r"(?:R\$[ \t]*)?[0-9][0-9.,]*(?:[ \t]*reais?)?", re.IGNORECASE
+)
 PROCESSING_FAILURE_TEXT = (
     "⚠️ Não consegui registrar esse gasto agora. Envie a mensagem novamente em alguns minutos."
 )
@@ -125,6 +150,8 @@ class ExpenseProcessingService:
         jitter: Callable[[], float] = random.random,
         clock: Callable[[], datetime] = utc_now,
         delete_confirmation_ttl_seconds: float = 600.0,
+        clarification_ttl_seconds: float = 900.0,
+        clarification_min_confidence: float = 0.75,
         media_provider: WhatsAppProvider | None = None,
         audio_transcriber_factory: Callable[[], AudioTranscriber] | None = None,
         image_analyzer_factory: Callable[[], ImageAnalyzer] | None = None,
@@ -138,6 +165,10 @@ class ExpenseProcessingService:
         self._jitter = jitter
         self._clock = clock
         self._delete_confirmation_ttl = timedelta(seconds=delete_confirmation_ttl_seconds)
+        if clarification_ttl_seconds <= 0 or not 0 <= clarification_min_confidence <= 1:
+            raise ValueError("invalid clarification configuration")
+        self._clarification_ttl = timedelta(seconds=clarification_ttl_seconds)
+        self._clarification_min_confidence = clarification_min_confidence
         self._media_provider = media_provider
         self._audio_transcriber_factory = audio_transcriber_factory
         self._image_analyzer_factory = image_analyzer_factory
@@ -290,6 +321,7 @@ class ExpenseProcessingService:
             image_analyzed_at = message.image_analyzed_at
             image_analysis_payload = message.image_analysis
             media_caption = message.media_caption
+            clarification_origin_id = message.clarification_origin_message_id
 
         if source_type == MessageSourceType.AUDIO and transcribed_at is None:
             text = await self._transcribe_audio(message_id)
@@ -334,23 +366,60 @@ class ExpenseProcessingService:
             except IntegrityError:
                 await self._recover_unique_conflict(message_id)
             return
-        await self._cancel_pending_for_normal_message(message_id)
 
         try:
             interpreter = self._interpreter_factory(timezone)
-            async with self._timing.span(
-                "interpretation_started",
-                "interpretation_completed",
-                message_id,
-                attempt_number=message.processing_attempts,
-                source_type=source_type_value(source_type),
+            clarification, clarification_expired = await self._load_clarification(message.user_id)
+            is_new_intent = source_type == MessageSourceType.IMAGE or self._looks_like_new_expense(
+                text
+            )
+            if (
+                clarification_origin_id is not None
+                and not is_new_intent
+                and (
+                    clarification is None
+                    or clarification.origin_message_id != clarification_origin_id
+                )
             ):
-                interpretation = await interpreter.interpret(text, reference_timestamp=timestamp)
+                await self._discard_stale_clarification_reply(message_id)
+                return
+            if clarification is not None and not is_new_intent:
+                if clarification_expired:
+                    await self._expire_clarification(message_id, clarification)
+                    return
+                interpretation = await self._interpret(
+                    interpreter,
+                    clarification.interpreter_input(text),
+                    timestamp=clarification.reference_timestamp,
+                    message=message,
+                )
+                self._validate_partial_interpretation(interpretation)
+                await self._persist_clarification_answer(message_id, clarification, interpretation)
+                return
+
+            interpretation = await self._interpret(
+                interpreter,
+                text,
+                timestamp=timestamp,
+                message=message,
+            )
+            self._validate_partial_interpretation(interpretation)
+            draft_interpretation = interpretation
+            forced_fields = list(self._image_clarification_fields(image_checkpoint))
+            if (
+                source_type != MessageSourceType.IMAGE
+                and len(self._explicit_monetary_values(text)) > 1
+            ):
+                forced_fields.append(ExpenseClarificationField.AMOUNT)
+            if image_checkpoint is not None:
+                interpretation = self._constrain_image_interpretation(
+                    image_checkpoint, interpretation
+                )
+            clarification_fields = self._clarification_fields(
+                interpretation, forced_fields=self._ordered_fields(forced_fields)
+            )
+            if not clarification_fields:
                 self._validate_interpretation(interpretation)
-                if image_checkpoint is not None:
-                    interpretation = self._constrain_image_interpretation(
-                        image_checkpoint, interpretation
-                    )
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "GEMINI_TIMEOUT"))
             raise
@@ -390,19 +459,26 @@ class ExpenseProcessingService:
                     message.locked_at = None
                     message.next_attempt_at = None
                     return
-                if interpretation.intent is ExpenseIntent.CREATE_EXPENSE:
+                state = await self._locked_state(session, message.user_id)
+                if clarification_fields:
+                    context = self._new_clarification_context(
+                        message,
+                        draft_interpretation,
+                        clarification_fields,
+                        image_checkpoint=image_checkpoint,
+                    )
+                    self._set_clarification_state(state, context)
+                    self._create_clarification_outbox(session, message, context.requested_field)
+                    status = ProcessedMessageStatus.NEEDS_CLARIFICATION
+                elif interpretation.intent is ExpenseIntent.CREATE_EXPENSE:
                     await self._create_expense(session, message, interpretation)
                     status = ProcessedMessageStatus.PROCESSED
-                elif interpretation.intent is ExpenseIntent.UNCLEAR:
-                    self._create_outbox(
-                        session,
-                        message,
-                        content=CLARIFICATION_TEXT,
-                        kind=OutboundMessageKind.CLARIFICATION,
-                        expense=None,
-                    )
-                    status = ProcessedMessageStatus.NEEDS_CLARIFICATION
                 else:
+                    if state.status in {
+                        ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+                        ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM,
+                    }:
+                        self._reset_state(state)
                     status = ProcessedMessageStatus.NOT_EXPENSE
                 self._complete_successfully(message, status)
         except GeminiInterpreterError as exc:
@@ -416,6 +492,408 @@ class ExpenseProcessingService:
                 raise
             await self._mark_failed(message_id, "PERSISTENCE_DATA_ERROR")
 
+    async def _interpret(
+        self,
+        interpreter: ExpenseInterpreter,
+        text: str,
+        *,
+        timestamp: datetime,
+        message: ProcessedMessage,
+    ) -> ExpenseInterpretation:
+        async with self._timing.span(
+            "interpretation_started",
+            "interpretation_completed",
+            message.id,
+            attempt_number=message.processing_attempts,
+            source_type=source_type_value(message.source_type),
+        ):
+            return await interpreter.interpret(text, reference_timestamp=timestamp)
+
+    async def _load_clarification(
+        self, user_id: UUID | None
+    ) -> tuple[ExpenseClarificationContext | None, bool]:
+        if user_id is None:
+            return None, False
+        async with self._session_factory() as session, session.begin():
+            state = await session.scalar(
+                select(ConversationState)
+                .where(ConversationState.user_id == user_id)
+                .with_for_update(of=ConversationState)
+            )
+            if (
+                state is None
+                or state.status is not ConversationStatus.WAITING_EXPENSE_CLARIFICATION
+            ):
+                return None, False
+            try:
+                context = ExpenseClarificationContext.model_validate(state.context)
+            except (ValidationError, TypeError, ValueError):
+                self._reset_state(state)
+                return None, False
+            return context, self._state_expired(state)
+
+    async def _expire_clarification(
+        self, message_id: UUID, expected: ExpenseClarificationContext | None
+    ) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if message is None or message.status is not ProcessedMessageStatus.PROCESSING:
+                return
+            if message.user_id is None:
+                self._fail_locked_message(message, "USER_NOT_FOUND")
+                return
+            state = await self._locked_state(session, message.user_id)
+            if state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
+                if (
+                    expected is None
+                    or state.context == expected.payload()
+                    or self._state_expired(state)
+                ):
+                    self._reset_state(state)
+            self._complete_successfully(message, ProcessedMessageStatus.NOT_EXPENSE)
+
+    async def _discard_stale_clarification_reply(self, message_id: UUID) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if message is None or message.status is not ProcessedMessageStatus.PROCESSING:
+                return
+            self._complete_successfully(message, ProcessedMessageStatus.NOT_EXPENSE)
+
+    async def _persist_clarification_answer(
+        self,
+        message_id: UUID,
+        expected: ExpenseClarificationContext,
+        result: ExpenseInterpretation,
+    ) -> None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.user_id is None
+                or message.user is None
+            ):
+                return
+            state = await self._locked_state(session, message.user_id)
+            if (
+                state.status is not ConversationStatus.WAITING_EXPENSE_CLARIFICATION
+                or state.context != expected.payload()
+            ):
+                self._complete_successfully(message, ProcessedMessageStatus.NOT_EXPENSE)
+                return
+            if self._state_expired(state):
+                self._reset_state(state)
+                self._complete_successfully(message, ProcessedMessageStatus.NOT_EXPENSE)
+                return
+
+            if (
+                expected.requested_field is ExpenseClarificationField.INTENT
+                and result.intent is ExpenseIntent.NOT_EXPENSE
+                and result.confidence >= self._clarification_min_confidence
+            ):
+                origin = await self._locked_clarification_origin(session, message, expected)
+                if origin is not None:
+                    self._complete_successfully(origin, ProcessedMessageStatus.NOT_EXPENSE)
+                self._reset_state(state)
+                self._complete_successfully(message, ProcessedMessageStatus.NOT_EXPENSE)
+                return
+
+            updated = self._merge_clarification(expected, result)
+            if updated is None:
+                self._create_clarification_outbox(session, message, expected.requested_field)
+                self._complete_successfully(message, ProcessedMessageStatus.NEEDS_CLARIFICATION)
+                return
+
+            if updated.remaining_fields:
+                next_context = ExpenseClarificationContext(
+                    **updated.model_dump(exclude={"requested_field", "remaining_fields"}),
+                    requested_field=updated.remaining_fields[0],
+                    remaining_fields=updated.remaining_fields,
+                )
+                state.context = next_context.payload()
+                self._create_clarification_outbox(session, message, next_context.requested_field)
+                self._complete_successfully(message, ProcessedMessageStatus.NEEDS_CLARIFICATION)
+                return
+
+            final_result = self._clarification_result(updated, result.confidence)
+            self._validate_interpretation(final_result)
+            origin = await self._locked_clarification_origin(session, message, expected)
+            if origin is None:
+                self._reset_state(state)
+                self._fail_locked_message(message, "CLARIFICATION_ORIGIN_INVALID")
+                return
+            await self._create_expense(
+                session, message, final_result, origin_message=origin, reset_state=False
+            )
+            self._complete_successfully(origin, ProcessedMessageStatus.PROCESSED)
+            self._reset_state(state)
+            self._complete_successfully(message, ProcessedMessageStatus.PROCESSED)
+
+    async def _locked_clarification_origin(
+        self,
+        session: AsyncSession,
+        response: ProcessedMessage,
+        context: ExpenseClarificationContext,
+    ) -> ProcessedMessage | None:
+        origin = await session.scalar(
+            self._locked_message_statement(context.origin_message_id).options(
+                selectinload(ProcessedMessage.user)
+            )
+        )
+        if (
+            origin is None
+            or origin.user_id != response.user_id
+            or origin.status is not ProcessedMessageStatus.NEEDS_CLARIFICATION
+        ):
+            return None
+        return origin
+
+    @staticmethod
+    def _looks_like_new_expense(text: str) -> bool:
+        return bool(_NEW_EXPENSE_ACTION.search(text) and _MONETARY_REFERENCE.search(text))
+
+    @staticmethod
+    def _explicit_monetary_values(text: str) -> set[Decimal]:
+        values: set[Decimal] = set()
+        for match in _EXPLICIT_MONETARY_VALUE.finditer(text):
+            candidate = match.group().strip()
+            if not candidate.lower().endswith(("real", "reais")) and not candidate.startswith("R$"):
+                continue
+            candidate = re.sub(r"[ \t]*reais?$", "", candidate, flags=re.IGNORECASE).strip()
+            try:
+                values.add(parse_monetary_value(candidate, maximum=EXPENSE_AMOUNT_MAX))
+            except MonetaryValueError:
+                continue
+        return values
+
+    @staticmethod
+    def _normalized_missing_field(value: str) -> ExpenseClarificationField | None:
+        normalized = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", value.casefold())
+            if not unicodedata.combining(character)
+        )
+        normalized = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+        aliases = {
+            "amount": ExpenseClarificationField.AMOUNT,
+            "value": ExpenseClarificationField.AMOUNT,
+            "valor": ExpenseClarificationField.AMOUNT,
+            "total": ExpenseClarificationField.AMOUNT,
+            "date": ExpenseClarificationField.EXPENSE_DATE,
+            "expense_date": ExpenseClarificationField.EXPENSE_DATE,
+            "data": ExpenseClarificationField.EXPENSE_DATE,
+            "description": ExpenseClarificationField.DESCRIPTION,
+            "descricao": ExpenseClarificationField.DESCRIPTION,
+            "item": ExpenseClarificationField.DESCRIPTION,
+            "merchant": ExpenseClarificationField.MERCHANT,
+            "estabelecimento": ExpenseClarificationField.MERCHANT,
+            "loja": ExpenseClarificationField.MERCHANT,
+            "category": ExpenseClarificationField.CATEGORY,
+            "categoria": ExpenseClarificationField.CATEGORY,
+            "payment": ExpenseClarificationField.PAYMENT_METHOD,
+            "payment_method": ExpenseClarificationField.PAYMENT_METHOD,
+            "forma_de_pagamento": ExpenseClarificationField.PAYMENT_METHOD,
+            "pagamento": ExpenseClarificationField.PAYMENT_METHOD,
+            "intent": ExpenseClarificationField.INTENT,
+            "intencao": ExpenseClarificationField.INTENT,
+        }
+        return aliases.get(normalized)
+
+    @staticmethod
+    def _ordered_fields(
+        fields: list[ExpenseClarificationField] | tuple[ExpenseClarificationField, ...],
+    ) -> tuple[ExpenseClarificationField, ...]:
+        priority = (
+            ExpenseClarificationField.AMOUNT,
+            ExpenseClarificationField.EXPENSE_DATE,
+            ExpenseClarificationField.DESCRIPTION,
+            ExpenseClarificationField.MERCHANT,
+            ExpenseClarificationField.CATEGORY,
+            ExpenseClarificationField.PAYMENT_METHOD,
+            ExpenseClarificationField.INTENT,
+        )
+        unique = set(fields)
+        return tuple(field for field in priority if field in unique)
+
+    def _clarification_fields(
+        self,
+        result: ExpenseInterpretation,
+        *,
+        forced_fields: tuple[ExpenseClarificationField, ...] = (),
+    ) -> tuple[ExpenseClarificationField, ...]:
+        if (
+            result.intent is ExpenseIntent.NOT_EXPENSE
+            and result.confidence >= self._clarification_min_confidence
+            and not forced_fields
+        ):
+            return ()
+        fields = list(forced_fields)
+        for value in result.missing_fields:
+            field = self._normalized_missing_field(value)
+            if field is not None:
+                fields.append(field)
+        if result.intent in {ExpenseIntent.CREATE_EXPENSE, ExpenseIntent.UNCLEAR}:
+            if result.amount is None:
+                fields.append(ExpenseClarificationField.AMOUNT)
+            if result.description is None or not result.description.strip():
+                fields.append(ExpenseClarificationField.DESCRIPTION)
+        if result.confidence < self._clarification_min_confidence:
+            fields.append(ExpenseClarificationField.INTENT)
+        if result.intent is ExpenseIntent.UNCLEAR and not fields:
+            fields.append(ExpenseClarificationField.INTENT)
+        return self._ordered_fields(fields)
+
+    @staticmethod
+    def _image_clarification_fields(
+        checkpoint: ImageAnalysisCheckpoint | None,
+    ) -> tuple[ExpenseClarificationField, ...]:
+        if checkpoint is None or not checkpoint.is_financial_document:
+            return ()
+        fields: list[ExpenseClarificationField] = []
+        if not checkpoint.is_legible:
+            fields.extend([ExpenseClarificationField.AMOUNT, ExpenseClarificationField.DESCRIPTION])
+        else:
+            if len(checkpoint.distinct_amounts()) != 1:
+                fields.append(ExpenseClarificationField.AMOUNT)
+            if len(checkpoint.distinct_dates()) > 1:
+                fields.append(ExpenseClarificationField.EXPENSE_DATE)
+            if len(checkpoint.merchant_candidates) > 1:
+                fields.append(ExpenseClarificationField.MERCHANT)
+            if len(checkpoint.payment_method_candidates) > 1:
+                fields.append(ExpenseClarificationField.PAYMENT_METHOD)
+        return ExpenseProcessingService._ordered_fields(fields)
+
+    def _new_clarification_context(
+        self,
+        message: ProcessedMessage,
+        result: ExpenseInterpretation,
+        fields: tuple[ExpenseClarificationField, ...],
+        *,
+        image_checkpoint: ImageAnalysisCheckpoint | None,
+    ) -> ExpenseClarificationContext:
+        values: dict[str, object] = {
+            "amount": result.amount,
+            "description": result.description,
+            "merchant": result.merchant,
+            "category": result.category,
+            "payment_method": result.payment_method,
+            "expense_date": result.expense_date,
+        }
+        if image_checkpoint is not None and image_checkpoint.is_legible:
+            amounts = image_checkpoint.distinct_amounts()
+            if len(amounts) == 1 and ExpenseClarificationField.AMOUNT not in fields:
+                values["amount"] = next(iter(amounts))
+            dates = image_checkpoint.distinct_dates()
+            if len(dates) == 1 and ExpenseClarificationField.EXPENSE_DATE not in fields:
+                candidate = next(iter(dates))
+                try:
+                    values["expense_date"] = date.fromisoformat(candidate)
+                except ValueError:
+                    values["expense_date"] = None
+        for field in fields:
+            if field is not ExpenseClarificationField.INTENT:
+                values[field.value] = None
+        reference_timestamp = message.message_timestamp
+        if reference_timestamp.tzinfo is None or reference_timestamp.utcoffset() is None:
+            reference_timestamp = reference_timestamp.replace(tzinfo=UTC)
+        return ExpenseClarificationContext(
+            origin_message_id=message.id,
+            source_type=message.source_type,
+            reference_timestamp=reference_timestamp,
+            requested_field=fields[0],
+            remaining_fields=fields,
+            **values,
+        )
+
+    def _merge_clarification(
+        self,
+        context: ExpenseClarificationContext,
+        result: ExpenseInterpretation,
+    ) -> ExpenseClarificationContext | None:
+        if (
+            result.intent is not ExpenseIntent.CREATE_EXPENSE
+            or result.confidence < self._clarification_min_confidence
+        ):
+            return None
+        field = context.requested_field
+        resolved: object | None
+        if field is ExpenseClarificationField.INTENT:
+            resolved = True
+        else:
+            resolved = getattr(result, field.value)
+            if isinstance(resolved, str):
+                resolved = resolved.strip() or None
+        if resolved is None:
+            return None
+
+        values = context.model_dump(exclude={"requested_field", "remaining_fields"})
+        if field is not ExpenseClarificationField.INTENT:
+            values[field.value] = resolved
+        remaining = [item for item in context.remaining_fields if item is not field]
+        if values.get("amount") is None:
+            remaining.append(ExpenseClarificationField.AMOUNT)
+        if values.get("description") is None:
+            remaining.append(ExpenseClarificationField.DESCRIPTION)
+        if values.get("category") is None:
+            remaining.append(ExpenseClarificationField.CATEGORY)
+        ordered = self._ordered_fields(remaining)
+        validation_fields = ordered or (field,)
+        validated = ExpenseClarificationContext(
+            **values,
+            requested_field=validation_fields[0],
+            remaining_fields=validation_fields,
+        )
+        if ordered:
+            return validated
+        return validated.model_copy(update={"remaining_fields": ()})
+
+    @staticmethod
+    def _clarification_result(
+        context: ExpenseClarificationContext, confidence: float
+    ) -> ExpenseInterpretation:
+        assert context.amount is not None
+        assert context.description is not None
+        assert context.category is not None
+        return ExpenseInterpretation(
+            intent=ExpenseIntent.CREATE_EXPENSE,
+            amount=context.amount,
+            amount_evidence=None,
+            description=context.description,
+            merchant=context.merchant,
+            category=context.category,
+            payment_method=context.payment_method,
+            expense_date=context.expense_date,
+            confidence=confidence,
+            missing_fields=[],
+            reasoning_summary="clarification completed",
+        )
+
+    def _set_clarification_state(
+        self, state: ConversationState, context: ExpenseClarificationContext
+    ) -> None:
+        state.status = ConversationStatus.WAITING_EXPENSE_CLARIFICATION
+        state.active_expense_id = None
+        state.context = context.payload()
+        state.expires_at = self._now() + self._clarification_ttl
+
+    def _create_clarification_outbox(
+        self,
+        session: AsyncSession,
+        message: ProcessedMessage,
+        field: ExpenseClarificationField,
+    ) -> None:
+        self._create_outbox(
+            session,
+            message,
+            content=CLARIFICATION_QUESTIONS[field],
+            kind=OutboundMessageKind.CLARIFICATION,
+            expense=None,
+        )
+
     @staticmethod
     def _is_transient(exc: GeminiInterpreterError) -> bool:
         if isinstance(exc, (GeminiTimeoutError, GeminiRateLimitError)):
@@ -428,19 +906,29 @@ class ExpenseProcessingService:
 
     @staticmethod
     def _validate_interpretation(result: ExpenseInterpretation) -> None:
+        ExpenseProcessingService._validate_partial_interpretation(result)
         if result.intent is not ExpenseIntent.CREATE_EXPENSE:
-            if result.amount is not None:
-                raise GeminiSchemaError("Non-expense result must not contain amount")
             return
         if not isinstance(result.amount, Decimal) or not result.amount.is_finite():
             raise GeminiSchemaError("Expense result failed deterministic validation")
-        if result.amount <= 0 or result.amount > EXPENSE_AMOUNT_MAX:
-            raise InterpretationLimitError("AMOUNT_OUT_OF_RANGE")
-        if result.amount.as_tuple().exponent < -EXPENSE_AMOUNT_SCALE:
-            raise InterpretationLimitError("AMOUNT_SCALE_EXCEEDED")
         if result.description is None or not result.description.strip():
             raise GeminiSchemaError("Expense result failed deterministic validation")
-        if len(result.description.strip()) > EXPENSE_DESCRIPTION_MAX_LENGTH:
+
+    @staticmethod
+    def _validate_partial_interpretation(result: ExpenseInterpretation) -> None:
+        if result.intent is not ExpenseIntent.CREATE_EXPENSE and result.amount is not None:
+            raise GeminiSchemaError("Non-expense result must not contain amount")
+        if result.amount is not None:
+            if not isinstance(result.amount, Decimal) or not result.amount.is_finite():
+                raise GeminiSchemaError("Expense result failed deterministic validation")
+            if result.amount <= 0 or result.amount > EXPENSE_AMOUNT_MAX:
+                raise InterpretationLimitError("AMOUNT_OUT_OF_RANGE")
+            if result.amount.as_tuple().exponent < -EXPENSE_AMOUNT_SCALE:
+                raise InterpretationLimitError("AMOUNT_SCALE_EXCEEDED")
+        if (
+            result.description is not None
+            and len(result.description.strip()) > EXPENSE_DESCRIPTION_MAX_LENGTH
+        ):
             raise InterpretationLimitError("DESCRIPTION_TOO_LONG")
         if result.merchant is not None and len(result.merchant) > EXPENSE_MERCHANT_MAX_LENGTH:
             raise InterpretationLimitError("MERCHANT_TOO_LONG")
@@ -489,8 +977,14 @@ class ExpenseProcessingService:
         session: AsyncSession,
         message: ProcessedMessage,
         result: ExpenseInterpretation,
+        *,
+        origin_message: ProcessedMessage | None = None,
+        reset_state: bool = True,
     ) -> None:
         assert result.amount is not None and result.description is not None
+        origin = origin_message or message
+        if origin.user_id != message.user_id:
+            raise GeminiSchemaError("Clarification user does not match expense origin")
         category = await session.scalar(
             select(Category).where(
                 Category.name == result.category.value, Category.is_active.is_(True)
@@ -499,33 +993,31 @@ class ExpenseProcessingService:
         if category is None:
             raise GeminiSchemaError("Canonical category is unavailable")
         timezone = self._timezone(message.user.timezone)
-        timestamp = message.message_timestamp
+        timestamp = origin.message_timestamp
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=UTC)
         expense_date = result.expense_date or timestamp.astimezone(timezone).date()
         expense = Expense(
             user_id=message.user_id,
-            processed_message_id=message.id,
+            processed_message_id=origin.id,
             category_id=category.id,
             amount=result.amount,
             description=result.description.strip(),
             expense_date=expense_date,
             merchant=result.merchant,
             payment_method=result.payment_method.value if result.payment_method else None,
-            source_type=message.source_type,
+            source_type=origin.source_type,
         )
         session.add(expense)
         await session.flush()
-        state = await session.scalar(
-            select(ConversationState).where(ConversationState.user_id == message.user_id)
-        )
-        if state is None:
-            session.add(ConversationState(user_id=message.user_id))
-        else:
-            state.status = ConversationStatus.IDLE
-            state.active_expense_id = None
-            state.context = None
-            state.expires_at = None
+        if reset_state:
+            state = await session.scalar(
+                select(ConversationState).where(ConversationState.user_id == message.user_id)
+            )
+            if state is None:
+                session.add(ConversationState(user_id=message.user_id))
+            else:
+                self._reset_state(state)
         self._create_outbox(
             session,
             message,
@@ -947,7 +1439,10 @@ class ExpenseProcessingService:
             elif command.type is ExpenseCommandType.CONFIRM_REMOVE:
                 await self._confirm_delete(session, message, state, command)
             elif command.type is ExpenseCommandType.CANCEL:
-                pending = state.status is ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM
+                pending = state.status in {
+                    ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM,
+                    ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+                }
                 self._reset_state(state)
                 self._complete_command(
                     session,
@@ -1076,17 +1571,6 @@ class ExpenseProcessingService:
             expense=expense,
         )
 
-    async def _cancel_pending_for_normal_message(self, message_id: UUID) -> None:
-        async with self._session_factory() as session, session.begin():
-            message = await session.scalar(self._locked_message_statement(message_id))
-            if message is None or message.status != ProcessedMessageStatus.PROCESSING:
-                return
-            if message.user_id is None:
-                return
-            state = await self._locked_state(session, message.user_id)
-            if state.status is ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM:
-                self._reset_state(state)
-
     @staticmethod
     async def _locked_state(session: AsyncSession, user_id: UUID) -> ConversationState:
         state = await session.scalar(
@@ -1130,7 +1614,10 @@ class ExpenseProcessingService:
         state.expires_at = None
 
     def _state_expired(self, state: ConversationState) -> bool:
-        if state.status is not ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM:
+        if state.status not in {
+            ConversationStatus.WAITING_EXPENSE_DELETE_CONFIRM,
+            ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+        }:
             return False
         if state.expires_at is None:
             return True

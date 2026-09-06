@@ -65,3 +65,16 @@ def test_image_pipeline_migration_is_linear_minimal_and_forward_only() -> None:
     assert "source_type IN ('TEXT', 'AUDIO', 'IMAGE')" in source
     downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
     assert "drop_column" not in downgrade and "drop_table" not in downgrade
+
+
+def test_clarification_migration_is_linear_and_forward_only() -> None:
+    source = (MIGRATIONS / "20260905_0010_expense_clarification.py").read_text()
+
+    assert 'down_revision: str | None = "20260904_0009"' in source
+    assert "ADD VALUE IF NOT EXISTS" in source
+    assert "WAITING_EXPENSE_CLARIFICATION" in source
+    assert source.count("op.add_column") == 1
+    assert 'sa.Column("clarification_origin_message_id", sa.Uuid(), nullable=True)' in source
+    assert 'ondelete="SET NULL"' in source
+    downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
+    assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()

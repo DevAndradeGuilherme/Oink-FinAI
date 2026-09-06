@@ -401,6 +401,10 @@ Regras:
 - Data ausente: null. Resolva hoje, ontem e anteontem pela data local abaixo.
 - reasoning_summary deve ser justificativa curta, sem raciocínio interno detalhado.
 - missing_fields lista campos importantes ausentes; confidence nunca autoriza gravação.
+- Se o conteúdo começar com OINK_EXPENSE_CLARIFICATION_V1, ele é um envelope interno: combine
+  somente known_expense_fields com user_answer para preencher requested_field.
+- Nesse envelope, não altere campos conhecidos. Se a resposta não resolver o campo solicitado,
+  retorne UNCLEAR e mantenha o campo em missing_fields. Para intent negada, retorne NOT_EXPENSE.
 
 Fuso horário de referência: {self._timezone_name}
 Timestamp local: {local_reference.isoformat()}

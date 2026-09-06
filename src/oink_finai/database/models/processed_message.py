@@ -54,6 +54,9 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     instance_id: Mapped[str] = mapped_column(String(120))
     external_message_id: Mapped[str] = mapped_column(String(255))
     user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    clarification_origin_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("processed_messages.id", ondelete="SET NULL"), index=True
+    )
     accepted_text: Mapped[str] = mapped_column(Text, default="")
     source_type: Mapped[MessageSourceType] = mapped_column(
         String(10), default=MessageSourceType.TEXT
