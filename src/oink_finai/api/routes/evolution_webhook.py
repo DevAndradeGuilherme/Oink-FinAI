@@ -22,8 +22,16 @@ from oink_finai.providers.whatsapp.evolution import (
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
-from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
-from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
+from oink_finai.schemas.expense_clarification import (
+    ClarificationReplyBinding,
+    ExpenseClarificationContext,
+)
+from oink_finai.services.expense_commands import (
+    expense_command_text,
+    parse_expense_action,
+    parse_expense_command,
+)
+from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.image_analyzer import normalize_image_caption
 from oink_finai.services.pipeline_timing import PipelineTiming
 
@@ -34,7 +42,9 @@ class WebhookResponse(BaseModel):
     status: str
 
 
-def _clarification_origin(state: ConversationState, now: datetime) -> UUID | None:
+def _clarification_origin(
+    state: ConversationState, now: datetime, *, reply_id: UUID | None = None
+) -> UUID | None:
     if state.status is not ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
         return None
     expires_at = state.expires_at
@@ -50,13 +60,19 @@ def _clarification_origin(state: ConversationState, now: datetime) -> UUID | Non
         state.context = None
         state.expires_at = None
         return None
-    if expires_at is None or expires_at <= now:
+    if (expires_at is None or expires_at <= now) and not context.reply_bindings:
         origin_message_id = context.origin_message_id
         state.status = ConversationStatus.IDLE
         state.active_expense_id = None
         state.context = None
         state.expires_at = None
         return origin_message_id
+    if reply_id is not None:
+        bindings = dict(context.reply_bindings)
+        bindings[reply_id] = ClarificationReplyBinding(
+            revision=context.revision, deadline=expires_at or now
+        )
+        state.context = context.model_copy(update={"reply_bindings": bindings}).payload()
     return context.origin_message_id
 
 
@@ -176,7 +192,14 @@ async def _handle_evolution_webhook(
             session.add(conversation_state)
             await session.flush()
         now = datetime.now(UTC)
-        clarification_origin_message_id = _clarification_origin(conversation_state, now)
+        is_reply = (
+            source_type is not MessageSourceType.IMAGE
+            and parse_expense_command(accepted_text) is None
+            and not ExpenseProcessingService._looks_like_new_expense(accepted_text)
+        )
+        clarification_origin_message_id = _clarification_origin(
+            conversation_state, now, reply_id=correlation_id if is_reply else None
+        )
         processed_message = ProcessedMessage(
             id=correlation_id,
             provider=message.provider,

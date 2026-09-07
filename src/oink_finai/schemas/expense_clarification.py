@@ -18,6 +18,13 @@ from oink_finai.domain.expense_limits import (
 )
 
 
+class ClarificationReplyBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    revision: int = Field(ge=0)
+    deadline: datetime
+
+
 class ExpenseClarificationContext(BaseModel):
     """Minimal durable draft; it intentionally excludes source content and provider data."""
 
@@ -29,6 +36,8 @@ class ExpenseClarificationContext(BaseModel):
     reference_timestamp: datetime
     requested_field: ExpenseClarificationField
     remaining_fields: tuple[ExpenseClarificationField, ...]
+    revision: int = Field(default=0, ge=0)
+    reply_bindings: dict[UUID, ClarificationReplyBinding] = Field(default_factory=dict)
     amount: Decimal | None = Field(default=None, gt=0, le=EXPENSE_AMOUNT_MAX)
     description: str | None = Field(default=None, max_length=EXPENSE_DESCRIPTION_MAX_LENGTH)
     merchant: str | None = Field(default=None, max_length=EXPENSE_MERCHANT_MAX_LENGTH)
@@ -61,6 +70,11 @@ class ExpenseClarificationContext(BaseModel):
 
     def payload(self) -> dict[str, object]:
         return self.model_dump(mode="json", exclude_none=True)
+
+    def same_draft(self, other: "ExpenseClarificationContext") -> bool:
+        return self.model_dump(exclude={"reply_bindings"}) == other.model_dump(
+            exclude={"reply_bindings"}
+        )
 
     def interpreter_input(self, answer: str) -> str:
         known_fields = self.model_dump(
