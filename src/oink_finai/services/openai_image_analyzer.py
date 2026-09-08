@@ -409,11 +409,20 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
             (GroundingCandidateKind.MERCHANT, transport.merchant_candidates),
             (GroundingCandidateKind.PAYMENT_METHOD, transport.payment_method_candidates),
         )
-        has_candidates = any(candidates for _, candidates in candidate_groups)
-        if not transport.is_legible and has_candidates:
-            self._raise_grounding(GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES)
-        if not transport.is_financial_document and has_candidates:
-            self._raise_grounding(GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES)
+        first_candidate = next(
+            ((kind, 0) for kind, candidates in candidate_groups if candidates),
+            None,
+        )
+        if not transport.is_legible and first_candidate is not None:
+            self._raise_grounding(
+                GroundingFailureReason.CANDIDATES_ON_UNREADABLE_IMAGE,
+                *first_candidate,
+            )
+        if not transport.is_financial_document and first_candidate is not None:
+            self._raise_grounding(
+                GroundingFailureReason.CANDIDATES_ON_NON_FINANCIAL_IMAGE,
+                *first_candidate,
+            )
         self._validate_result_coherence(transport)
         for kind, candidates in candidate_groups:
             self._reject_duplicate_candidates(kind, candidates)
@@ -481,7 +490,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
         except ImageAnalysisError:
             raise
         except (ValidationError, TypeError, ValueError, InvalidOperation):
-            self._raise_grounding(GroundingFailureReason.CONTRADICTORY_RESULT)
+            self._raise_grounding(GroundingFailureReason.DOMAIN_CONTRACT_CONFLICT)
 
     def _convert_date_candidates(self, transport: ImageAnalysisTransport) -> list[DateCandidate]:
         converted: list[DateCandidate] = []
@@ -646,18 +655,24 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
             "BANK_TRANSFER",
             "CARD_RECEIPT",
         }
-        contradictory = (
-            ("NONE" in warnings and len(warnings) != 1)
-            or len(set(warnings)) != len(warnings)
-            or (len(transport.amount_candidates) > 1 and "MULTIPLE_AMOUNTS" not in warnings)
-            or (len(transport.date_candidates) > 1 and "MULTIPLE_DATES" not in warnings)
-            or (
-                transport.document_type.value in financial_types
-                and not transport.is_financial_document
+        if "NONE" in warnings and len(warnings) != 1:
+            self._raise_grounding(GroundingFailureReason.WARNING_NONE_CONFLICT)
+        if len(set(warnings)) != len(warnings):
+            self._raise_grounding(GroundingFailureReason.DUPLICATE_WARNINGS)
+        if len(transport.amount_candidates) > 1 and "MULTIPLE_AMOUNTS" not in warnings:
+            self._raise_grounding(
+                GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
+                GroundingCandidateKind.AMOUNT,
+                1,
             )
-        )
-        if contradictory:
-            self._raise_grounding(GroundingFailureReason.CONTRADICTORY_RESULT)
+        if len(transport.date_candidates) > 1 and "MULTIPLE_DATES" not in warnings:
+            self._raise_grounding(
+                GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
+                GroundingCandidateKind.DATE,
+                1,
+            )
+        if transport.document_type.value in financial_types and not transport.is_financial_document:
+            self._raise_grounding(GroundingFailureReason.DOCUMENT_TYPE_CONFLICT)
 
     def _reject_duplicate_candidates(
         self, kind: GroundingCandidateKind, candidates: list[Any]

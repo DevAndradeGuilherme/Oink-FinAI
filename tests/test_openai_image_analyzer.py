@@ -338,19 +338,77 @@ async def test_rejects_merchant_or_payment_without_visible_evidence(field: str) 
     assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
 
 
-@pytest.mark.parametrize("flag", ["financial", "legible"])
-async def test_rejects_candidates_for_non_financial_or_illegible_result(flag: str) -> None:
-    overrides = {"is_financial_document": False} if flag == "financial" else {"is_legible": False}
+@pytest.mark.parametrize(
+    ("field", "candidate", "visible_text", "kind"),
+    [
+        (
+            "amount_candidates",
+            {"value": "42.50", "evidence": "R$ 42,50", "label": "TOTAL"},
+            "R$ 42,50",
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            "date_candidates",
+            {"value": "2026-09-04", "evidence": "04/09/2026", "label": "EMISSÃO"},
+            "04/09/2026",
+            GroundingCandidateKind.DATE,
+        ),
+        (
+            "merchant_candidates",
+            {"value": "MERCADO OINK", "evidence": "MERCADO OINK"},
+            "MERCADO OINK",
+            GroundingCandidateKind.MERCHANT,
+        ),
+        (
+            "payment_method_candidates",
+            {"value": "PIX", "evidence": "PIX"},
+            "PIX",
+            GroundingCandidateKind.PAYMENT_METHOD,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("is_financial_document", GroundingFailureReason.CANDIDATES_ON_NON_FINANCIAL_IMAGE),
+        ("is_legible", GroundingFailureReason.CANDIDATES_ON_UNREADABLE_IMAGE),
+    ],
+)
+async def test_rejects_each_candidate_kind_for_false_financial_or_legible_flag(
+    field: str,
+    candidate: dict[str, str],
+    visible_text: str,
+    kind: GroundingCandidateKind,
+    flag: str,
+    expected: GroundingFailureReason,
+) -> None:
+    overrides: dict[str, object] = {
+        "visible_text": visible_text,
+        "amount_candidates": [],
+        "date_candidates": [],
+        "merchant_candidates": [],
+        "payment_method_candidates": [],
+        field: [candidate],
+        flag: False,
+    }
     instance, _ = analyzer(response(**overrides))
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
     assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
-    expected = (
-        GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES
-        if flag == "financial"
-        else GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES
-    )
     assert caught.value.grounding_reason is expected
+    assert caught.value.candidate_kind is kind
+    assert caught.value.candidate_index == 0
+
+
+async def test_unreadable_candidate_reason_has_priority_when_both_flags_are_false() -> None:
+    instance, _ = analyzer(
+        response(is_financial_document=False, is_legible=False),
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.CANDIDATES_ON_UNREADABLE_IMAGE
+    assert caught.value.candidate_kind is GroundingCandidateKind.AMOUNT
+    assert caught.value.candidate_index == 0
 
 
 @pytest.mark.parametrize(
@@ -364,22 +422,140 @@ async def test_rejects_empty_invalid_or_additional_fields(response_text: str | N
     assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
 
 
+async def test_rejects_unknown_warning_as_invalid_response() -> None:
+    instance, _ = analyzer(response(warnings=["INVALID"]))
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
+
+
 @pytest.mark.parametrize(
-    ("warnings", "code"),
+    ("warnings", "expected"),
     [
-        (["INVALID"], ImageAnalysisErrorCode.INVALID_RESPONSE),
-        (["NONE", "CROPPED"], ImageAnalysisErrorCode.GROUNDING),
+        (["NONE", "CROPPED"], GroundingFailureReason.WARNING_NONE_CONFLICT),
+        (["CROPPED", "CROPPED"], GroundingFailureReason.DUPLICATE_WARNINGS),
     ],
 )
-async def test_rejects_invalid_or_contradictory_warnings(
-    warnings: list[str], code: ImageAnalysisErrorCode
+async def test_rejects_each_warning_contradiction(
+    warnings: list[str], expected: GroundingFailureReason
 ) -> None:
     instance, _ = analyzer(response(warnings=warnings))
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
-    assert caught.value.code is code
-    if code is ImageAnalysisErrorCode.GROUNDING:
-        assert caught.value.grounding_reason is GroundingFailureReason.CONTRADICTORY_RESULT
+    assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
+    assert caught.value.grounding_reason is expected
+    assert caught.value.candidate_kind is None
+    assert caught.value.candidate_index is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected", "kind"),
+    [
+        (
+            {
+                "visible_text": "R$ 40,00\nR$ 42,50",
+                "amount_candidates": [
+                    {"value": "40.00", "evidence": "R$ 40,00", "label": "SUBTOTAL"},
+                    {"value": "42.50", "evidence": "R$ 42,50", "label": "TOTAL"},
+                ],
+                "date_candidates": [],
+                "merchant_candidates": [],
+                "payment_method_candidates": [],
+                "warnings": ["CROPPED"],
+            },
+            GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
+            GroundingCandidateKind.AMOUNT,
+        ),
+        (
+            {
+                "visible_text": "03/09/2026\n04/09/2026",
+                "amount_candidates": [],
+                "date_candidates": [
+                    {"value": "2026-09-03", "evidence": "03/09/2026", "label": "PAGAMENTO"},
+                    {"value": "2026-09-04", "evidence": "04/09/2026", "label": "EMISSÃO"},
+                ],
+                "merchant_candidates": [],
+                "payment_method_candidates": [],
+                "warnings": ["CROPPED"],
+            },
+            GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
+            GroundingCandidateKind.DATE,
+        ),
+    ],
+)
+async def test_rejects_multiple_candidates_without_required_warning(
+    overrides: dict[str, object],
+    expected: GroundingFailureReason,
+    kind: GroundingCandidateKind,
+) -> None:
+    instance, _ = analyzer(response(**overrides))
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is expected
+    assert caught.value.candidate_kind is kind
+    assert caught.value.candidate_index == 1
+
+
+@pytest.mark.parametrize(
+    "document_type",
+    ["RECEIPT", "INVOICE", "PAYMENT_RECEIPT", "BANK_TRANSFER", "CARD_RECEIPT"],
+)
+async def test_rejects_financial_document_type_with_false_financial_flag(
+    document_type: str,
+) -> None:
+    instance, _ = analyzer(
+        response(
+            document_type=document_type,
+            visible_text="",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+            is_financial_document=False,
+            warnings=["UNSUPPORTED_CONTENT"],
+        )
+    )
+    with pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+    assert caught.value.grounding_reason is GroundingFailureReason.DOCUMENT_TYPE_CONFLICT
+    assert caught.value.candidate_kind is None
+    assert caught.value.candidate_index is None
+
+
+@pytest.mark.parametrize("document_type", ["SCREENSHOT", "OTHER", "UNKNOWN"])
+async def test_allows_generic_document_type_with_true_financial_flag(
+    document_type: str,
+) -> None:
+    instance, _ = analyzer(
+        response(
+            document_type=document_type,
+            visible_text="documento financeiro sem campos candidatos",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+            warnings=["INCOMPLETE_DOCUMENT"],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.is_financial_document is True
+
+
+async def test_allows_legible_financial_receipt_without_candidates() -> None:
+    instance, _ = analyzer(
+        response(
+            visible_text="COMPROVANTE",
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+            warnings=["INCOMPLETE_DOCUMENT"],
+        )
+    )
+    result = await instance.analyze(image())
+    assert result.document_type is ImageDocumentType.RECEIPT
+    assert result.is_financial_document is True
+    assert result.is_legible is True
 
 
 async def test_rejects_excessive_lists_and_visible_text() -> None:
@@ -873,6 +1049,40 @@ async def test_grounding_logs_and_exception_contain_only_sanitized_metadata(capl
     assert private_text not in rendered
 
 
+async def test_domain_contract_fallback_contains_only_sanitized_metadata(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    private_text = "private merchant account 123456789"
+    instance, _ = analyzer(
+        response(
+            visible_text=private_text,
+            amount_candidates=[],
+            date_candidates=[],
+            merchant_candidates=[],
+            payment_method_candidates=[],
+            warnings=["INCOMPLETE_DOCUMENT"],
+        )
+    )
+
+    def reject_domain_model(**_values: object) -> None:
+        raise ValueError(private_text)
+
+    monkeypatch.setattr(
+        "oink_finai.services.openai_image_analyzer.ImageAnalysis",
+        reject_domain_model,
+    )
+    with caplog.at_level(logging.WARNING), pytest.raises(ImageAnalysisError) as caught:
+        await instance.analyze(image())
+
+    record = next(record for record in caplog.records if hasattr(record, "grounding_reason"))
+    rendered = caplog.text + repr(caught.value) + str(caught.value)
+    assert caught.value.grounding_reason is GroundingFailureReason.DOMAIN_CONTRACT_CONFLICT
+    assert caught.value.candidate_kind is None
+    assert caught.value.candidate_index is None
+    assert record.grounding_reason == "DOMAIN_CONTRACT_CONFLICT"
+    assert private_text not in rendered
+
+
 def test_every_grounding_reason_has_explicit_test_case() -> None:
     candidate_reasons = {
         GroundingFailureReason.AMOUNT_VALUE_EMPTY,
@@ -896,10 +1106,15 @@ def test_every_grounding_reason_has_explicit_test_case() -> None:
         GroundingFailureReason.PAYMENT_METHOD_VALUE_INVALID,
         GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_INVALID,
         GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND,
-        GroundingFailureReason.ILLEGIBLE_WITH_CANDIDATES,
-        GroundingFailureReason.NON_FINANCIAL_WITH_CANDIDATES,
+        GroundingFailureReason.CANDIDATES_ON_UNREADABLE_IMAGE,
+        GroundingFailureReason.CANDIDATES_ON_NON_FINANCIAL_IMAGE,
         GroundingFailureReason.DUPLICATE_CANDIDATE,
-        GroundingFailureReason.CONTRADICTORY_RESULT,
+        GroundingFailureReason.WARNING_NONE_CONFLICT,
+        GroundingFailureReason.DUPLICATE_WARNINGS,
+        GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
+        GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
+        GroundingFailureReason.DOCUMENT_TYPE_CONFLICT,
+        GroundingFailureReason.DOMAIN_CONTRACT_CONFLICT,
     }
     assert candidate_reasons == set(GroundingFailureReason)
 
