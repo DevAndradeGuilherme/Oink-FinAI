@@ -140,7 +140,7 @@ async def test_ogg_multipart_contract_single_call_and_private_result(caplog) -> 
                 for part in multipart.iter_parts()
             }
             assert set(parts) == {"file", "model", "language", "response_format"}
-            assert parts["model"].get_content().strip() == "gpt-4o-mini-transcribe"
+            assert parts["model"].get_content().strip() == "gpt-transcribe"
             assert parts["language"].get_content().strip() == "pt"
             assert parts["response_format"].get_content().strip() == "json"
             assert parts["file"].get_filename() == "audio.ogg"
@@ -173,12 +173,8 @@ async def test_ogg_multipart_contract_single_call_and_private_result(caplog) -> 
     ],
 )
 async def test_http_failure_is_sanitized_without_retries_or_fallback(
-    status, code, transient, caplog, monkeypatch
+    status, code, transient, caplog
 ) -> None:
-    fallback = AsyncMock(side_effect=AssertionError("fallback must not run"))
-    monkeypatch.setattr(
-        "oink_finai.services.gemini_audio_transcriber.GeminiAudioTranscriber.transcribe", fallback
-    )
     with caplog.at_level(logging.DEBUG):
         async with transcriber(
             lambda _: httpx.Response(
@@ -196,7 +192,6 @@ async def test_http_failure_is_sanitized_without_retries_or_fallback(
                 await instance.transcribe(MEDIA)
             assert caught.value.code is code and caught.value.transient is transient
             assert len(calls) == 1
-            fallback.assert_not_called()
             assert_sanitized(caught.value, caplog)
 
 

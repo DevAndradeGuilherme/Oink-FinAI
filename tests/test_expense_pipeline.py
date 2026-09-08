@@ -40,12 +40,12 @@ from oink_finai.providers.whatsapp import (
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
-from oink_finai.services.gemini_errors import (
-    GeminiErrorMetadata,
-    GeminiRateLimitError,
-    GeminiRequestError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
+from oink_finai.services.interpretation_errors import (
+    AIErrorMetadata,
+    InterpretationRateLimitError,
+    InterpretationRequestError,
+    InterpretationTimeoutError,
+    InterpretationUnavailableError,
 )
 from oink_finai.services.outbox_delivery import OutboundMessageClaim, OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
@@ -416,11 +416,11 @@ async def test_non_create_results_do_not_create_expense(
         assert saved is not None and saved.status == expected_status
 
 
-async def test_permanent_gemini_error_is_not_retried(
+async def test_permanent_ai_error_is_not_retried(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     message = await seed(factory)
-    interpreter = FakeInterpreter([GeminiRequestError("sanitized")])
+    interpreter = FakeInterpreter([InterpretationRequestError("sanitized")])
     processor = service(factory, interpreter)
     await processor.claim(1)
     await processor.process(message.id)
@@ -437,9 +437,9 @@ async def test_503_schedules_durable_retry_without_nested_attempt(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     message = await seed(factory)
-    transient = GeminiUnavailableError(
+    transient = InterpretationUnavailableError(
         "sanitized",
-        metadata=GeminiErrorMetadata(
+        metadata=AIErrorMetadata(
             exception_class="ServerError", category="transient", duration_ms=1, http_status=503
         ),
     )
@@ -462,8 +462,8 @@ async def test_503_schedules_durable_retry_without_nested_attempt(
 @pytest.mark.parametrize(
     ("error", "code"),
     [
-        (GeminiTimeoutError("sanitized"), "GEMINI_TIMEOUT"),
-        (GeminiRateLimitError("sanitized"), "GEMINI_RATE_LIMIT"),
+        (InterpretationTimeoutError("sanitized"), "GEMINI_TIMEOUT"),
+        (InterpretationRateLimitError("sanitized"), "GEMINI_RATE_LIMIT"),
     ],
 )
 async def test_retryable_error_schedules_retry(
@@ -588,9 +588,9 @@ async def test_later_success_creates_one_expense_and_confirmation(
 ) -> None:
     now = datetime(2026, 9, 2, 12, tzinfo=UTC)
     clock = MutableClock(now)
-    transient = GeminiUnavailableError(
+    transient = InterpretationUnavailableError(
         "sanitized",
-        metadata=GeminiErrorMetadata(
+        metadata=AIErrorMetadata(
             exception_class="ServerError", category="transient", duration_ms=1, http_status=503
         ),
     )
@@ -633,13 +633,13 @@ async def test_later_success_creates_one_expense_and_confirmation(
     ("error", "result_intent", "expected_status", "expected_error_code"),
     [
         (
-            GeminiTimeoutError("sanitized"),
+            InterpretationTimeoutError("sanitized"),
             ExpenseIntent.UNCLEAR,
             ProcessedMessageStatus.NEEDS_CLARIFICATION,
             "GEMINI_TIMEOUT",
         ),
         (
-            GeminiRateLimitError("sanitized"),
+            InterpretationRateLimitError("sanitized"),
             ExpenseIntent.NOT_EXPENSE,
             ProcessedMessageStatus.NOT_EXPENSE,
             "GEMINI_RATE_LIMIT",
@@ -688,7 +688,7 @@ async def test_retry_exhaustion_creates_one_failure_notification(
 ) -> None:
     now = datetime(2026, 9, 2, 12, tzinfo=UTC)
     clock = MutableClock(now)
-    transient = GeminiTimeoutError("sanitized")
+    transient = InterpretationTimeoutError("sanitized")
     interpreter = FakeInterpreter([transient])
     processor = ExpenseProcessingService(
         factory,
@@ -717,7 +717,7 @@ async def test_retry_exhaustion_creates_one_failure_notification(
         assert len(outbox) == 1
         assert outbox[0].expense_id is None
         assert outbox[0].kind == OutboundMessageKind.PROCESSING_FAILURE
-        assert "GEMINI" not in outbox[0].content
+        assert "OPENAI" not in outbox[0].content
         assert await session.scalar(select(func.count()).select_from(Expense)) == 0
     assert interpreter.calls == 2
     assert await processor.recover_stale(clock.current + timedelta(days=1)) == 0

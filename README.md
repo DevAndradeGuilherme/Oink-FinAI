@@ -75,13 +75,18 @@ Com PostgreSQL configurado no `.env`, use `alembic upgrade head` para aplicar mi
 
 Configurações são lidas por Pydantic Settings. Nunca versione `.env`, tokens, chaves da Evolution API ou senhas. `.env.example` contém somente valores locais ilustrativos. Dinheiro usa `Decimal`/`NUMERIC(14,2)`; exclusões de gastos devem preencher `deleted_at`, nunca remover a linha.
 
-O modelo Gemini padrão é `gemini-3.1-flash-lite`, configurável por `GEMINI_MODEL`.
+Texto, esclarecimentos e imagens usam a API OpenAI. Os modelos padrão de
+`OPENAI_EXPENSE_MODEL` e `OPENAI_IMAGE_MODEL` são `gpt-4.1-mini`; áudio usa
+`OPENAI_AUDIO_TRANSCRIPTION_MODEL=gpt-transcribe`. Configure `OPENAI_API_KEY` somente no ambiente.
+Cada operação faz uma chamada por tentativa durável, com timeout externo, sem retry interno do SDK
+e sem fallback de modelo.
 
 As tentativas e os intervalos do processamento durável de gastos são configurados por
 `EXPENSE_PROCESSING_MAX_ATTEMPTS`, `EXPENSE_RETRY_BASE_SECONDS` e
-`EXPENSE_RETRY_MAX_SECONDS`. Os nomes anteriores `GEMINI_MAX_ATTEMPTS`,
-`GEMINI_RETRY_BASE_SECONDS` e `GEMINI_RETRY_MAX_SECONDS` permanecem aceitos somente como aliases
-de compatibilidade; quando ambos forem definidos, o nome novo tem prioridade.
+`EXPENSE_RETRY_MAX_SECONDS`.
+
+Os valores históricos `GEMINI_*` de `error_code` permanecem somente como identificadores duráveis
+compatíveis com registros e alertas existentes; eles não indicam uso do provider Gemini.
 
 ### Timing seguro do pipeline
 
@@ -103,7 +108,7 @@ Cada evento usa UUID interno de `ProcessedMessage` como `correlation_id`. Demais
 timestamp UTC ISO 8601, duracao, tentativa, etapa, tipo de origem, resultado, codigo de erro
 sanitizado, status HTTP numerico, tamanho em bytes, MIME normalizado, duracao declarada do audio e
 proxima tentativa. Nunca sao registrados telefone, JID, identificador externo, texto, transcript,
-dados do gasto, prompt, resposta do Gemini, audio/base64, referencia ou URL de midia, segredos,
+dados do gasto, prompt, resposta OpenAI, audio/base64, referencia ou URL de midia, segredos,
 chaves, headers, respostas ou payloads brutos.
 
 Duracoes internas ao processo usam relogio monotonico. Timestamps UTC correlacionam API e worker;
@@ -116,7 +121,7 @@ usuario pode ser maior.
 
 ### Pipeline durável de imagens
 
-`GeminiImageAnalyzer` recebe somente bytes e metadados técnicos já validados, além de legenda
+`OpenAIImageAnalyzer` recebe somente bytes e metadados técnicos já validados, além de legenda
 opcional não confiável. Retorna observações estruturadas e evidências literais do texto visível.
 Webhook persiste somente referência opaca, MIME normalizado e legenda validada. Worker baixa e
 valida mídia, executa análise isolada e confirma checkpoint JSONB em transação própria antes da

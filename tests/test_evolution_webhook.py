@@ -197,17 +197,17 @@ async def test_accepts_supported_text_and_records_processed_message(
     assert count == 1
 
 
-async def test_webhook_only_persists_accepted_text_and_never_waits_for_gemini(
+async def test_webhook_only_persists_accepted_text_and_never_waits_for_openai(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def forbidden_interpretation(*_args: object, **_kwargs: object) -> None:
         await asyncio.sleep(10)
-        raise AssertionError("webhook called Gemini")
+        raise AssertionError("webhook called OpenAI")
 
     monkeypatch.setattr(
-        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        "oink_finai.services.openai_expense_interpreter.OpenAIExpenseInterpreter.interpret",
         forbidden_interpretation,
     )
     payload = authorized_payload()
@@ -343,8 +343,9 @@ async def test_duplicate_webhook_succeeds_without_processing_twice(
     assert count == 1
 
 
+@pytest.mark.parametrize("expire_while_processing", [False, True])
 async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
-    webhook_client: TestClient, session: AsyncSession
+    webhook_client: TestClient, session: AsyncSession, expire_while_processing: bool
 ) -> None:
     now = datetime.now(UTC)
     user = User(phone_number="5511999999999")
@@ -364,6 +365,7 @@ async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
     session.add(origin)
     await session.flush()
     origin_id = origin.id
+    owner_id = user.id
     context = ExpenseClarificationContext(
         origin_message_id=origin_id,
         source_type=MessageSourceType.TEXT,
@@ -392,10 +394,29 @@ async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
     assert duplicate.json() == {"status": "duplicate"}
     assert reply is not None and reply.clarification_origin_message_id == origin_id
     assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 2
+    state = await session.scalar(
+        select(ConversationState).where(ConversationState.user_id == owner_id)
+    )
+    await session.refresh(state)
+    bound = ExpenseClarificationContext.model_validate(state.context)
+    assert list(bound.reply_bindings) == [reply.id]
+    assert bound.reply_bindings[reply.id].revision == bound.revision
+    if expire_while_processing:
+        state.expires_at = now - timedelta(seconds=1)
+        reply.status = ProcessedMessageStatus.PROCESSING
+        await session.commit()
+        payload["data"]["key"]["id"] = "SYNTHETIC-SECOND-REPLY"
+        assert post(webhook_client, payload).json() == {"status": "accepted"}
+        await session.refresh(state)
+        after = ExpenseClarificationContext.model_validate(state.context)
+        assert state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION
+        assert after.same_draft(bound)
+        assert reply.id in after.reply_bindings
+        assert len(after.reply_bindings) == 2
 
 
 @pytest.mark.parametrize("identity_case", ["outside_allowlist", "participant_alt_bypass", "lid"])
-async def test_rejects_untrusted_dedicated_identity_before_database_and_gemini(
+async def test_rejects_untrusted_dedicated_identity_before_database_and_openai(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -408,7 +429,7 @@ async def test_rejects_untrusted_dedicated_identity_before_database_and_gemini(
         calls += 1
 
     monkeypatch.setattr(
-        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        "oink_finai.services.openai_expense_interpreter.OpenAIExpenseInterpreter.interpret",
         forbidden_interpretation,
     )
     payload = dedicated_payload()

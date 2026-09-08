@@ -40,7 +40,7 @@ class ImageAnalysisWarning(StrEnum):
     NONE = "NONE"
 
 
-class GeminiAmountCandidateTransport(BaseModel):
+class AmountCandidateTransport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str = Field(max_length=IMAGE_ANALYSIS_CANDIDATE_VALUE_MAX_LENGTH)
@@ -48,7 +48,7 @@ class GeminiAmountCandidateTransport(BaseModel):
     label: str = Field(max_length=IMAGE_ANALYSIS_LABEL_MAX_LENGTH)
 
 
-class GeminiDateCandidateTransport(BaseModel):
+class DateCandidateTransport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str = Field(max_length=IMAGE_ANALYSIS_CANDIDATE_VALUE_MAX_LENGTH)
@@ -56,30 +56,30 @@ class GeminiDateCandidateTransport(BaseModel):
     label: str = Field(max_length=IMAGE_ANALYSIS_LABEL_MAX_LENGTH)
 
 
-class GeminiEvidenceCandidateTransport(BaseModel):
+class EvidenceCandidateTransport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str = Field(max_length=IMAGE_ANALYSIS_CANDIDATE_VALUE_MAX_LENGTH)
     evidence: str = Field(max_length=IMAGE_ANALYSIS_EVIDENCE_MAX_LENGTH)
 
 
-class GeminiImageAnalysisTransport(BaseModel):
-    """Gemini-only DTO. Absence uses empty arrays and visible text may be empty."""
+class ImageAnalysisTransport(BaseModel):
+    """Transport DTO. Absence uses empty arrays and visible text may be empty."""
 
     model_config = ConfigDict(extra="forbid")
 
     document_type: ImageDocumentType
     visible_text: str
-    amount_candidates: list[GeminiAmountCandidateTransport] = Field(
+    amount_candidates: list[AmountCandidateTransport] = Field(
         max_length=IMAGE_ANALYSIS_MAX_AMOUNT_CANDIDATES
     )
-    date_candidates: list[GeminiDateCandidateTransport] = Field(
+    date_candidates: list[DateCandidateTransport] = Field(
         max_length=IMAGE_ANALYSIS_MAX_DATE_CANDIDATES
     )
-    merchant_candidates: list[GeminiEvidenceCandidateTransport] = Field(
+    merchant_candidates: list[EvidenceCandidateTransport] = Field(
         max_length=IMAGE_ANALYSIS_MAX_MERCHANT_CANDIDATES
     )
-    payment_method_candidates: list[GeminiEvidenceCandidateTransport] = Field(
+    payment_method_candidates: list[EvidenceCandidateTransport] = Field(
         max_length=IMAGE_ANALYSIS_MAX_PAYMENT_METHOD_CANDIDATES
     )
     is_financial_document: StrictBool
@@ -189,7 +189,7 @@ _EVIDENCE_CANDIDATE_SCHEMA = _object_schema(
     {"value": {"type": "string"}, "evidence": {"type": "string"}}
 )
 
-GEMINI_IMAGE_ANALYSIS_SCHEMA: dict[str, object] = _object_schema(
+IMAGE_ANALYSIS_SCHEMA: dict[str, object] = _object_schema(
     {
         "document_type": {"type": "string", "enum": [item.value for item in ImageDocumentType]},
         "visible_text": {"type": "string"},

@@ -40,11 +40,11 @@ from oink_finai.services.expense_processing import (
     CLARIFICATION_RETRY_PREFIX,
     ExpenseProcessingService,
 )
-from oink_finai.services.gemini_errors import (
-    GeminiModelUnavailableError,
-    GeminiSchemaError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
+from oink_finai.services.interpretation_errors import (
+    InterpretationInvalidResponseError,
+    InterpretationModelUnavailableError,
+    InterpretationTimeoutError,
+    InterpretationUnavailableError,
 )
 
 
@@ -91,7 +91,7 @@ class ExpiringSchemaInterpreter(ExpenseInterpreter):
         if self.calls == 1:
             return self.draft
         self.clock.advance(61)
-        raise GeminiSchemaError("sanitized invalid provider output")
+        raise InterpretationInvalidResponseError("sanitized invalid provider output")
 
 
 class ExpiringValidInterpreter(ExpenseInterpreter):
@@ -127,7 +127,7 @@ class DraftThenSchemaErrorInterpreter(ExpenseInterpreter):
         self.calls += 1
         if self.calls == 1:
             return self.draft
-        raise GeminiSchemaError("sanitized invalid provider output")
+        raise InterpretationInvalidResponseError("sanitized invalid provider output")
 
 
 class MutableClock:
@@ -689,9 +689,9 @@ async def test_late_reply_transition_matrix(
                     assert state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION
                     assert state.context is not None
             errors = {
-                "schema": GeminiSchemaError("synthetic"),
-                "timeout": GeminiTimeoutError("synthetic"),
-                "503": GeminiUnavailableError("synthetic"),
+                "schema": InterpretationInvalidResponseError("synthetic"),
+                "timeout": InterpretationTimeoutError("synthetic"),
+                "503": InterpretationUnavailableError("synthetic"),
             }
             if outcome in errors:
                 raise errors[outcome]
@@ -736,7 +736,7 @@ async def test_durable_retry_keeps_binding_and_cannot_silently_expire(
     user = await seed_user(factory)
     origin = await add_message(factory, user, "synthetic origin")
     clock = MutableClock()
-    interpreter = QueueInterpreter([unclear(), GeminiTimeoutError("synthetic"), complete()])
+    interpreter = QueueInterpreter([unclear(), InterpretationTimeoutError("synthetic"), complete()])
     service = processor(factory, interpreter, clock)
     await run_message(service, origin)
     reply = await add_message(factory, user, "42,50")
@@ -943,8 +943,14 @@ async def test_terminal_recovery_releases_binding_without_losing_draft(
 @pytest.mark.parametrize(
     ("provider_error", "expected_code"),
     [
-        (GeminiSchemaError("sanitized invalid provider output"), "GEMINI_SCHEMA_INVALID"),
-        (GeminiModelUnavailableError("sanitized unavailable model"), "GEMINI_MODEL_UNAVAILABLE"),
+        (
+            InterpretationInvalidResponseError("sanitized invalid provider output"),
+            "GEMINI_SCHEMA_INVALID",
+        ),
+        (
+            InterpretationModelUnavailableError("sanitized unavailable model"),
+            "GEMINI_MODEL_UNAVAILABLE",
+        ),
     ],
 )
 async def test_provider_failure_preserves_draft_and_reasks_once(

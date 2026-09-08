@@ -34,9 +34,9 @@ from oink_finai.schemas.image_checkpoint import ImageAnalysisCheckpoint
 from oink_finai.schemas.whatsapp import InboundMedia, InboundWhatsAppMessage
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
-from oink_finai.services.gemini_errors import GeminiRateLimitError
 from oink_finai.services.image_analysis_errors import ImageAnalysisError, ImageAnalysisErrorCode
 from oink_finai.services.image_analyzer import ImageAnalyzer, ValidatedImage
+from oink_finai.services.interpretation_errors import InterpretationRateLimitError
 
 
 @pytest_asyncio.fixture
@@ -244,7 +244,7 @@ async def test_retry_after_checkpoint_never_downloads_or_analyzes_again(
     message = await seed_image(image_factory, checkpoint=checkpoint)
     provider = FakeProvider([AssertionError("download forbidden")])
     analyzer = FakeAnalyzer([AssertionError("analysis forbidden")])
-    interpreter = FakeInterpreter([GeminiRateLimitError("limited"), expense_result()])
+    interpreter = FakeInterpreter([InterpretationRateLimitError("limited"), expense_result()])
     service = processor(image_factory, provider, analyzer, interpreter)
 
     await service.claim(1)

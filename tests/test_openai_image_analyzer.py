@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
-from google.genai import errors
+from openai import APIStatusError, AsyncOpenAI
 
 from oink_finai.domain.image_analysis_limits import (
     IMAGE_ANALYSIS_CAPTION_MAX_LENGTH,
@@ -15,11 +16,10 @@ from oink_finai.domain.image_analysis_limits import (
     IMAGE_ANALYSIS_VISIBLE_TEXT_MAX_LENGTH,
 )
 from oink_finai.schemas.image_analysis import (
-    GEMINI_IMAGE_ANALYSIS_SCHEMA,
+    IMAGE_ANALYSIS_SCHEMA,
     ImageAnalysisWarning,
     ImageDocumentType,
 )
-from oink_finai.services.gemini_image_analyzer import GeminiImageAnalyzer
 from oink_finai.services.image_analysis_errors import (
     GroundingCandidateKind,
     GroundingFailureReason,
@@ -27,14 +27,15 @@ from oink_finai.services.image_analysis_errors import (
     ImageAnalysisErrorCode,
 )
 from oink_finai.services.image_analyzer import ImageAnalyzer, ValidatedImage
+from oink_finai.services.openai_image_analyzer import OpenAIImageAnalyzer
 
 
-class FakeModels:
+class FakeResponses:
     def __init__(self, outcome: object) -> None:
         self.outcome = outcome
         self.calls: list[dict[str, Any]] = []
 
-    async def generate_content(self, **kwargs: Any) -> object:
+    async def create(self, **kwargs: Any) -> object:
         self.calls.append(kwargs)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
@@ -45,8 +46,16 @@ class FakeModels:
 
 class FakeClient:
     def __init__(self, outcome: object) -> None:
-        self.models = FakeModels(outcome)
-        self.aio = SimpleNamespace(models=self.models)
+        self.responses = FakeResponses(outcome)
+        self._client = SimpleNamespace(follow_redirects=False)
+        self.max_retries = 2
+
+    def with_options(self, **kwargs: object) -> "FakeClient":
+        self.max_retries = int(kwargs["max_retries"])
+        return self
+
+    async def close(self) -> None:
+        return None
 
 
 def payload(**overrides: object) -> dict[str, object]:
@@ -67,14 +76,14 @@ def payload(**overrides: object) -> dict[str, object]:
 
 
 def response(**overrides: object) -> object:
-    return SimpleNamespace(text=json.dumps(payload(**overrides)))
+    return SimpleNamespace(output_text=json.dumps(payload(**overrides)))
 
 
-def analyzer(outcome: object, **overrides: object) -> tuple[GeminiImageAnalyzer, FakeClient]:
+def analyzer(outcome: object, **overrides: object) -> tuple[OpenAIImageAnalyzer, FakeClient]:
     client = FakeClient(outcome)
-    instance = GeminiImageAnalyzer(
+    instance = OpenAIImageAnalyzer(
         api_key="private-key",
-        model="gemini-3.1-flash-lite",
+        model="gpt-4.1-mini",
         timeout_seconds=0.05,
         client=client,
         **overrides,
@@ -125,16 +134,14 @@ def test_transport_schema_is_manual_minimal_and_requires_every_field() -> None:
         "maximum",
         "property_ordering",
     )
-    rendered = json.dumps(GEMINI_IMAGE_ANALYSIS_SCHEMA)
-    assert set(GEMINI_IMAGE_ANALYSIS_SCHEMA) == {
+    rendered = json.dumps(IMAGE_ANALYSIS_SCHEMA)
+    assert set(IMAGE_ANALYSIS_SCHEMA) == {
         "type",
         "properties",
         "required",
         "additionalProperties",
     }
-    assert set(GEMINI_IMAGE_ANALYSIS_SCHEMA["required"]) == set(
-        GEMINI_IMAGE_ANALYSIS_SCHEMA["properties"]
-    )
+    assert set(IMAGE_ANALYSIS_SCHEMA["required"]) == set(IMAGE_ANALYSIS_SCHEMA["properties"])
     assert all(item not in rendered for item in forbidden)
 
 
@@ -146,15 +153,23 @@ async def test_analyzes_supported_inline_image_once(mime_type: str) -> None:
     assert result.document_type is ImageDocumentType.RECEIPT
     assert str(result.amount_candidates[0].value) == "42.50"
     assert result.caption is None
-    assert len(client.models.calls) == 1
-    call = client.models.calls[0]
-    assert call["model"] == "gemini-3.1-flash-lite"
-    assert call["config"].response_mime_type == "application/json"
-    assert call["config"].response_json_schema == GEMINI_IMAGE_ANALYSIS_SCHEMA
-    assert call["config"].temperature == 0
-    assert call["contents"][0].parts[0].inline_data.data == b"private-image-bytes"
-    assert call["contents"][0].parts[0].inline_data.mime_type == mime_type
-    instruction = call["config"].system_instruction.text
+    assert len(client.responses.calls) == 1
+    call = client.responses.calls[0]
+    assert call["model"] == "gpt-4.1-mini"
+    assert call["text"]["format"] == {
+        "type": "json_schema",
+        "name": "image_analysis",
+        "strict": True,
+        "schema": IMAGE_ANALYSIS_SCHEMA,
+    }
+    assert call["temperature"] == 0 and call["store"] is False
+    content = call["input"][0]["content"]
+    assert content[0]["type"] == "input_text"
+    image_url = content[1]["image_url"]
+    prefix, encoded = image_url.split(",", 1)
+    assert prefix == f"data:{mime_type};base64"
+    assert base64.b64decode(encoded) == b"private-image-bytes"
+    instruction = call["instructions"]
     for required in (
         "string decimal canônica",
         "sem R$",
@@ -173,11 +188,11 @@ async def test_caption_is_preserved_separately_after_outer_trim(caption: str | N
     result = await instance.analyze(image(), caption)
     expected = caption.strip() if caption is not None else None
     assert result.caption == expected
-    parts = client.models.calls[0]["contents"][0].parts
-    assert len(parts) == (2 if caption is not None else 1)
+    parts = client.responses.calls[0]["input"][0]["content"]
+    assert len(parts) == (3 if caption is not None else 2)
     if caption is not None:
-        assert parts[1].text == expected
-        assert expected not in str(client.models.calls[0]["config"].system_instruction)
+        assert parts[2]["text"].endswith(expected)
+        assert expected not in str(client.responses.calls[0]["instructions"])
 
 
 async def test_untrusted_caption_and_visible_commands_cannot_change_instruction() -> None:
@@ -195,7 +210,7 @@ async def test_untrusted_caption_and_visible_commands_cannot_change_instruction(
         )
     )
     result = await instance.analyze(image(), malicious)
-    instruction = client.models.calls[0]["config"].system_instruction.text
+    instruction = client.responses.calls[0]["instructions"]
     assert malicious not in instruction
     assert result.visible_text == malicious and result.caption == malicious
     assert result.amount_candidates == []
@@ -343,7 +358,7 @@ async def test_rejects_candidates_for_non_financial_or_illegible_result(flag: st
     [None, "", "not-json", "[]", json.dumps({**payload(), "extra": "forbidden"})],
 )
 async def test_rejects_empty_invalid_or_additional_fields(response_text: str | None) -> None:
-    instance, _ = analyzer(SimpleNamespace(text=response_text))
+    instance, _ = analyzer(SimpleNamespace(output_text=response_text))
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
     assert caught.value.code is ImageAnalysisErrorCode.INVALID_RESPONSE
@@ -396,7 +411,7 @@ async def test_rejects_excessive_or_unsafe_caption_before_call(caption: str) -> 
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image(), caption)
     assert caught.value.code is ImageAnalysisErrorCode.UNSUPPORTED_INPUT
-    assert client.models.calls == []
+    assert client.responses.calls == []
 
 
 async def test_rejects_unsafe_response_characters() -> None:
@@ -415,7 +430,7 @@ async def test_timeout_is_transient_single_call() -> None:
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
     assert_error(caught.value, ImageAnalysisErrorCode.TIMEOUT, True)
-    assert len(client.models.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -428,6 +443,7 @@ async def test_timeout_is_transient_single_call() -> None:
         (429, ImageAnalysisErrorCode.QUOTA_EXCEEDED, True),
         (500, ImageAnalysisErrorCode.UNAVAILABLE, True),
         (503, ImageAnalysisErrorCode.UNAVAILABLE, True),
+        (504, ImageAnalysisErrorCode.TIMEOUT, True),
     ],
 )
 async def test_maps_api_statuses(
@@ -438,18 +454,17 @@ async def test_maps_api_statuses(
         headers={"x-request-id": "private-id", "authorization": "private"},
         request=httpx.Request("POST", "https://example.invalid"),
     )
-    error_type = errors.ClientError if status < 500 else errors.ServerError
-    error = error_type(
-        status,
-        {"error": {"status": "PRIVATE_DETAIL", "message": "private body"}},
-        raw,
+    error = APIStatusError(
+        "private body",
+        response=raw,
+        body={"error": {"message": "private body"}},
     )
     instance, client = analyzer(error)
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
     assert_error(caught.value, code, transient)
     assert caught.value.metadata.http_status == status
-    assert len(client.models.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
 async def test_transport_failure_is_transient_without_retry_or_fallback() -> None:
@@ -457,25 +472,27 @@ async def test_transport_failure_is_transient_without_retry_or_fallback() -> Non
     with pytest.raises(ImageAnalysisError) as caught:
         await instance.analyze(image())
     assert_error(caught.value, ImageAnalysisErrorCode.UNAVAILABLE, True)
-    assert len(client.models.calls) == 1
-    assert client.models.calls[0]["model"] == "gemini-3.1-flash-lite"
+    assert len(client.responses.calls) == 1
+    assert client.responses.calls[0]["model"] == "gpt-4.1-mini"
 
 
-def test_created_client_uses_one_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_created_client_uses_one_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_client(**kwargs: object) -> FakeClient:
         captured.update(kwargs)
         return FakeClient(response())
 
-    monkeypatch.setattr("oink_finai.services.gemini_image_analyzer.genai.Client", fake_client)
-    instance = GeminiImageAnalyzer(
-        api_key="private-key", model="gemini-3.1-flash-lite", timeout_seconds=12.5
+    monkeypatch.setattr("oink_finai.services.openai_image_analyzer.AsyncOpenAI", fake_client)
+    instance = OpenAIImageAnalyzer(
+        api_key="private-key", model="gpt-4.1-mini", timeout_seconds=12.5
     )
-    options = captured["http_options"]
-    assert options.timeout == 12_500
-    assert options.retry_options.attempts == 1
+    assert captured["timeout"] == 12.5
+    assert captured["max_retries"] == 0
+    assert captured["http_client"].follow_redirects is False
     assert "private-key" not in repr(instance)
+    await instance.aclose()
+    await captured["http_client"].aclose()
 
 
 @pytest.mark.parametrize(
@@ -492,12 +509,12 @@ def test_created_client_uses_one_attempt(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_invalid_configuration_is_terminal(overrides: dict[str, object]) -> None:
     arguments = {
         "api_key": "key",
-        "model": "gemini-3.1-flash-lite",
+        "model": "gpt-4.1-mini",
         "timeout_seconds": 10,
         **overrides,
     }
     with pytest.raises(ImageAnalysisError) as caught:
-        GeminiImageAnalyzer(**arguments)
+        OpenAIImageAnalyzer(**arguments)
     assert_error(caught.value, ImageAnalysisErrorCode.CONFIGURATION, False)
 
 
@@ -518,8 +535,64 @@ async def test_sensitive_data_absent_from_logs_repr_and_exceptions(caplog) -> No
         assert secret not in rendered
 
 
+async def test_mock_transport_uses_one_responses_call_with_manual_schema_and_image() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_synthetic",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-4.1-mini",
+                "output": [
+                    {
+                        "id": "msg_synthetic",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(payload()),
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    async with AsyncOpenAI(
+        api_key="private-key",
+        base_url="https://openai.invalid/v1",
+        max_retries=2,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        instance = OpenAIImageAnalyzer(api_key="private-key", model="gpt-4.1-mini", client=client)
+        result = await instance.analyze(image())
+        await instance.aclose()
+
+    assert str(result.amount_candidates[0].value) == "42.50"
+    assert len(requests) == 1 and requests[0].url.path == "/v1/responses"
+    body = json.loads(requests[0].content)
+    assert body["model"] == "gpt-4.1-mini"
+    assert body["text"]["format"] == {
+        "type": "json_schema",
+        "name": "image_analysis",
+        "strict": True,
+        "schema": IMAGE_ANALYSIS_SCHEMA,
+    }
+    assert body["store"] is False
+    image_url = body["input"][0]["content"][1]["image_url"]
+    assert image_url.startswith("data:image/jpeg;base64,")
+
+
 def test_analyzer_has_no_persistence_or_pipeline_imports() -> None:
-    source = Path("src/oink_finai/services/gemini_image_analyzer.py").read_text(encoding="utf-8")
+    source = Path("src/oink_finai/services/openai_image_analyzer.py").read_text(encoding="utf-8")
     for forbidden in ("sqlalchemy", "database", "worker", "repositories", "outbox"):
         assert forbidden not in source.lower()
 

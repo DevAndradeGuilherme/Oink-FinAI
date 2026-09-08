@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -8,8 +9,8 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from google import genai
-from google.genai import errors, types
+import httpx
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from oink_finai.domain.image_analysis_limits import (
@@ -29,14 +30,14 @@ from oink_finai.domain.monetary_value import (
     parse_monetary_value,
 )
 from oink_finai.schemas.image_analysis import (
-    GEMINI_IMAGE_ANALYSIS_SCHEMA,
+    IMAGE_ANALYSIS_SCHEMA,
     AmountCandidate,
     DateCandidate,
     EvidenceCandidate,
-    GeminiImageAnalysisTransport,
     ImageAnalysis,
+    ImageAnalysisTransport,
 )
-from oink_finai.services.gemini_errors import GeminiErrorMetadata
+from oink_finai.services.ai_error_metadata import AIErrorMetadata
 from oink_finai.services.image_analysis_errors import (
     GroundingCandidateKind,
     GroundingFailureReason,
@@ -48,6 +49,7 @@ from oink_finai.services.image_analyzer import (
     ValidatedImage,
     normalize_image_caption,
 )
+from oink_finai.services.openai_privacy import openai_private_operation
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,7 @@ _ALLOWED_IMAGE_FORMATS = {
 _MONEY_TOKEN_PATTERN = re.compile(r"(?<![\w.,])(?:R\$[ \t]*)?\d[\d.,]*(?![\w.,])")
 _PROVIDER_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SAFE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
-_REQUEST_ID_HEADERS = frozenset({"x-request-id", "x-goog-request-id"})
+_REQUEST_ID_HEADERS = frozenset({"x-request-id"})
 _GENERIC_EVIDENCE = frozenset(
     {"evidence", "evidencia", "evidência", "texto", "valor", "data", "loja", "pagamento"}
 )
@@ -178,21 +180,26 @@ def _amount_grounding_reason(
     return GroundingFailureReason.AMOUNT_EVIDENCE_NOT_FOUND
 
 
-class GeminiImageAnalyzer(ImageAnalyzer):
+class OpenAIImageAnalyzer(ImageAnalyzer):
     def __init__(
         self,
         *,
         api_key: str | None,
-        model: str | None,
-        timeout_seconds: float,
+        model: str = "gpt-4.1-mini",
+        timeout_seconds: float = 90.0,
         max_image_bytes: int = 10 * 1024 * 1024,
         max_visible_text_characters: int = IMAGE_ANALYSIS_VISIBLE_TEXT_MAX_LENGTH,
         max_caption_characters: int = IMAGE_ANALYSIS_CAPTION_MAX_LENGTH,
-        client: Any | None = None,
+        client: AsyncOpenAI | None = None,
     ) -> None:
         if (
-            not api_key
-            or not model
+            not isinstance(api_key, str)
+            or not api_key.strip()
+            or any(ord(character) < 33 or ord(character) > 126 for character in api_key)
+            or not isinstance(model, str)
+            or not _SAFE_MODEL_PATTERN.fullmatch(model)
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
             or isinstance(max_image_bytes, bool)
@@ -207,79 +214,137 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         ):
             raise ImageAnalysisError(ImageAnalysisErrorCode.CONFIGURATION, transient=False)
         self._model = model
-        self._safe_model = model if _SAFE_MODEL_PATTERN.fullmatch(model) else None
+        self._safe_model = model
         self._timeout_seconds = timeout_seconds
         self._max_image_bytes = max_image_bytes
         self._max_visible_text_characters = max_visible_text_characters
         self._max_caption_characters = max_caption_characters
         self._owns_client = client is None
-        self._client = client or genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(
-                timeout=int(timeout_seconds * 1000),
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
-        )
+        self._closed = False
+        failure = None
+        with openai_private_operation():
+            try:
+                if client is not None and client._client.follow_redirects:
+                    raise ValueError
+                self._client = (
+                    AsyncOpenAI(
+                        api_key=api_key,
+                        base_url="https://api.openai.com/v1",
+                        max_retries=0,
+                        timeout=timeout_seconds,
+                        http_client=httpx.AsyncClient(
+                            timeout=timeout_seconds, follow_redirects=False
+                        ),
+                    )
+                    if client is None
+                    else client.with_options(max_retries=0, timeout=timeout_seconds)
+                )
+            except Exception:
+                failure = ImageAnalysisError(ImageAnalysisErrorCode.CONFIGURATION, transient=False)
+        if failure is not None:
+            raise failure
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aio.aclose()
+        if self._closed:
+            return
+        failure = None
+        with openai_private_operation():
+            try:
+                if self._owns_client:
+                    async with asyncio.timeout(self._timeout_seconds):
+                        await self._client.close()
+                self._closed = True
+            except Exception:
+                failure = ImageAnalysisError(ImageAnalysisErrorCode.UNAVAILABLE, transient=True)
+        if failure is not None:
+            raise failure
 
     async def analyze(self, image: ValidatedImage, caption: str | None = None) -> ImageAnalysis:
         mime_type = self._validate_image(image)
         normalized_caption = self._validate_caption(caption)
         started_at = time.monotonic()
-        try:
-            return await asyncio.wait_for(
-                self._analyze_once(image, mime_type, normalized_caption),
-                timeout=self._timeout_seconds,
-            )
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            self._raise_error(
-                ImageAnalysisErrorCode.TIMEOUT,
-                transient=True,
-                exception_class="TimeoutError",
-                category="timeout",
-                started_at=started_at,
-            )
-        except errors.APIError as error:
-            self._raise_api_error(error, started_at)
-        except ImageAnalysisError:
-            raise
-        except Exception as error:
-            self._raise_error(
-                ImageAnalysisErrorCode.UNAVAILABLE,
-                transient=True,
-                exception_class=type(error).__name__,
-                category="transport_unavailable",
-                started_at=started_at,
-            )
+        failure = None
+        result = None
+        with openai_private_operation():
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    if self._closed:
+                        raise ImageAnalysisError(
+                            ImageAnalysisErrorCode.CONFIGURATION, transient=False
+                        )
+                    result = await self._analyze_once(image, mime_type, normalized_caption)
+            except asyncio.CancelledError:
+                raise
+            except ImageAnalysisError as error:
+                failure = error
+            except (TimeoutError, APITimeoutError, httpx.TimeoutException):
+                failure = self._error(
+                    ImageAnalysisErrorCode.TIMEOUT,
+                    transient=True,
+                    exception_class="TimeoutError",
+                    category="timeout",
+                    started_at=started_at,
+                )
+            except APIStatusError as error:
+                failure = self._status_error(error, started_at)
+            except (APIConnectionError, httpx.TransportError, ConnectionError) as error:
+                failure = self._error(
+                    ImageAnalysisErrorCode.UNAVAILABLE,
+                    transient=True,
+                    exception_class=type(error).__name__,
+                    category="connection",
+                    started_at=started_at,
+                )
+            except Exception as error:
+                failure = self._error(
+                    ImageAnalysisErrorCode.UNAVAILABLE,
+                    transient=True,
+                    exception_class=type(error).__name__,
+                    category="transport_unavailable",
+                    started_at=started_at,
+                )
+        if failure is not None:
+            raise failure
+        if result is None:
+            raise ImageAnalysisError(ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False)
+        return result
 
     async def _analyze_once(
         self, image: ValidatedImage, mime_type: str, caption: str | None
     ) -> ImageAnalysis:
-        parts = [types.Part.from_bytes(data=image.content, mime_type=mime_type)]
+        content: list[dict[str, str]] = [
+            {"type": "input_text", "text": "Analise a imagem conforme as instruções."},
+            {
+                "type": "input_image",
+                "image_url": (
+                    f"data:{mime_type};base64,{base64.b64encode(image.content).decode('ascii')}"
+                ),
+                "detail": "high",
+            },
+        ]
         if caption is not None:
-            parts.append(types.Part.from_text(text=caption))
-        user_content = types.Content(role="user", parts=parts)
-        response = await self._client.aio.models.generate_content(
+            content.append({"type": "input_text", "text": f"Legenda não confiável:\n{caption}"})
+        response = await self._client.responses.create(
             model=self._model,
-            contents=[user_content],
-            config=types.GenerateContentConfig(
-                system_instruction=types.Part.from_text(text=_IMAGE_ANALYSIS_INSTRUCTION),
-                response_mime_type="application/json",
-                response_json_schema=GEMINI_IMAGE_ANALYSIS_SCHEMA,
-                temperature=0,
-            ),
+            instructions=_IMAGE_ANALYSIS_INSTRUCTION,
+            input=[{"role": "user", "content": content}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "image_analysis",
+                    "strict": True,
+                    "schema": IMAGE_ANALYSIS_SCHEMA,
+                }
+            },
+            temperature=0,
+            store=False,
         )
-        response_text = getattr(response, "text", None)
+        response_text = response.output_text
         if not isinstance(response_text, str) or not response_text.strip():
             raise ImageAnalysisError(ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False)
         try:
             payload = json.loads(response_text)
-            transport = GeminiImageAnalysisTransport.model_validate(payload)
+            transport = ImageAnalysisTransport.model_validate(payload)
         except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
             raise ImageAnalysisError(
                 ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False
@@ -321,9 +386,7 @@ class GeminiImageAnalyzer(ImageAnalyzer):
             raise ImageAnalysisError(ImageAnalysisErrorCode.UNSUPPORTED_INPUT, transient=False)
         return normalized
 
-    def _to_domain(
-        self, transport: GeminiImageAnalysisTransport, caption: str | None
-    ) -> ImageAnalysis:
+    def _to_domain(self, transport: ImageAnalysisTransport, caption: str | None) -> ImageAnalysis:
         if len(transport.visible_text) > self._max_visible_text_characters:
             raise ImageAnalysisError(ImageAnalysisErrorCode.TOO_MUCH_TEXT, transient=False)
         if _has_unsafe_control(transport.visible_text):
@@ -420,9 +483,7 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         except (ValidationError, TypeError, ValueError, InvalidOperation):
             self._raise_grounding(GroundingFailureReason.CONTRADICTORY_RESULT)
 
-    def _convert_date_candidates(
-        self, transport: GeminiImageAnalysisTransport
-    ) -> list[DateCandidate]:
+    def _convert_date_candidates(self, transport: ImageAnalysisTransport) -> list[DateCandidate]:
         converted: list[DateCandidate] = []
         for index, candidate in enumerate(transport.date_candidates):
             kind = GroundingCandidateKind.DATE
@@ -576,7 +637,7 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         )
         return evidence
 
-    def _validate_result_coherence(self, transport: GeminiImageAnalysisTransport) -> None:
+    def _validate_result_coherence(self, transport: ImageAnalysisTransport) -> None:
         warnings = transport.warnings
         financial_types = {
             "RECEIPT",
@@ -622,10 +683,10 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         index: int | None = None,
     ) -> None:
         logger.warning(
-            "Gemini image grounding failed",
+            "Image grounding failed",
             extra={
-                "gemini_operation": "image_analysis_grounding",
-                "gemini_model": self._safe_model,
+                "ai_operation": "image_analysis_grounding",
+                "openai_model": self._safe_model,
                 "image_analysis_code": ImageAnalysisErrorCode.GROUNDING.value,
                 "grounding_reason": reason.value,
                 "candidate_kind": kind.value if kind is not None else None,
@@ -640,31 +701,45 @@ class GeminiImageAnalyzer(ImageAnalyzer):
             candidate_index=index,
         )
 
-    def _raise_api_error(self, error: errors.APIError, started_at: float) -> None:
-        status = getattr(error, "code", None)
-        mapping: dict[int, tuple[ImageAnalysisErrorCode, bool, str]] = {
-            400: (ImageAnalysisErrorCode.INVALID_RESPONSE, False, "invalid_request"),
-            401: (ImageAnalysisErrorCode.AUTHENTICATION, False, "authentication"),
-            403: (ImageAnalysisErrorCode.AUTHENTICATION, False, "permission"),
-            404: (ImageAnalysisErrorCode.MODEL_UNAVAILABLE, False, "model_unavailable"),
-            429: (ImageAnalysisErrorCode.QUOTA_EXCEEDED, True, "quota"),
-            500: (ImageAnalysisErrorCode.UNAVAILABLE, True, "provider_unavailable"),
-            503: (ImageAnalysisErrorCode.UNAVAILABLE, True, "provider_unavailable"),
-            504: (ImageAnalysisErrorCode.TIMEOUT, True, "timeout"),
-        }
-        code, transient, category = mapping.get(
-            status,
-            (ImageAnalysisErrorCode.UNAVAILABLE, True, "provider_unavailable"),
-        )
-        self._raise_error(
+    def _status_error(self, error: APIStatusError, started_at: float) -> ImageAnalysisError:
+        status = error.status_code
+        if status in {401, 403}:
+            code, transient, category = (
+                ImageAnalysisErrorCode.AUTHENTICATION,
+                False,
+                "authentication" if status == 401 else "permission",
+            )
+        elif status == 404:
+            code, transient, category = (
+                ImageAnalysisErrorCode.MODEL_UNAVAILABLE,
+                False,
+                "model_unavailable",
+            )
+        elif status == 429:
+            code, transient, category = ImageAnalysisErrorCode.QUOTA_EXCEEDED, True, "quota"
+        elif status in {408, 504}:
+            code, transient, category = ImageAnalysisErrorCode.TIMEOUT, True, "timeout"
+        elif 500 <= status <= 599:
+            code, transient, category = (
+                ImageAnalysisErrorCode.UNAVAILABLE,
+                True,
+                "provider_unavailable",
+            )
+        else:
+            code, transient, category = (
+                ImageAnalysisErrorCode.INVALID_RESPONSE,
+                False,
+                "invalid_request",
+            )
+        return self._error(
             code,
             transient=transient,
             exception_class=type(error).__name__,
             category=category,
             started_at=started_at,
-            http_status=status if isinstance(status, int) else None,
-            provider_code=self._safe_provider_code(getattr(error, "status", None)),
-            request_id_present=self._has_request_id(getattr(error, "response", None)),
+            http_status=status,
+            provider_code=self._safe_provider_code(getattr(error, "code", None)),
+            request_id_present=self._has_request_id(error.response),
         )
 
     @staticmethod
@@ -680,7 +755,7 @@ class GeminiImageAnalyzer(ImageAnalyzer):
             return False
         return not _REQUEST_ID_HEADERS.isdisjoint(names)
 
-    def _raise_error(
+    def _error(
         self,
         code: ImageAnalysisErrorCode,
         *,
@@ -691,8 +766,8 @@ class GeminiImageAnalyzer(ImageAnalyzer):
         http_status: int | None = None,
         provider_code: str | None = None,
         request_id_present: bool = False,
-    ) -> None:
-        metadata = GeminiErrorMetadata(
+    ) -> ImageAnalysisError:
+        metadata = AIErrorMetadata(
             exception_class=exception_class,
             category=category,
             duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
@@ -701,14 +776,14 @@ class GeminiImageAnalyzer(ImageAnalyzer):
             request_id_present=request_id_present,
         )
         logger.warning(
-            "Gemini image analysis failed",
+            "OpenAI image analysis failed",
             extra={
-                "gemini_operation": "image_analysis",
-                "gemini_model": self._safe_model,
-                "gemini_duration_ms": metadata.duration_ms,
-                "gemini_status": metadata.http_status,
-                "gemini_exception_class": metadata.exception_class,
-                "gemini_code": metadata.provider_code,
+                "ai_operation": "image_analysis",
+                "openai_model": self._safe_model,
+                "openai_duration_ms": metadata.duration_ms,
+                "openai_status": metadata.http_status,
+                "openai_exception_class": metadata.exception_class,
+                "openai_code": metadata.provider_code,
             },
         )
-        raise ImageAnalysisError(code, transient=transient, metadata=metadata) from None
+        return ImageAnalysisError(code, transient=transient, metadata=metadata)

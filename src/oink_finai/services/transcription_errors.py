@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from oink_finai.services.gemini_errors import GeminiErrorMetadata
+from oink_finai.services.ai_error_metadata import AIErrorMetadata
 
 
 class TranscriptionErrorCode(StrEnum):
@@ -21,7 +21,7 @@ class TranscriptionError(Exception):
         code: TranscriptionErrorCode,
         *,
         transient: bool,
-        metadata: GeminiErrorMetadata | None = None,
+        metadata: AIErrorMetadata | None = None,
     ) -> None:
         self.code = code
         self.transient = transient

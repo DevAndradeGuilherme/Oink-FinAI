@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from oink_finai.domain.enums import ExpenseCategory, ExpenseIntent, PaymentMethod
 
 
-class GeminiExpenseTransport(BaseModel):
+class ExpenseInterpretationTransport(BaseModel):
     """Transport DTO parsed before deterministic domain validation."""
 
     model_config = ConfigDict(extra="forbid")
@@ -42,7 +42,7 @@ class ExpenseInterpretation(BaseModel):
     reasoning_summary: str
 
 
-GEMINI_EXPENSE_TRANSPORT_SCHEMA: dict[str, object] = {
+EXPENSE_INTERPRETATION_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "intent": {"type": "string", "enum": [value.value for value in ExpenseIntent]},

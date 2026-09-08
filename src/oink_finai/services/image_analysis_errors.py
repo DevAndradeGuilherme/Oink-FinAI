@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from oink_finai.services.gemini_errors import GeminiErrorMetadata
+from oink_finai.services.ai_error_metadata import AIErrorMetadata
 
 
 class ImageAnalysisErrorCode(StrEnum):
@@ -57,7 +57,7 @@ class ImageAnalysisError(Exception):
         code: ImageAnalysisErrorCode,
         *,
         transient: bool,
-        metadata: GeminiErrorMetadata | None = None,
+        metadata: AIErrorMetadata | None = None,
         grounding_reason: GroundingFailureReason | None = None,
         candidate_kind: GroundingCandidateKind | None = None,
         candidate_index: int | None = None,

@@ -31,7 +31,7 @@ from oink_finai.services.expense_processing import (
     AUDIO_NO_SPEECH_TEXT,
     ExpenseProcessingService,
 )
-from oink_finai.services.gemini_errors import GeminiRateLimitError
+from oink_finai.services.interpretation_errors import InterpretationRateLimitError
 from oink_finai.services.openai_audio_transcriber import OpenAIAudioTranscriber
 from oink_finai.services.transcription_errors import (
     NoSpeechError,
@@ -233,7 +233,9 @@ async def test_openai_failures_use_durable_retry_and_reuse_successful_checkpoint
 
     message = await seed_audio(audio_factory)
     provider = FakeProvider([b"OggSvalid"])
-    interpreter = FakeAudioInterpreter([GeminiRateLimitError("synthetic retry"), expense_result()])
+    interpreter = FakeAudioInterpreter(
+        [InterpretationRateLimitError("synthetic retry"), expense_result()]
+    )
     async with AsyncOpenAI(
         api_key="synthetic-key",
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -295,7 +297,9 @@ async def test_retry_after_transcript_checkpoint_skips_download_and_transcriptio
     )
     provider = FakeProvider([AssertionError("download must not run")])
     transcriber = FakeTranscriber([AssertionError("transcription must not run")])
-    interpreter = FakeAudioInterpreter([GeminiRateLimitError("rate limited"), expense_result()])
+    interpreter = FakeAudioInterpreter(
+        [InterpretationRateLimitError("rate limited"), expense_result()]
+    )
     service = processor(audio_factory, provider, transcriber, interpreter)
 
     await service.claim(1)

@@ -62,23 +62,15 @@ from oink_finai.services.expense_commands import (
     parse_expense_command,
 )
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
-from oink_finai.services.gemini_errors import (
-    GeminiAuthenticationError,
-    GeminiConfigurationError,
-    GeminiInterpreterError,
-    GeminiModelUnavailableError,
-    GeminiPermissionError,
-    GeminiRateLimitError,
-    GeminiRequestError,
-    GeminiSchemaError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
-)
 from oink_finai.services.image_analysis_errors import ImageAnalysisError
 from oink_finai.services.image_analyzer import (
     ImageAnalyzer,
     ValidatedImage,
     normalize_image_caption,
+)
+from oink_finai.services.interpretation_errors import (
+    InterpretationError,
+    InterpretationErrorCode,
 )
 from oink_finai.services.pipeline_timing import PipelineTiming
 from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
@@ -461,7 +453,7 @@ class ExpenseProcessingService:
             await asyncio.shield(
                 self._retry_or_fail(
                     message_id,
-                    "GEMINI_TIMEOUT",
+                    InterpretationErrorCode.TIMEOUT.value,
                     clarification=clarification if is_clarification_response else None,
                 )
             )
@@ -472,7 +464,7 @@ class ExpenseProcessingService:
             else:
                 await self._fail_clarification_and_reask(message_id, exc.code, clarification)
             return
-        except GeminiInterpreterError as exc:
+        except InterpretationError as exc:
             if self._is_transient(exc):
                 await self._retry_or_fail(
                     message_id,
@@ -535,7 +527,7 @@ class ExpenseProcessingService:
                         self._reset_state(state)
                     status = ProcessedMessageStatus.NOT_EXPENSE
                 self._complete_successfully(message, status)
-        except GeminiInterpreterError as exc:
+        except InterpretationError as exc:
             await self._mark_failed(message_id, self._error_code(exc))
         except IntegrityError:
             await self._recover_unique_conflict(message_id)
@@ -1003,14 +995,8 @@ class ExpenseProcessingService:
         )
 
     @staticmethod
-    def _is_transient(exc: GeminiInterpreterError) -> bool:
-        if isinstance(exc, (GeminiTimeoutError, GeminiRateLimitError)):
-            return True
-        if not isinstance(exc, GeminiUnavailableError):
-            return False
-        if exc.metadata is None or exc.metadata.http_status is None:
-            return True
-        return 500 <= exc.metadata.http_status < 600
+    def _is_transient(exc: InterpretationError) -> bool:
+        return exc.transient
 
     @staticmethod
     def _validate_interpretation(result: ExpenseInterpretation) -> None:
@@ -1018,17 +1004,17 @@ class ExpenseProcessingService:
         if result.intent is not ExpenseIntent.CREATE_EXPENSE:
             return
         if not isinstance(result.amount, Decimal) or not result.amount.is_finite():
-            raise GeminiSchemaError("Expense result failed deterministic validation")
+            raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
         if result.description is None or not result.description.strip():
-            raise GeminiSchemaError("Expense result failed deterministic validation")
+            raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
 
     @staticmethod
     def _validate_partial_interpretation(result: ExpenseInterpretation) -> None:
         if result.intent is not ExpenseIntent.CREATE_EXPENSE and result.amount is not None:
-            raise GeminiSchemaError("Non-expense result must not contain amount")
+            raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
         if result.amount is not None:
             if not isinstance(result.amount, Decimal) or not result.amount.is_finite():
-                raise GeminiSchemaError("Expense result failed deterministic validation")
+                raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
             if result.amount <= 0 or result.amount > EXPENSE_AMOUNT_MAX:
                 raise InterpretationLimitError("AMOUNT_OUT_OF_RANGE")
             if result.amount.as_tuple().exponent < -EXPENSE_AMOUNT_SCALE:
@@ -1092,14 +1078,14 @@ class ExpenseProcessingService:
         assert result.amount is not None and result.description is not None
         origin = origin_message or message
         if origin.user_id != message.user_id:
-            raise GeminiSchemaError("Clarification user does not match expense origin")
+            raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
         category = await session.scalar(
             select(Category).where(
                 Category.name == result.category.value, Category.is_active.is_(True)
             )
         )
         if category is None:
-            raise GeminiSchemaError("Canonical category is unavailable")
+            raise InterpretationError(InterpretationErrorCode.INVALID_RESPONSE, transient=False)
         timezone = self._timezone(message.user.timezone)
         timestamp = origin.message_timestamp
         if timestamp.tzinfo is None:
@@ -1911,19 +1897,8 @@ class ExpenseProcessingService:
                 message.locked_at = None
 
     @staticmethod
-    def _error_code(exc: GeminiInterpreterError) -> str:
-        names = {
-            GeminiConfigurationError: "GEMINI_CONFIGURATION",
-            GeminiRequestError: "GEMINI_REQUEST",
-            GeminiAuthenticationError: "GEMINI_AUTHENTICATION",
-            GeminiPermissionError: "GEMINI_PERMISSION",
-            GeminiModelUnavailableError: "GEMINI_MODEL_UNAVAILABLE",
-            GeminiSchemaError: "GEMINI_SCHEMA_INVALID",
-            GeminiTimeoutError: "GEMINI_TIMEOUT",
-            GeminiRateLimitError: "GEMINI_RATE_LIMIT",
-            GeminiUnavailableError: "GEMINI_UNAVAILABLE",
-        }
-        return next((code for cls, code in names.items() if isinstance(exc, cls)), "GEMINI_ERROR")
+    def _error_code(exc: InterpretationError) -> str:
+        return exc.code.value
 
     @staticmethod
     def _is_data_exception(exc: DBAPIError) -> bool:

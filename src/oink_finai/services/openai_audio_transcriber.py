@@ -1,32 +1,15 @@
 import asyncio
-import logging
 import math
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from oink_finai.schemas.audio import MAX_TRANSCRIPT_CHARACTERS, AudioTranscription
 from oink_finai.services.audio_transcriber import AudioTranscriber, ValidatedAudio
+from oink_finai.services.openai_privacy import openai_private_operation
 from oink_finai.services.transcription_errors import TranscriptionError, TranscriptionErrorCode
 
-_PRIVATE_OPERATION: ContextVar[bool] = ContextVar("openai_audio_private_operation", default=False)
-_SDK_LOGGERS = (
-    "openai",
-    "openai._base_client",
-    "openai._response",
-    "openai._legacy_response",
-    "openai.audio.transcriptions",
-    "httpx",
-    "httpcore.connection",
-    "httpcore.http11",
-    "httpcore.http2",
-    "httpcore.proxy",
-    "httpcore.socks",
-)
 _AUDIO_FILES = {
     "audio/ogg": ("audio.ogg", "audio/ogg"),
     "audio/opus": ("audio.ogg", "audio/ogg"),
@@ -36,27 +19,6 @@ _AUDIO_FILES = {
     "audio/flac": ("audio.flac", "audio/flac"),
     "audio/webm": ("audio.webm", "audio/webm"),
 }
-
-
-class _PrivateOperationFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _PRIVATE_OPERATION.get()
-
-
-_PRIVATE_FILTER = _PrivateOperationFilter()
-
-
-@contextmanager
-def _private_operation() -> Iterator[None]:
-    # Logger filters run before any handler sees SDK bodies, headers or transport URLs.
-    # Context-local suppression leaves concurrent Gemini/Evolution operations unchanged.
-    for name in _SDK_LOGGERS:
-        logging.getLogger(name).addFilter(_PRIVATE_FILTER)
-    token = _PRIVATE_OPERATION.set(True)
-    try:
-        yield
-    finally:
-        _PRIVATE_OPERATION.reset(token)
 
 
 def _positive_number(value: object) -> bool:
@@ -79,7 +41,7 @@ class OpenAIAudioTranscriber(AudioTranscriber):
         self,
         *,
         api_key: str | None,
-        model: str = "gpt-4o-mini-transcribe",
+        model: str = "gpt-transcribe",
         timeout_seconds: float = 90.0,
         language: str = "pt",
         max_audio_bytes: int = 10 * 1024 * 1024,
@@ -109,7 +71,7 @@ class OpenAIAudioTranscriber(AudioTranscriber):
         self._owns_client = client is None
         self._closed = False
         failure = None
-        with _private_operation():
+        with openai_private_operation():
             try:
                 # The SDK has no public HTTP-client accessor. Inspect without mutating the
                 # borrowed client so a redirect cannot create another request in an attempt.
@@ -138,7 +100,7 @@ class OpenAIAudioTranscriber(AudioTranscriber):
         if self._closed:
             return
         failure = None
-        with _private_operation():
+        with openai_private_operation():
             try:
                 if self._owns_client:
                     async with asyncio.timeout(self._timeout_seconds):
@@ -151,7 +113,7 @@ class OpenAIAudioTranscriber(AudioTranscriber):
 
     async def transcribe(self, audio: ValidatedAudio) -> AudioTranscription:
         failure = None
-        with _private_operation():
+        with openai_private_operation():
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     if self._closed:

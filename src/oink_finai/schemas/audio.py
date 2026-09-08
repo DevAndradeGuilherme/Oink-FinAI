@@ -4,16 +4,6 @@ MAX_TRANSCRIPT_CHARACTERS = 10_000
 MAX_LANGUAGE_CHARACTERS = 64
 
 
-class GeminiAudioTranscriptionTransport(BaseModel):
-    """Minimal Gemini transport DTO; optional language is represented by an empty string."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    transcript: str
-    has_speech: bool
-    detected_language: str
-
-
 class AudioTranscription(BaseModel):
     """Provider-neutral, coherently validated transcription result."""
 
@@ -40,15 +30,3 @@ class AudioTranscription(BaseModel):
         self.transcript = transcript
         self.detected_language = language
         return self
-
-
-GEMINI_AUDIO_TRANSCRIPTION_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {
-        "transcript": {"type": "string"},
-        "has_speech": {"type": "boolean"},
-        "detected_language": {"type": "string"},
-    },
-    "required": ["transcript", "has_speech", "detected_language"],
-    "additionalProperties": False,
-}

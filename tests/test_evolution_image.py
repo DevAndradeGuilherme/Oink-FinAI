@@ -246,7 +246,7 @@ def webhook_client(
     get_settings.cache_clear()
 
 
-async def test_webhook_persists_one_pending_image_without_download_or_gemini(
+async def test_webhook_persists_one_pending_image_without_download_or_openai(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +256,7 @@ async def test_webhook_persists_one_pending_image_without_download_or_gemini(
 
     monkeypatch.setattr(EvolutionWhatsAppProvider, "download_media", forbidden)
     monkeypatch.setattr(
-        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        "oink_finai.services.openai_expense_interpreter.OpenAIExpenseInterpreter.interpret",
         forbidden,
     )
 

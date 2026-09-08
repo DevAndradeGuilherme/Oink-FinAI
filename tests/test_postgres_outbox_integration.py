@@ -35,12 +35,12 @@ from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
-from oink_finai.services.gemini_errors import (
-    GeminiErrorMetadata,
-    GeminiRequestError,
-    GeminiSchemaError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
+from oink_finai.services.interpretation_errors import (
+    AIErrorMetadata,
+    InterpretationInvalidResponseError,
+    InterpretationRequestError,
+    InterpretationTimeoutError,
+    InterpretationUnavailableError,
 )
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 
@@ -193,9 +193,9 @@ async def test_postgres_claim_and_recovery_transitions() -> None:
     ("error", "expected_status", "expected_code"),
     [
         (
-            GeminiUnavailableError(
+            InterpretationUnavailableError(
                 "sanitized",
-                metadata=GeminiErrorMetadata(
+                metadata=AIErrorMetadata(
                     exception_class="ServerError",
                     category="transient",
                     duration_ms=1,
@@ -206,12 +206,12 @@ async def test_postgres_claim_and_recovery_transitions() -> None:
             "GEMINI_UNAVAILABLE",
         ),
         (
-            GeminiTimeoutError("sanitized"),
+            InterpretationTimeoutError("sanitized"),
             ProcessedMessageStatus.PENDING,
             "GEMINI_TIMEOUT",
         ),
         (
-            GeminiRequestError("sanitized"),
+            InterpretationRequestError("sanitized"),
             ProcessedMessageStatus.FAILED,
             "GEMINI_REQUEST",
         ),
@@ -265,7 +265,7 @@ async def test_postgres_concurrent_retry_is_applied_once() -> None:
     user, message = await seed_processing_message(factory)
     processor = ExpenseProcessingService(
         factory,
-        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        lambda _: ErrorInterpreter(InterpretationTimeoutError("unused")),
         max_attempts=3,
         retry_base_seconds=3600,
         retry_max_seconds=3600,
@@ -303,7 +303,7 @@ async def test_postgres_concurrent_retry_exhaustion_creates_one_notification() -
     user, message = await seed_processing_message(factory, processing_attempts=2)
     processor = ExpenseProcessingService(
         factory,
-        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        lambda _: ErrorInterpreter(InterpretationTimeoutError("unused")),
         max_attempts=2,
     )
 
@@ -577,9 +577,9 @@ async def test_postgres_concurrent_schema_failure_reasks_once_and_preserves_draf
                     message, reference_timestamp=reference_timestamp
                 )
             error = {
-                "timeout": GeminiTimeoutError,
-                "503": GeminiUnavailableError,
-            }.get(outcome, GeminiSchemaError)
+                "timeout": InterpretationTimeoutError,
+                "503": InterpretationUnavailableError,
+            }.get(outcome, InterpretationInvalidResponseError)
             raise error("synthetic")
 
     processor = ExpenseProcessingService(
