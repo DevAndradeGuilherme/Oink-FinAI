@@ -36,6 +36,7 @@ from oink_finai.schemas.image_analysis import (
     EvidenceCandidate,
     ImageAnalysis,
     ImageAnalysisTransport,
+    ImageAnalysisWarning,
 )
 from oink_finai.services.ai_error_metadata import AIErrorMetadata
 from oink_finai.services.image_analysis_errors import (
@@ -474,6 +475,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
                 GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_INVALID,
                 GroundingFailureReason.PAYMENT_METHOD_EVIDENCE_NOT_FOUND,
             )
+            warnings = self._normalize_warnings(transport)
             return ImageAnalysis(
                 document_type=transport.document_type,
                 visible_text=transport.visible_text,
@@ -485,7 +487,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
                 is_financial_document=transport.is_financial_document,
                 is_legible=transport.is_legible,
                 confidence=transport.confidence,
-                warnings=transport.warnings,
+                warnings=warnings,
             )
         except ImageAnalysisError:
             raise
@@ -647,7 +649,6 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
         return evidence
 
     def _validate_result_coherence(self, transport: ImageAnalysisTransport) -> None:
-        warnings = transport.warnings
         financial_types = {
             "RECEIPT",
             "INVOICE",
@@ -655,24 +656,25 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
             "BANK_TRANSFER",
             "CARD_RECEIPT",
         }
-        if "NONE" in warnings and len(warnings) != 1:
-            self._raise_grounding(GroundingFailureReason.WARNING_NONE_CONFLICT)
-        if len(set(warnings)) != len(warnings):
-            self._raise_grounding(GroundingFailureReason.DUPLICATE_WARNINGS)
-        if len(transport.amount_candidates) > 1 and "MULTIPLE_AMOUNTS" not in warnings:
-            self._raise_grounding(
-                GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
-                GroundingCandidateKind.AMOUNT,
-                1,
-            )
-        if len(transport.date_candidates) > 1 and "MULTIPLE_DATES" not in warnings:
-            self._raise_grounding(
-                GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
-                GroundingCandidateKind.DATE,
-                1,
-            )
         if transport.document_type.value in financial_types and not transport.is_financial_document:
             self._raise_grounding(GroundingFailureReason.DOCUMENT_TYPE_CONFLICT)
+
+    @staticmethod
+    def _normalize_warnings(
+        transport: ImageAnalysisTransport,
+    ) -> list[ImageAnalysisWarning]:
+        derived = {
+            ImageAnalysisWarning.MULTIPLE_AMOUNTS,
+            ImageAnalysisWarning.MULTIPLE_DATES,
+        }
+        normalized = set(transport.warnings) - derived - {ImageAnalysisWarning.NONE}
+        if len(transport.amount_candidates) > 1:
+            normalized.add(ImageAnalysisWarning.MULTIPLE_AMOUNTS)
+        if len(transport.date_candidates) > 1:
+            normalized.add(ImageAnalysisWarning.MULTIPLE_DATES)
+        if not normalized:
+            return [ImageAnalysisWarning.NONE]
+        return [warning for warning in ImageAnalysisWarning if warning in normalized]
 
     def _reject_duplicate_candidates(
         self, kind: GroundingCandidateKind, candidates: list[Any]

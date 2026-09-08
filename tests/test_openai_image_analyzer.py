@@ -432,24 +432,28 @@ async def test_rejects_unknown_warning_as_invalid_response() -> None:
 @pytest.mark.parametrize(
     ("warnings", "expected"),
     [
-        (["NONE", "CROPPED"], GroundingFailureReason.WARNING_NONE_CONFLICT),
-        (["CROPPED", "CROPPED"], GroundingFailureReason.DUPLICATE_WARNINGS),
+        (["NONE", "CROPPED"], [ImageAnalysisWarning.CROPPED]),
+        (["CROPPED", "CROPPED"], [ImageAnalysisWarning.CROPPED]),
+        (
+            ["INCOMPLETE_DOCUMENT", "BLURRED", "CROPPED"],
+            [
+                ImageAnalysisWarning.BLURRED,
+                ImageAnalysisWarning.CROPPED,
+                ImageAnalysisWarning.INCOMPLETE_DOCUMENT,
+            ],
+        ),
     ],
 )
-async def test_rejects_each_warning_contradiction(
-    warnings: list[str], expected: GroundingFailureReason
+async def test_normalizes_none_duplicates_and_domain_order(
+    warnings: list[str], expected: list[ImageAnalysisWarning]
 ) -> None:
     instance, _ = analyzer(response(warnings=warnings))
-    with pytest.raises(ImageAnalysisError) as caught:
-        await instance.analyze(image())
-    assert caught.value.code is ImageAnalysisErrorCode.GROUNDING
-    assert caught.value.grounding_reason is expected
-    assert caught.value.candidate_kind is None
-    assert caught.value.candidate_index is None
+    result = await instance.analyze(image())
+    assert result.warnings == expected
 
 
 @pytest.mark.parametrize(
-    ("overrides", "expected", "kind"),
+    ("overrides", "expected"),
     [
         (
             {
@@ -463,8 +467,7 @@ async def test_rejects_each_warning_contradiction(
                 "payment_method_candidates": [],
                 "warnings": ["CROPPED"],
             },
-            GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
-            GroundingCandidateKind.AMOUNT,
+            ImageAnalysisWarning.MULTIPLE_AMOUNTS,
         ),
         (
             {
@@ -478,22 +481,29 @@ async def test_rejects_each_warning_contradiction(
                 "payment_method_candidates": [],
                 "warnings": ["CROPPED"],
             },
-            GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
-            GroundingCandidateKind.DATE,
+            ImageAnalysisWarning.MULTIPLE_DATES,
         ),
     ],
 )
-async def test_rejects_multiple_candidates_without_required_warning(
+async def test_adds_derived_warning_when_model_omits_it(
     overrides: dict[str, object],
-    expected: GroundingFailureReason,
-    kind: GroundingCandidateKind,
+    expected: ImageAnalysisWarning,
 ) -> None:
     instance, _ = analyzer(response(**overrides))
-    with pytest.raises(ImageAnalysisError) as caught:
-        await instance.analyze(image())
-    assert caught.value.grounding_reason is expected
-    assert caught.value.candidate_kind is kind
-    assert caught.value.candidate_index == 1
+    result = await instance.analyze(image())
+    assert result.warnings == [ImageAnalysisWarning.CROPPED, expected]
+
+
+async def test_removes_stale_derived_warnings_and_uses_none_for_empty_set() -> None:
+    instance, _ = analyzer(response(warnings=["MULTIPLE_AMOUNTS", "MULTIPLE_DATES"]))
+    result = await instance.analyze(image())
+    assert result.warnings == [ImageAnalysisWarning.NONE]
+
+
+async def test_preserves_valid_non_derived_warning() -> None:
+    instance, _ = analyzer(response(warnings=["SENSITIVE_DATA_PRESENT"]))
+    result = await instance.analyze(image())
+    assert result.warnings == [ImageAnalysisWarning.SENSITIVE_DATA_PRESENT]
 
 
 @pytest.mark.parametrize(
@@ -1109,10 +1119,6 @@ def test_every_grounding_reason_has_explicit_test_case() -> None:
         GroundingFailureReason.CANDIDATES_ON_UNREADABLE_IMAGE,
         GroundingFailureReason.CANDIDATES_ON_NON_FINANCIAL_IMAGE,
         GroundingFailureReason.DUPLICATE_CANDIDATE,
-        GroundingFailureReason.WARNING_NONE_CONFLICT,
-        GroundingFailureReason.DUPLICATE_WARNINGS,
-        GroundingFailureReason.MULTIPLE_AMOUNTS_WARNING_MISSING,
-        GroundingFailureReason.MULTIPLE_DATES_WARNING_MISSING,
         GroundingFailureReason.DOCUMENT_TYPE_CONFLICT,
         GroundingFailureReason.DOMAIN_CONTRACT_CONFLICT,
     }
