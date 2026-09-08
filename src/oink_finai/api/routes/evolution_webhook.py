@@ -1,6 +1,7 @@
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
@@ -9,25 +10,38 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from oink_finai.api.dependencies import get_evolution_provider
-from oink_finai.config.settings import get_settings
+from oink_finai.config.settings import Settings, get_settings
 from oink_finai.database.models.conversation_state import ConversationState
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import MessageSourceType, ProcessedMessageStatus
+from oink_finai.domain.enums import ConversationStatus, MessageSourceType, ProcessedMessageStatus
 from oink_finai.providers.whatsapp.access import filter_inbound_message
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionMediaReference,
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
-from oink_finai.services.expense_commands import expense_command_text, parse_expense_action
+from oink_finai.services.expense_commands import (
+    expense_command_text,
+    parse_expense_action,
+)
+from oink_finai.services.image_analyzer import normalize_image_caption
+from oink_finai.services.pipeline_timing import PipelineTiming
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
 
 
 class WebhookResponse(BaseModel):
     status: str
+
+
+def _retire_historical_clarification(state: ConversationState) -> None:
+    if state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
+        state.status = ConversationStatus.IDLE
+        state.active_expense_id = None
+        state.context = None
+        state.expires_at = None
 
 
 def verify_webhook_secret(
@@ -52,6 +66,24 @@ async def evolution_webhook(
     session: Annotated[AsyncSession, Depends(get_session)],
     provider: Annotated[EvolutionWhatsAppProvider, Depends(get_evolution_provider)],
 ) -> WebhookResponse:
+    settings = get_settings()
+    correlation_id = uuid4()
+    timing = PipelineTiming(settings.pipeline_timing_enabled)
+    timing.event("webhook_received", correlation_id)
+    async with timing.span(None, "webhook_completed", correlation_id):
+        return await _handle_evolution_webhook(
+            payload, session, provider, correlation_id, timing, settings
+        )
+
+
+async def _handle_evolution_webhook(
+    payload: dict[str, Any],
+    session: AsyncSession,
+    provider: EvolutionWhatsAppProvider,
+    correlation_id: UUID,
+    timing: PipelineTiming,
+    settings: Settings,
+) -> WebhookResponse:
     try:
         message = await provider.parse_webhook(payload)
     except EvolutionWebhookInstanceError:
@@ -61,12 +93,12 @@ async def evolution_webhook(
         ) from None
     if message is None:
         return WebhookResponse(status="ignored")
-    decision = filter_inbound_message(message, get_settings())
+    async with timing.span(None, "access_filter_completed", correlation_id):
+        decision = filter_inbound_message(message, settings)
     if not decision.accepted or decision.message is None:
         return WebhookResponse(status="ignored")
     message = decision.message
 
-    settings = get_settings()
     media = message.media
     media_reference: EvolutionMediaReference | None = None
     if media is not None:
@@ -74,15 +106,25 @@ async def evolution_webhook(
             return WebhookResponse(status="ignored")
         media_reference = media.reference
         accepted_text = ""
-        source_type = MessageSourceType.AUDIO
+        if media.media_type == "image":
+            try:
+                media_caption = normalize_image_caption(media.caption)
+            except ValueError:
+                return WebhookResponse(status="ignored")
+            source_type = MessageSourceType.IMAGE
+        else:
+            media_caption = None
+            source_type = MessageSourceType.AUDIO
     elif message.interaction_id is not None:
         command = parse_expense_action(message.interaction_id)
         if command is None:
             return WebhookResponse(status="ignored")
         accepted_text = expense_command_text(command)
+        media_caption = None
         source_type = MessageSourceType.TEXT
     else:
         accepted_text = (message.text_content or "").strip()
+        media_caption = None
         source_type = MessageSourceType.TEXT
     if source_type is MessageSourceType.TEXT and not accepted_text:
         return WebhookResponse(status="ignored")
@@ -98,33 +140,52 @@ async def evolution_webhook(
                     )
                     session.add(user)
                     await session.flush()
-                    session.add(ConversationState(user_id=user.id))
             except IntegrityError:
                 user = await session.scalar(
                     select(User).where(User.phone_number == message.phone_number)
                 )
                 if user is None:
                     raise
-        session.add(
-            ProcessedMessage(
-                provider=message.provider,
-                instance_id=message.instance_id,
-                external_message_id=message.external_message_id,
-                user_id=user.id,
-                accepted_text=accepted_text,
-                source_type=source_type,
-                media_remote_jid=(media_reference.remote_jid if media_reference else None),
-                media_mime_type=(
-                    media.declared_mime_type.partition(";")[0].strip().lower() if media else None
-                ),
-                media_duration_seconds=(media.declared_duration_seconds if media else None),
-                media_is_voice_note=(media.is_voice_note if media else None),
-                message_timestamp=message.timestamp,
-                status=ProcessedMessageStatus.PENDING,
-                available_at=datetime.now(UTC),
-            )
+        conversation_state = await session.scalar(
+            select(ConversationState)
+            .where(ConversationState.user_id == user.id)
+            .with_for_update(of=ConversationState)
         )
-        await session.commit()
+        if conversation_state is not None:
+            _retire_historical_clarification(conversation_state)
+        now = datetime.now(UTC)
+        processed_message = ProcessedMessage(
+            id=correlation_id,
+            provider=message.provider,
+            instance_id=message.instance_id,
+            external_message_id=message.external_message_id,
+            user_id=user.id,
+            clarification_origin_message_id=None,
+            accepted_text=accepted_text,
+            source_type=source_type,
+            media_remote_jid=(media_reference.remote_jid if media_reference else None),
+            media_mime_type=(
+                media.declared_mime_type.partition(";")[0].strip().lower() if media else None
+            ),
+            media_duration_seconds=(media.declared_duration_seconds if media else None),
+            media_is_voice_note=(media.is_voice_note if media else None),
+            media_caption=media_caption,
+            message_timestamp=message.timestamp,
+            status=ProcessedMessageStatus.PENDING,
+            available_at=now,
+        )
+        session.add(processed_message)
+        async with timing.span(
+            None,
+            "inbound_persisted",
+            correlation_id,
+            source_type=source_type.value,
+            mime_type=(
+                media.declared_mime_type.partition(";")[0].strip().lower() if media else None
+            ),
+            audio_duration_seconds=(media.declared_duration_seconds if media else None),
+        ):
+            await session.commit()
     except IntegrityError:
         await session.rollback()
         return WebhookResponse(status="duplicate")

@@ -6,6 +6,7 @@ class ConversationStatus(StrEnum):
     EDITING_EXPENSE = "EDITING_EXPENSE"
     REMOVING_EXPENSE = "REMOVING_EXPENSE"
     WAITING_EXPENSE_DELETE_CONFIRM = "WAITING_EXPENSE_DELETE_CONFIRM"
+    WAITING_EXPENSE_CLARIFICATION = "WAITING_EXPENSE_CLARIFICATION"
 
 
 class ExpenseHistoryAction(StrEnum):
@@ -59,6 +60,7 @@ class ProcessedMessageStatus(StrEnum):
 class MessageSourceType(StrEnum):
     TEXT = "TEXT"
     AUDIO = "AUDIO"
+    IMAGE = "IMAGE"
 
 
 class OutboundMessageStatus(StrEnum):
@@ -72,6 +74,7 @@ class OutboundMessageStatus(StrEnum):
 
 class OutboundMessageKind(StrEnum):
     EXPENSE_CONFIRMATION = "EXPENSE_CONFIRMATION"
+    INCOMPLETE_EXPENSE = "INCOMPLETE_EXPENSE"
     CLARIFICATION = "CLARIFICATION"
     PROCESSING_FAILURE = "PROCESSING_FAILURE"
     DELETE_CONFIRMATION_REQUEST = "DELETE_CONFIRMATION_REQUEST"

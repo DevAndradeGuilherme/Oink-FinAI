@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oink_finai.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -31,7 +33,8 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_processed_messages_claim", "status", "available_at", "created_at"),
         Index("ix_processed_messages_retry", "status", "next_attempt_at", "created_at"),
         CheckConstraint(
-            "source_type IN ('TEXT', 'AUDIO')", name="processed_message_source_type_valid"
+            "source_type IN ('TEXT', 'AUDIO', 'IMAGE')",
+            name="processed_message_source_type_valid",
         ),
         CheckConstraint(
             "media_duration_seconds IS NULL OR media_duration_seconds >= 0",
@@ -41,12 +44,19 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "source_type <> 'AUDIO' OR length(accepted_text) <= 10000",
             name="processed_message_audio_transcript_length",
         ),
+        CheckConstraint(
+            "media_caption IS NULL OR length(media_caption) <= 2000",
+            name="processed_message_media_caption_length",
+        ),
     )
 
     provider: Mapped[str] = mapped_column(String(40))
     instance_id: Mapped[str] = mapped_column(String(120))
     external_message_id: Mapped[str] = mapped_column(String(255))
     user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    clarification_origin_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("processed_messages.id", ondelete="SET NULL"), index=True
+    )
     accepted_text: Mapped[str] = mapped_column(Text, default="")
     source_type: Mapped[MessageSourceType] = mapped_column(
         String(10), default=MessageSourceType.TEXT
@@ -56,6 +66,11 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     media_duration_seconds: Mapped[int | None] = mapped_column(Integer)
     media_is_voice_note: Mapped[bool | None] = mapped_column(Boolean)
     transcribed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    media_caption: Mapped[str | None] = mapped_column(String(2000))
+    image_analysis: Mapped[dict[str, object] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql")
+    )
+    image_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     message_timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

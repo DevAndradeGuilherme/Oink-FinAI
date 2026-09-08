@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from oink_finai.domain.enums import ExpenseCategory, ExpenseIntent, PaymentMethod
 
 
-class GeminiExpenseTransport(BaseModel):
+class ExpenseInterpretationTransport(BaseModel):
     """Transport DTO parsed before deterministic domain validation."""
 
     model_config = ConfigDict(extra="forbid")
@@ -16,7 +16,7 @@ class GeminiExpenseTransport(BaseModel):
     amount_evidence: str | None
     description: str | None
     merchant: str | None
-    category: ExpenseCategory
+    category: ExpenseCategory | None
     payment_method: PaymentMethod | None
     expense_date: date | None
     confidence: float = Field(ge=0, le=1)
@@ -34,7 +34,7 @@ class ExpenseInterpretation(BaseModel):
     amount_evidence: str | None
     description: str | None
     merchant: str | None
-    category: ExpenseCategory
+    category: ExpenseCategory | None
     payment_method: PaymentMethod | None
     expense_date: date | None
     confidence: float = Field(ge=0, le=1)
@@ -42,7 +42,7 @@ class ExpenseInterpretation(BaseModel):
     reasoning_summary: str
 
 
-GEMINI_EXPENSE_TRANSPORT_SCHEMA: dict[str, object] = {
+EXPENSE_INTERPRETATION_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "intent": {"type": "string", "enum": [value.value for value in ExpenseIntent]},
@@ -50,7 +50,10 @@ GEMINI_EXPENSE_TRANSPORT_SCHEMA: dict[str, object] = {
         "amount_evidence": {"type": ["string", "null"]},
         "description": {"type": ["string", "null"]},
         "merchant": {"type": ["string", "null"]},
-        "category": {"type": "string", "enum": [value.value for value in ExpenseCategory]},
+        "category": {
+            "type": ["string", "null"],
+            "enum": [value.value for value in ExpenseCategory] + [None],
+        },
         "payment_method": {
             "type": ["string", "null"],
             "enum": [value.value for value in PaymentMethod] + [None],

@@ -7,28 +7,28 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
-from google.genai import errors
+from openai import APIStatusError, AsyncOpenAI
 
 from oink_finai.domain.enums import ExpenseCategory, ExpenseIntent
 from oink_finai.schemas.expense_interpretation import (
-    GEMINI_EXPENSE_TRANSPORT_SCHEMA,
-    GeminiExpenseTransport,
+    EXPENSE_INTERPRETATION_SCHEMA,
+    ExpenseInterpretationTransport,
 )
-from oink_finai.services import gemini_expense_interpreter as interpreter_module
-from oink_finai.services.gemini_errors import (
-    GeminiAuthenticationError,
-    GeminiConfigurationError,
-    GeminiEmptyResponseError,
-    GeminiInterpreterError,
-    GeminiModelUnavailableError,
-    GeminiPermissionError,
-    GeminiRateLimitError,
-    GeminiRequestError,
-    GeminiSchemaError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
+from oink_finai.services import openai_expense_interpreter as interpreter_module
+from oink_finai.services.interpretation_errors import (
+    InterpretationAuthenticationError,
+    InterpretationConfigurationError,
+    InterpretationEmptyResponseError,
+    InterpretationError,
+    InterpretationInvalidResponseError,
+    InterpretationModelUnavailableError,
+    InterpretationPermissionError,
+    InterpretationRateLimitError,
+    InterpretationRequestError,
+    InterpretationTimeoutError,
+    InterpretationUnavailableError,
 )
-from oink_finai.services.gemini_expense_interpreter import GeminiExpenseInterpreter
+from oink_finai.services.openai_expense_interpreter import OpenAIExpenseInterpreter
 
 REFERENCE = datetime(2026, 9, 1, 15, 0, tzinfo=ZoneInfo("America/Sao_Paulo"))
 
@@ -51,12 +51,12 @@ def payload(**overrides: object) -> dict[str, object]:
     return result
 
 
-class FakeModels:
+class FakeResponses:
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[dict[str, object]] = []
 
-    async def generate_content(self, **kwargs: object) -> object:
+    async def create(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
         if isinstance(self.result, BaseException):
             raise self.result
@@ -67,8 +67,16 @@ class FakeModels:
 
 class FakeClient:
     def __init__(self, result: object) -> None:
-        self.models = FakeModels(result)
-        self.aio = SimpleNamespace(models=self.models)
+        self.responses = FakeResponses(result)
+        self._client = SimpleNamespace(follow_redirects=False)
+        self.max_retries = 2
+
+    def with_options(self, **kwargs: object) -> "FakeClient":
+        self.max_retries = int(kwargs["max_retries"])
+        return self
+
+    async def close(self) -> None:
+        return None
 
 
 def make_interpreter(
@@ -76,9 +84,9 @@ def make_interpreter(
     *,
     api_key: str = "test-secret",
     timezone: str | ZoneInfo = "America/Sao_Paulo",
-) -> tuple[GeminiExpenseInterpreter, FakeClient]:
+) -> tuple[OpenAIExpenseInterpreter, FakeClient]:
     client = FakeClient(result)
-    interpreter = GeminiExpenseInterpreter(
+    interpreter = OpenAIExpenseInterpreter(
         api_key=api_key,
         model="configured-model",
         timeout_seconds=0.05,
@@ -88,22 +96,24 @@ def make_interpreter(
     return interpreter, client
 
 
-def test_sdk_retry_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_sdk_retry_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
     def client_factory(**kwargs: object) -> FakeClient:
         captured.update(kwargs)
         return FakeClient(response(payload()))
 
-    monkeypatch.setattr(interpreter_module.genai, "Client", client_factory)
-    GeminiExpenseInterpreter(
+    monkeypatch.setattr(interpreter_module, "AsyncOpenAI", client_factory)
+    interpreter = OpenAIExpenseInterpreter(
         api_key="test-secret",
         model="configured-model",
         timeout_seconds=90,
     )
 
-    http_options = captured["http_options"]
-    assert http_options.retry_options.attempts == 1
+    assert captured["max_retries"] == 0
+    assert captured["http_client"].follow_redirects is False
+    await interpreter.aclose()
+    await captured["http_client"].aclose()
 
 
 def build_system_instruction(timezone: str | ZoneInfo, reference: datetime) -> str:
@@ -111,7 +121,7 @@ def build_system_instruction(timezone: str | ZoneInfo, reference: datetime) -> s
 
     prompt = interpreter._build_system_instruction(reference)
 
-    assert client.models.calls == []
+    assert client.responses.calls == []
     return prompt
 
 
@@ -122,7 +132,7 @@ def test_prompt_uses_default_timezone() -> None:
         datetime(2026, 9, 2, 2, 30, tzinfo=ZoneInfo("UTC"))
     )
 
-    assert client.models.calls == []
+    assert client.responses.calls == []
     assert "Fuso horário de referência: America/Sao_Paulo" in prompt
     assert "Timestamp local: 2026-09-01T23:30:00-03:00" in prompt
     assert "Data local: 2026-09-01" in prompt
@@ -162,12 +172,50 @@ def test_same_utc_instant_has_different_local_dates_near_midnight() -> None:
 
 
 def test_invalid_iana_timezone_is_rejected() -> None:
-    with pytest.raises(GeminiConfigurationError):
+    with pytest.raises(InterpretationConfigurationError):
         make_interpreter(response(payload()), timezone="Invalid/Timezone")
 
 
 def response(data: dict[str, object]) -> SimpleNamespace:
-    return SimpleNamespace(text=json.dumps(data, ensure_ascii=False))
+    return SimpleNamespace(output_text=json.dumps(data, ensure_ascii=False))
+
+
+def api_status_error(status: int) -> APIStatusError:
+    response_object = httpx.Response(
+        status,
+        headers={"x-request-id": "private-request-id", "authorization": "private-secret"},
+        request=httpx.Request("POST", "https://private.invalid"),
+    )
+    return APIStatusError(
+        "private provider detail",
+        response=response_object,
+        body={"error": {"message": "private provider detail"}},
+    )
+
+
+def responses_api_payload(data: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": "resp_synthetic",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "gpt-4.1-mini",
+        "output": [
+            {
+                "id": "msg_synthetic",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(data, ensure_ascii=False),
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def collect_schema_keywords(value: object) -> set[str]:
@@ -203,19 +251,19 @@ def test_transport_schema_only_contains_supported_keywords() -> None:
         "property_ordering",
     }
 
-    keywords = collect_schema_keywords(GEMINI_EXPENSE_TRANSPORT_SCHEMA)
+    keywords = collect_schema_keywords(EXPENSE_INTERPRETATION_SCHEMA)
 
     assert keywords <= allowed
     assert keywords.isdisjoint(forbidden)
-    assert set(GEMINI_EXPENSE_TRANSPORT_SCHEMA["required"]) == set(
-        GEMINI_EXPENSE_TRANSPORT_SCHEMA["properties"]
+    assert set(EXPENSE_INTERPRETATION_SCHEMA["required"]) == set(
+        EXPENSE_INTERPRETATION_SCHEMA["properties"]
     )
 
 
 def test_transport_dto_converts_to_strict_domain_result() -> None:
-    transport = GeminiExpenseTransport.model_validate(payload())
+    transport = ExpenseInterpretationTransport.model_validate(payload())
 
-    result = GeminiExpenseInterpreter._validate_result(
+    result = OpenAIExpenseInterpreter._validate_result(
         transport, "Gastei R$ 42,50 no mercado hoje pelo Pix."
     )
 
@@ -247,11 +295,11 @@ def test_transport_dto_converts_to_strict_domain_result() -> None:
     ],
 )
 def test_accepts_grounded_brazilian_monetary_evidence(evidence: str, amount: str) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    result = GeminiExpenseInterpreter._validate_result(structured, f"paguei {evidence} no mercado")
+    result = OpenAIExpenseInterpreter._validate_result(structured, f"paguei {evidence} no mercado")
 
     assert result.amount == Decimal(amount)
 
@@ -266,7 +314,7 @@ async def test_interprets_expense_with_mil_as_valid_create_expense() -> None:
 
     assert result.intent is ExpenseIntent.CREATE_EXPENSE
     assert result.amount == Decimal("1000.00")
-    assert len(client.models.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -280,12 +328,12 @@ async def test_interprets_expense_with_mil_as_valid_create_expense() -> None:
 def test_rejects_partial_or_invalid_thousand_evidence(
     message: str, amount: str, evidence: str
 ) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 @pytest.mark.parametrize(
@@ -306,12 +354,12 @@ def test_rejects_partial_or_invalid_thousand_evidence(
     ],
 )
 def test_sentence_and_list_separators_end_written_number_spans(message: str, evidence: str) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount="50.00", amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 @pytest.mark.parametrize(
@@ -333,11 +381,11 @@ def test_sentence_and_list_separators_end_written_number_spans(message: str, evi
 def test_valid_written_number_grammar_remains_a_single_span(
     message: str, amount: str, evidence: str
 ) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    result = GeminiExpenseInterpreter._validate_result(structured, message)
+    result = OpenAIExpenseInterpreter._validate_result(structured, message)
 
     assert result.amount == Decimal(amount)
 
@@ -355,12 +403,12 @@ def test_valid_written_number_grammar_remains_a_single_span(
 def test_rejects_ungrounded_or_ambiguous_monetary_evidence(
     amount: str, evidence: str, message: str
 ) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 @pytest.mark.parametrize(
@@ -377,12 +425,12 @@ def test_rejects_ungrounded_or_ambiguous_monetary_evidence(
 def test_rejects_evidence_that_cuts_a_complete_monetary_span(
     message: str, amount: str, evidence: str
 ) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 @pytest.mark.parametrize(
@@ -392,12 +440,12 @@ def test_rejects_evidence_that_cuts_a_complete_monetary_span(
 def test_rejects_numeric_evidence_with_adjacent_digits(prefix: str, suffix: str) -> None:
     evidence = "20"
     message = f"gastei {prefix}{evidence}{suffix}"
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount="20.00", amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 @pytest.mark.parametrize(
@@ -414,23 +462,23 @@ def test_rejects_numeric_evidence_with_adjacent_digits(prefix: str, suffix: str)
 def test_accepts_evidence_covering_a_complete_monetary_span(
     message: str, amount: str, evidence: str
 ) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount=amount, amount_evidence=evidence)
     )
 
-    result = GeminiExpenseInterpreter._validate_result(structured, message)
+    result = OpenAIExpenseInterpreter._validate_result(structured, message)
 
     assert result.amount == Decimal(amount)
 
 
 @pytest.mark.parametrize("evidence", ["-20", "20,000", "1e2", "NaN", "Infinity"])
 def test_rejects_invalid_monetary_evidence(evidence: str) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(amount="20.00", amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, f"gastei {evidence}")
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, f"gastei {evidence}")
 
 
 @pytest.mark.parametrize(
@@ -450,21 +498,24 @@ async def test_untrusted_message_is_separate_from_system_instruction(message: st
         reference_timestamp=datetime(2026, 9, 2, 3, 30, tzinfo=ZoneInfo("UTC")),
     )
 
-    call = client.models.calls[0]
-    config = call["config"]
-    system_instruction = config.system_instruction
+    call = client.responses.calls[0]
+    system_instruction = call["instructions"]
     assert isinstance(system_instruction, str)
     assert message not in system_instruction
     assert "</mensagem>" not in system_instruction
     assert "ignore as instruções" not in system_instruction
     assert "Fuso horário de referência: America/Manaus" in system_instruction
     assert "Timestamp local: 2026-09-01T23:30:00-04:00" in system_instruction
-    contents = call["contents"]
-    assert len(contents) == 1
-    assert contents[0].role == "user"
-    assert len(contents[0].parts) == 1
-    assert contents[0].parts[0].text == message
-    assert config.response_json_schema == GEMINI_EXPENSE_TRANSPORT_SCHEMA
+    contents = call["input"]
+    assert len(contents) == 1 and contents[0]["role"] == "user"
+    assert contents[0]["content"] == [{"type": "input_text", "text": message}]
+    assert call["text"]["format"] == {
+        "type": "json_schema",
+        "name": "expense_interpretation",
+        "strict": True,
+        "schema": EXPENSE_INTERPRETATION_SCHEMA,
+    }
+    assert call["store"] is False
 
 
 @pytest.mark.parametrize(
@@ -529,14 +580,13 @@ async def test_interprets_expense_messages(
     assert result.intent is ExpenseIntent.CREATE_EXPENSE
     assert result.amount == expected_amount
     assert result.category is expected_category
-    assert len(client.models.calls) == 1
-    call = client.models.calls[0]
+    assert len(client.responses.calls) == 1
+    call = client.responses.calls[0]
     assert call["model"] == "configured-model"
-    assert message in str(call["contents"])
-    config = call["config"]
-    assert "America/Sao_Paulo" in str(config.system_instruction)
-    assert config.response_json_schema == GEMINI_EXPENSE_TRANSPORT_SCHEMA
-    assert config.response_schema is None
+    assert message in str(call["input"])
+    assert "America/Sao_Paulo" in str(call["instructions"])
+    assert call["text"]["format"]["schema"] == EXPENSE_INTERPRETATION_SCHEMA
+    assert call["text"]["format"]["strict"] is True
 
 
 @pytest.mark.parametrize(
@@ -605,29 +655,29 @@ async def test_interprets_non_creatable_messages(
     ],
 )
 def test_rejects_not_expense_with_any_amount(amount: str, evidence: str, message: str) -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(intent="NOT_EXPENSE", amount=amount, amount_evidence=evidence)
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, message)
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, message)
 
 
 def test_rejects_not_expense_with_evidence_and_null_amount() -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(intent="NOT_EXPENSE", amount=None, amount_evidence="vinte reais")
     )
 
-    with pytest.raises(GeminiSchemaError):
-        GeminiExpenseInterpreter._validate_result(structured, "mencionei vinte reais")
+    with pytest.raises(InterpretationInvalidResponseError):
+        OpenAIExpenseInterpreter._validate_result(structured, "mencionei vinte reais")
 
 
 def test_accepts_not_expense_with_null_amount_and_evidence() -> None:
-    structured = GeminiExpenseTransport.model_validate(
+    structured = ExpenseInterpretationTransport.model_validate(
         payload(intent="NOT_EXPENSE", amount=None, amount_evidence=None)
     )
 
-    result = GeminiExpenseInterpreter._validate_result(structured, "bom dia")
+    result = OpenAIExpenseInterpreter._validate_result(structured, "bom dia")
 
     assert result.intent is ExpenseIntent.NOT_EXPENSE
     assert result.amount is None
@@ -638,7 +688,7 @@ def test_accepts_not_expense_with_null_amount_and_evidence() -> None:
 async def test_rejects_invalid_amounts(amount: str) -> None:
     interpreter, _ = make_interpreter(response(payload(amount=amount, amount_evidence="42")))
 
-    with pytest.raises(GeminiSchemaError):
+    with pytest.raises(InterpretationInvalidResponseError):
         await interpreter.interpret("gastei 42", reference_timestamp=REFERENCE)
 
 
@@ -649,14 +699,13 @@ async def test_rejects_invalid_amounts(amount: str) -> None:
         payload(payment_method="Cartão mágico"),
         payload(expense_date="2026-02-30"),
         payload(amount_evidence="42,50 inexistente"),
-        payload(intent="CREATE_EXPENSE", amount=None, amount_evidence=None),
         payload(intent="UNCLEAR", amount="42.50"),
     ],
 )
 async def test_rejects_structurally_invalid_responses(data: dict[str, object]) -> None:
     interpreter, _ = make_interpreter(response(data))
 
-    with pytest.raises(GeminiSchemaError):
+    with pytest.raises(InterpretationInvalidResponseError):
         await interpreter.interpret(
             "Gastei R$ 42,50 no mercado hoje pelo Pix.", reference_timestamp=REFERENCE
         )
@@ -664,16 +713,16 @@ async def test_rejects_structurally_invalid_responses(data: dict[str, object]) -
 
 @pytest.mark.parametrize("text", [None, "", "   "])
 async def test_rejects_empty_response(text: str | None) -> None:
-    interpreter, _ = make_interpreter(SimpleNamespace(text=text))
+    interpreter, _ = make_interpreter(SimpleNamespace(output_text=text))
 
-    with pytest.raises(GeminiEmptyResponseError):
+    with pytest.raises(InterpretationEmptyResponseError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
 
 async def test_rejects_invalid_json() -> None:
-    interpreter, _ = make_interpreter(SimpleNamespace(text="not json"))
+    interpreter, _ = make_interpreter(SimpleNamespace(output_text="not json"))
 
-    with pytest.raises(GeminiSchemaError):
+    with pytest.raises(InterpretationInvalidResponseError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
 
@@ -684,79 +733,66 @@ async def test_maps_timeout() -> None:
 
     interpreter, _ = make_interpreter(slow_response)
 
-    with pytest.raises(GeminiTimeoutError, match="timed out"):
+    with pytest.raises(InterpretationTimeoutError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
 
 async def test_maps_rate_limit() -> None:
-    api_error = errors.ClientError(429, {"error": {"message": "quota"}})
-    interpreter, _ = make_interpreter(api_error)
+    interpreter, _ = make_interpreter(api_status_error(429))
 
-    with pytest.raises(GeminiRateLimitError, match="quota"):
+    with pytest.raises(InterpretationRateLimitError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
 
 async def test_http_400_is_not_retried() -> None:
-    api_error = errors.ClientError(
-        400, {"error": {"status": "INVALID_ARGUMENT", "message": "raw detail"}}
-    )
-    interpreter, client = make_interpreter(api_error)
+    interpreter, client = make_interpreter(api_status_error(400))
 
-    with pytest.raises(GeminiRequestError):
+    with pytest.raises(InterpretationRequestError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
-    assert len(client.models.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
 @pytest.mark.parametrize(
-    ("status", "provider_code", "expected_type", "category"),
+    ("status", "expected_type", "category", "transient"),
     [
-        (400, "INVALID_ARGUMENT", GeminiRequestError, "invalid_request"),
-        (401, "UNAUTHENTICATED", GeminiAuthenticationError, "authentication"),
-        (403, "PERMISSION_DENIED", GeminiPermissionError, "permission"),
-        (404, "NOT_FOUND", GeminiModelUnavailableError, "model_unavailable"),
-        (429, "RESOURCE_EXHAUSTED", GeminiRateLimitError, "rate_limit_or_quota"),
-        (500, "INTERNAL", GeminiUnavailableError, "transient_unavailable"),
-        (503, "UNAVAILABLE", GeminiUnavailableError, "transient_unavailable"),
-        (504, "DEADLINE_EXCEEDED", GeminiTimeoutError, "timeout"),
+        (400, InterpretationRequestError, "invalid_request", False),
+        (401, InterpretationAuthenticationError, "authentication", False),
+        (403, InterpretationPermissionError, "permission", False),
+        (404, InterpretationModelUnavailableError, "model_unavailable", False),
+        (429, InterpretationRateLimitError, "rate_limit", True),
+        (500, InterpretationUnavailableError, "provider_unavailable", True),
+        (503, InterpretationUnavailableError, "provider_unavailable", True),
+        (504, InterpretationTimeoutError, "timeout", True),
     ],
 )
 async def test_maps_api_errors_with_safe_metadata(
     status: int,
-    provider_code: str,
-    expected_type: type[Exception],
+    expected_type: type[InterpretationError],
     category: str,
+    transient: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    response_object = httpx.Response(
-        status,
-        headers={"x-request-id": "sensitive-request-id", "authorization": "secret"},
-        request=httpx.Request("POST", "https://example.invalid"),
-    )
-    error_type = errors.ClientError if status < 500 else errors.ServerError
-    api_error = error_type(
-        status,
-        {"error": {"status": provider_code, "message": "sensitive provider detail"}},
-        response_object,
-    )
-    interpreter, _ = make_interpreter(api_error)
+    interpreter, client = make_interpreter(api_status_error(status))
 
     with pytest.raises(expected_type) as caught:
         await interpreter.interpret("mensagem sensível", reference_timestamp=REFERENCE)
 
     metadata = caught.value.metadata
     assert metadata.http_status == status
-    assert metadata.provider_code == provider_code
-    assert metadata.exception_class in {"ClientError", "ServerError"}
+    assert metadata.provider_code is None
+    assert metadata.exception_class == "APIStatusError"
     assert metadata.category == category
     assert metadata.duration_ms >= 0
     assert metadata.request_id_present is True
-    assert "sensitive" not in str(caught.value).lower()
+    assert caught.value.transient is transient
+    assert len(client.responses.calls) == 1
+    assert "private" not in str(caught.value).lower()
     record = caplog.records[-1]
-    assert record.gemini_status == status
-    assert record.gemini_code == provider_code
-    assert record.gemini_exception_class == metadata.exception_class
-    assert "sensitive" not in caplog.text.lower()
+    assert record.openai_status == status
+    assert record.openai_code is None
+    assert record.openai_exception_class == metadata.exception_class
+    assert "private" not in caplog.text.lower()
 
 
 async def test_local_timeout_has_safe_metadata() -> None:
@@ -766,7 +802,7 @@ async def test_local_timeout_has_safe_metadata() -> None:
 
     interpreter, _ = make_interpreter(slow_response)
 
-    with pytest.raises(GeminiTimeoutError) as caught:
+    with pytest.raises(InterpretationTimeoutError) as caught:
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
 
     assert caught.value.metadata.category == "timeout"
@@ -781,18 +817,17 @@ async def test_injected_client_is_used() -> None:
         "Gastei R$ 42,50 no mercado hoje pelo Pix.", reference_timestamp=REFERENCE
     )
 
-    assert len(client.models.calls) == 1
+    assert len(client.responses.calls) == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404])
 async def test_secret_never_appears_in_errors_or_logs(
     status: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    secret = "super-secret-gemini-key"
-    api_error = errors.ClientError(status, {"error": {"message": f"bad key {secret}"}})
-    interpreter, _ = make_interpreter(api_error, api_key=secret)
+    secret = "super-secret-openai-key"
+    interpreter, _ = make_interpreter(api_status_error(status), api_key=secret)
 
-    with pytest.raises(GeminiInterpreterError) as caught:
+    with pytest.raises(InterpretationError) as caught:
         await interpreter.interpret(secret, reference_timestamp=REFERENCE)
 
     assert secret not in str(caught.value)
@@ -802,5 +837,56 @@ async def test_secret_never_appears_in_errors_or_logs(
 async def test_unknown_client_failure_is_sanitized() -> None:
     interpreter, _ = make_interpreter(RuntimeError("raw provider response"))
 
-    with pytest.raises(GeminiUnavailableError, match="service is unavailable"):
+    with pytest.raises(InterpretationUnavailableError):
         await interpreter.interpret("mensagem", reference_timestamp=REFERENCE)
+
+
+async def test_mock_transport_contract_is_one_responses_call_without_sdk_retry() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=responses_api_payload(payload()))
+
+    async with AsyncOpenAI(
+        api_key="test-secret",
+        base_url="https://openai.invalid/v1",
+        max_retries=2,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        interpreter = OpenAIExpenseInterpreter(
+            api_key="test-secret", model="gpt-4.1-mini", client=client
+        )
+        result = await interpreter.interpret(
+            "Gastei R$ 42,50 no mercado hoje pelo Pix.", reference_timestamp=REFERENCE
+        )
+        await interpreter.aclose()
+
+    assert result.amount == Decimal("42.50")
+    assert len(requests) == 1 and requests[0].url.path == "/v1/responses"
+    body = json.loads(requests[0].content)
+    assert body["model"] == "gpt-4.1-mini"
+    assert body["text"]["format"]["type"] == "json_schema"
+    assert body["text"]["format"]["strict"] is True
+    assert body["store"] is False
+
+
+async def test_transport_accepts_missing_required_fields_and_category_for_backend_policy() -> None:
+    interpreter, _ = make_interpreter(
+        response(
+            payload(
+                amount=None,
+                amount_evidence=None,
+                description=None,
+                category=None,
+                missing_fields=["amount", "description"],
+            )
+        )
+    )
+
+    result = await interpreter.interpret("Gasto incompleto", reference_timestamp=REFERENCE)
+
+    assert result.amount is None
+    assert result.description is None
+    assert result.category is None
+    assert result.missing_fields == ["amount", "description"]

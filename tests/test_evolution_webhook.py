@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import json
+import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,7 +20,11 @@ from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import ProcessedMessageStatus
+from oink_finai.domain.enums import (
+    ConversationStatus,
+    MessageSourceType,
+    ProcessedMessageStatus,
+)
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
 from oink_finai.services.expense_commands import (
@@ -87,6 +93,31 @@ async def assert_no_business_records(session: AsyncSession) -> None:
     assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 0
 
 
+async def test_enabled_webhook_timing_uses_persisted_internal_id(
+    webhook_client: TestClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("PIPELINE_TIMING_ENABLED", "true")
+    get_settings.cache_clear()
+
+    with caplog.at_level(logging.INFO):
+        response = post(webhook_client, authorized_payload())
+
+    saved = await session.scalar(select(ProcessedMessage))
+    records = [record for record in caplog.records if record.name == "oink_finai.pipeline_timing"]
+    assert response.json() == {"status": "accepted"}
+    assert saved is not None
+    assert {record.correlation_id for record in records} == {str(saved.id)}
+    assert {record.event for record in records} == {
+        "webhook_received",
+        "access_filter_completed",
+        "inbound_persisted",
+        "webhook_completed",
+    }
+
+
 @pytest.mark.parametrize("self_test_enabled", ["false", "true"])
 async def test_accepts_allowlisted_dedicated_inbound_without_prefix(
     webhook_client: TestClient,
@@ -107,7 +138,7 @@ async def test_accepts_allowlisted_dedicated_inbound_without_prefix(
     assert saved.accepted_text == original_text
     assert saved.status == ProcessedMessageStatus.PENDING
     assert await session.scalar(select(func.count()).select_from(User)) == 1
-    assert await session.scalar(select(func.count()).select_from(ConversationState)) == 1
+    assert await session.scalar(select(func.count()).select_from(ConversationState)) == 0
 
 
 async def test_accepts_allowlisted_dedicated_lid_using_remote_jid_alt(
@@ -163,17 +194,17 @@ async def test_accepts_supported_text_and_records_processed_message(
     assert count == 1
 
 
-async def test_webhook_only_persists_accepted_text_and_never_waits_for_gemini(
+async def test_webhook_only_persists_accepted_text_and_never_waits_for_openai(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def forbidden_interpretation(*_args: object, **_kwargs: object) -> None:
         await asyncio.sleep(10)
-        raise AssertionError("webhook called Gemini")
+        raise AssertionError("webhook called OpenAI")
 
     monkeypatch.setattr(
-        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        "oink_finai.services.openai_expense_interpreter.OpenAIExpenseInterpreter.interpret",
         forbidden_interpretation,
     )
     payload = authorized_payload()
@@ -309,8 +340,58 @@ async def test_duplicate_webhook_succeeds_without_processing_twice(
     assert count == 1
 
 
+async def test_webhook_retires_historical_clarification_without_linking_new_message(
+    webhook_client: TestClient, session: AsyncSession
+) -> None:
+    now = datetime.now(UTC)
+    user = User(phone_number="5511999999999")
+    session.add(user)
+    await session.flush()
+    origin = ProcessedMessage(
+        provider="synthetic",
+        instance_id="synthetic-instance",
+        external_message_id=uuid4().hex,
+        user_id=user.id,
+        accepted_text="synthetic incomplete",
+        source_type=MessageSourceType.TEXT,
+        message_timestamp=now,
+        status=ProcessedMessageStatus.NEEDS_CLARIFICATION,
+        available_at=now,
+    )
+    session.add(origin)
+    await session.flush()
+    origin_id = origin.id
+    owner_id = user.id
+    session.add(
+        ConversationState(
+            user_id=user.id,
+            status=ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
+            context={"historical": True},
+            expires_at=now + timedelta(minutes=5),
+        )
+    )
+    await session.commit()
+    payload = dedicated_payload()
+
+    first = post(webhook_client, payload)
+    duplicate = post(webhook_client, payload)
+
+    reply = await session.scalar(select(ProcessedMessage).where(ProcessedMessage.id != origin_id))
+    assert first.json() == {"status": "accepted"}
+    assert duplicate.json() == {"status": "duplicate"}
+    assert reply is not None and reply.clarification_origin_message_id is None
+    assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 2
+    state = await session.scalar(
+        select(ConversationState).where(ConversationState.user_id == owner_id)
+    )
+    await session.refresh(state)
+    assert state.status is ConversationStatus.IDLE
+    assert state.context is None
+    assert state.expires_at is None
+
+
 @pytest.mark.parametrize("identity_case", ["outside_allowlist", "participant_alt_bypass", "lid"])
-async def test_rejects_untrusted_dedicated_identity_before_database_and_gemini(
+async def test_rejects_untrusted_dedicated_identity_before_database_and_openai(
     webhook_client: TestClient,
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -323,7 +404,7 @@ async def test_rejects_untrusted_dedicated_identity_before_database_and_gemini(
         calls += 1
 
     monkeypatch.setattr(
-        "oink_finai.services.gemini_expense_interpreter.GeminiExpenseInterpreter.interpret",
+        "oink_finai.services.openai_expense_interpreter.OpenAIExpenseInterpreter.interpret",
         forbidden_interpretation,
     )
     payload = dedicated_payload()

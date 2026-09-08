@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import io
 import json
 import math
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 from oink_finai.providers.whatsapp.base import (
     InteractiveMessage,
@@ -21,6 +23,7 @@ from oink_finai.schemas.whatsapp import InboundMedia, InboundWhatsAppMessage
 ALLOWED_AUDIO_MIME_TYPES = frozenset(
     {"audio/ogg", "audio/opus", "audio/mpeg", "audio/mp4", "audio/aac", "audio/wav"}
 )
+ALLOWED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 MEDIA_MESSAGE_WRAPPERS = (
     "ephemeralMessage",
     "documentWithCaptionMessage",
@@ -77,6 +80,9 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         media_timeout_seconds: float = 15.0,
         media_max_bytes: int = 10 * 1024 * 1024,
         media_max_duration_seconds: int = 300,
+        image_max_width: int = 4096,
+        image_max_height: int = 4096,
+        image_max_pixels: int = 16_000_000,
         max_retries: int = 2,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -104,6 +110,13 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
             or media_max_duration_seconds <= 0
         ):
             raise ValueError("media_max_duration_seconds must be a positive integer")
+        for name, value in (
+            ("image_max_width", image_max_width),
+            ("image_max_height", image_max_height),
+            ("image_max_pixels", image_max_pixels),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
 
@@ -114,6 +127,9 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         self._media_timeout_seconds = media_timeout_seconds
         self._media_max_bytes = media_max_bytes
         self._media_max_duration_seconds = media_max_duration_seconds
+        self._image_max_width = image_max_width
+        self._image_max_height = image_max_height
+        self._image_max_pixels = image_max_pixels
         self._max_retries = max_retries
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient()
@@ -224,7 +240,7 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         content = self._unwrap_message(message)
         message_type, text = self._extract_content(content, data.get("messageType"))
         interaction_id = self._extract_interaction_id(content)
-        media = self._extract_audio_media(content, key)
+        media = self._extract_media(content, key)
         timestamp = self._parse_timestamp(data.get("messageTimestamp"), payload.get("date_time"))
         phone_number = self._phone_from_jids(remote_jid_alt, remote_jid)
 
@@ -246,13 +262,19 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
 
     async def download_media(self, media: InboundMedia) -> bytes:
         reference = media.reference
-        if media.media_type != "audio" or not isinstance(reference, EvolutionMediaReference):
+        if media.media_type not in {"audio", "image"} or not isinstance(
+            reference, EvolutionMediaReference
+        ):
             raise MediaError(MediaErrorCode.CONFIGURATION, transient=False)
         mime_type = self._mime_for_comparison(media.declared_mime_type)
-        if mime_type not in ALLOWED_AUDIO_MIME_TYPES:
+        allowed_types = (
+            ALLOWED_AUDIO_MIME_TYPES if media.media_type == "audio" else ALLOWED_IMAGE_MIME_TYPES
+        )
+        if mime_type not in allowed_types:
             raise MediaError(MediaErrorCode.UNSUPPORTED_TYPE, transient=False)
         if (
-            media.declared_duration_seconds is not None
+            media.media_type == "audio"
+            and media.declared_duration_seconds is not None
             and media.declared_duration_seconds > self._media_max_duration_seconds
         ):
             raise MediaError(MediaErrorCode.TOO_LONG, transient=False)
@@ -299,9 +321,71 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
         response_mime = body.get("mimetype")
         if isinstance(response_mime, str) and self._mime_for_comparison(response_mime) != mime_type:
             raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
-        if not self._signature_matches(mime_type, content):
+        if media.media_type == "image":
+            self.validated_image_metadata(media.declared_mime_type, content)
+        elif not self._signature_matches(mime_type, content):
             raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
         return content
+
+    def validated_image_metadata(
+        self, declared_mime_type: str, content: bytes
+    ) -> tuple[str, int, int, str]:
+        """Apply phase-1 image validation and return normalized safe metadata."""
+        mime_type = self._mime_for_comparison(declared_mime_type)
+        if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+            raise MediaError(MediaErrorCode.UNSUPPORTED_TYPE, transient=False)
+        if not content or len(content) > self._media_max_bytes:
+            code = MediaErrorCode.TOO_LARGE if content else MediaErrorCode.MALFORMED_IMAGE
+            raise MediaError(code, transient=False)
+        if not self._signature_matches(mime_type, content):
+            raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
+        width, height = self._image_dimensions(mime_type, content)
+        if (
+            width > self._image_max_width
+            or height > self._image_max_height
+            or width * height > self._image_max_pixels
+        ):
+            raise MediaError(MediaErrorCode.DIMENSIONS_EXCEEDED, transient=False)
+        detected_format = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+        }[mime_type]
+        return mime_type, width, height, detected_format
+
+    @staticmethod
+    def _extract_media(message: dict[str, Any], key: dict[str, Any]) -> InboundMedia | None:
+        return EvolutionWhatsAppProvider._extract_image_media(
+            message, key
+        ) or EvolutionWhatsAppProvider._extract_audio_media(message, key)
+
+    @staticmethod
+    def _extract_image_media(message: dict[str, Any], key: dict[str, Any]) -> InboundMedia | None:
+        image = message.get("imageMessage")
+        if not isinstance(image, dict):
+            return None
+        mime_type = image.get("mimetype")
+        caption = image.get("caption")
+        external_id = key.get("id")
+        remote_jid = key.get("remoteJid")
+        from_me = key.get("fromMe")
+        if (
+            not isinstance(mime_type, str)
+            or not EvolutionWhatsAppProvider._is_safe_mime(mime_type)
+            or EvolutionWhatsAppProvider._mime_for_comparison(mime_type)
+            not in ALLOWED_IMAGE_MIME_TYPES
+            or (caption is not None and not isinstance(caption, str))
+            or not isinstance(external_id, str)
+            or not isinstance(remote_jid, str)
+            or not isinstance(from_me, bool)
+        ):
+            return None
+        return InboundMedia(
+            media_type="image",
+            declared_mime_type=mime_type.strip(),
+            caption=caption,
+            reference=EvolutionMediaReference(external_id, remote_jid, from_me),
+        )
 
     @staticmethod
     def _unwrap_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -365,6 +449,12 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
 
     @staticmethod
     def _signature_matches(mime_type: str, content: bytes) -> bool:
+        if mime_type == "image/jpeg":
+            return content.startswith(b"\xff\xd8")
+        if mime_type == "image/png":
+            return content.startswith(b"\x89PNG\r\n\x1a\n")
+        if mime_type == "image/webp":
+            return len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
         if mime_type == "audio/ogg":
             return content.startswith(b"OggS")
         if mime_type == "audio/opus":
@@ -382,6 +472,27 @@ class EvolutionWhatsAppProvider(WhatsAppProvider):
                 len(content) >= 2 and content[0] == 0xFF and content[1] & 0xF6 == 0xF0
             )
         return True
+
+    @staticmethod
+    def _image_dimensions(mime_type: str, content: bytes) -> tuple[int, int]:
+        try:
+            with Image.open(io.BytesIO(content)) as image:
+                expected_format = {
+                    "image/jpeg": "JPEG",
+                    "image/png": "PNG",
+                    "image/webp": "WEBP",
+                }[mime_type]
+                if image.format != expected_format:
+                    raise MediaError(MediaErrorCode.CONTENT_MISMATCH, transient=False)
+                dimensions = image.size
+                image.verify()
+        except MediaError:
+            raise
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError, SyntaxError):
+            raise MediaError(MediaErrorCode.MALFORMED_IMAGE, transient=False) from None
+        if 0 in dimensions:
+            raise MediaError(MediaErrorCode.MALFORMED_IMAGE, transient=False)
+        return dimensions
 
     @staticmethod
     def _first_string(*containers: dict[str, Any], names: tuple[str, ...]) -> str | None:

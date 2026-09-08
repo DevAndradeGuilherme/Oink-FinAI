@@ -23,6 +23,7 @@ from oink_finai.domain.enums import (
     ExpenseCategory,
     ExpenseHistoryAction,
     ExpenseIntent,
+    MessageSourceType,
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
@@ -31,11 +32,11 @@ from oink_finai.providers.whatsapp import WhatsAppProvider
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
 from oink_finai.services.expense_processing import ExpenseProcessingService
-from oink_finai.services.gemini_errors import (
-    GeminiErrorMetadata,
-    GeminiRequestError,
-    GeminiTimeoutError,
-    GeminiUnavailableError,
+from oink_finai.services.interpretation_errors import (
+    AIErrorMetadata,
+    InterpretationRequestError,
+    InterpretationTimeoutError,
+    InterpretationUnavailableError,
 )
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 
@@ -75,6 +76,23 @@ class NotExpenseInterpreter(ExpenseInterpreter):
             confidence=1,
             missing_fields=[],
             reasoning_summary="not an expense",
+        )
+
+
+class CompleteExpenseInterpreter(ExpenseInterpreter):
+    async def interpret(self, message: str, *, reference_timestamp: datetime):
+        return ExpenseInterpretation(
+            intent=ExpenseIntent.CREATE_EXPENSE,
+            amount=Decimal("17.50"),
+            amount_evidence="17,50",
+            description="Synthetic",
+            merchant=None,
+            category=ExpenseCategory.FOOD,
+            payment_method=None,
+            expense_date=None,
+            confidence=1,
+            missing_fields=[],
+            reasoning_summary="synthetic",
         )
 
 
@@ -171,9 +189,9 @@ async def test_postgres_claim_and_recovery_transitions() -> None:
     ("error", "expected_status", "expected_code"),
     [
         (
-            GeminiUnavailableError(
+            InterpretationUnavailableError(
                 "sanitized",
-                metadata=GeminiErrorMetadata(
+                metadata=AIErrorMetadata(
                     exception_class="ServerError",
                     category="transient",
                     duration_ms=1,
@@ -184,12 +202,12 @@ async def test_postgres_claim_and_recovery_transitions() -> None:
             "GEMINI_UNAVAILABLE",
         ),
         (
-            GeminiTimeoutError("sanitized"),
+            InterpretationTimeoutError("sanitized"),
             ProcessedMessageStatus.PENDING,
             "GEMINI_TIMEOUT",
         ),
         (
-            GeminiRequestError("sanitized"),
+            InterpretationRequestError("sanitized"),
             ProcessedMessageStatus.FAILED,
             "GEMINI_REQUEST",
         ),
@@ -243,7 +261,7 @@ async def test_postgres_concurrent_retry_is_applied_once() -> None:
     user, message = await seed_processing_message(factory)
     processor = ExpenseProcessingService(
         factory,
-        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        lambda _: ErrorInterpreter(InterpretationTimeoutError("unused")),
         max_attempts=3,
         retry_base_seconds=3600,
         retry_max_seconds=3600,
@@ -281,7 +299,7 @@ async def test_postgres_concurrent_retry_exhaustion_creates_one_notification() -
     user, message = await seed_processing_message(factory, processing_attempts=2)
     processor = ExpenseProcessingService(
         factory,
-        lambda _: ErrorInterpreter(GeminiTimeoutError("unused")),
+        lambda _: ErrorInterpreter(InterpretationTimeoutError("unused")),
         max_attempts=2,
     )
 
@@ -345,7 +363,82 @@ async def test_postgres_two_workers_do_not_start_attempt_beyond_limit() -> None:
             assert saved.locked_at is not None and saved.locked_at.tzinfo is not None
     finally:
         await cleanup_processing_message(factory, user.id)
-        await engine.dispose()
+    await engine.dispose()
+
+
+async def test_postgres_concurrent_complete_message_creates_one_expense() -> None:
+    engine = create_async_engine(os.environ["OINK_TEST_POSTGRES_URL"])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    unique = uuid4().hex
+    now = datetime.now(UTC)
+    async with factory() as session, session.begin():
+        category = await session.scalar(
+            select(Category).where(Category.name == ExpenseCategory.FOOD.value)
+        )
+        if category is None:
+            session.add(Category(name=ExpenseCategory.FOOD.value, slug=f"food-{unique[:12]}"))
+        user = User(phone_number=f"complete-{unique[:18]}")
+        session.add(user)
+        await session.flush()
+        message = ProcessedMessage(
+            provider="postgres-test",
+            instance_id=unique,
+            external_message_id=unique,
+            user_id=user.id,
+            accepted_text="Gastei 17,50 com almoÃ§o",
+            source_type=MessageSourceType.TEXT,
+            message_timestamp=now,
+            status=ProcessedMessageStatus.PROCESSING,
+            available_at=now,
+            locked_at=now,
+            processing_attempts=1,
+        )
+        session.add(message)
+        await session.flush()
+        user_id = user.id
+        message_id = message.id
+
+    processors = [
+        ExpenseProcessingService(factory, lambda _timezone: CompleteExpenseInterpreter())
+        for _ in range(2)
+    ]
+    await asyncio.gather(*(processor.process(message_id) for processor in processors))
+
+    async with factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Expense)
+                .where(Expense.processed_message_id == message_id)
+            )
+            == 1
+        )
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(OutboundMessage)
+                .where(
+                    OutboundMessage.user_id == user_id,
+                    OutboundMessage.kind == OutboundMessageKind.EXPENSE_CONFIRMATION,
+                )
+            )
+            == 1
+        )
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ConversationState)
+                .where(ConversationState.user_id == user_id)
+            )
+            == 0
+        )
+
+    async with factory() as session, session.begin():
+        await session.execute(delete(OutboundMessage).where(OutboundMessage.user_id == user_id))
+        await session.execute(delete(Expense).where(Expense.processed_message_id == message_id))
+        await session.execute(delete(ProcessedMessage).where(ProcessedMessage.user_id == user_id))
+        await session.execute(delete(User).where(User.id == user_id))
+    await engine.dispose()
 
 
 async def test_postgres_concurrent_delete_confirmations_delete_once() -> None:

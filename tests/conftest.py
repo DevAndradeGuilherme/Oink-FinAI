@@ -4,8 +4,15 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from oink_finai.config.settings import Settings
 from oink_finai.database import models  # noqa: F401
 from oink_finai.database.base import Base
+
+
+def pytest_configure() -> None:
+    # Prevent application imports during collection from reading local credentials.
+    # Tests of documented settings may still pass an explicit, synthetic env file.
+    Settings.model_config["env_file"] = None
 
 
 @pytest_asyncio.fixture
