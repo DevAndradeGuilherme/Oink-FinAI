@@ -47,7 +47,7 @@ def _retire_historical_clarification(state: ConversationState) -> None:
 def verify_webhook_secret(
     webhook_secret: Annotated[str | None, Header(alias="X-Evolution-Webhook-Secret")] = None,
 ) -> None:
-    configured_secret = get_settings().evolution_webhook_secret
+    configured_secret = get_settings().evolution_webhook_secret_value
     if not configured_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

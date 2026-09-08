@@ -1,0 +1,100 @@
+x-app: &app
+  image: ${OINK_IMAGE_REPOSITORY:?OINK_IMAGE_REPOSITORY is required}@${OINK_IMAGE_DIGEST:?OINK_IMAGE_DIGEST is required}
+  env_file:
+    - ${OINK_ENV_FILE:?OINK_ENV_FILE must identify the production environment file}
+  environment:
+    APP_ENV: production
+    APP_DEBUG: "false"
+    APP_RELOAD: "false"
+    PIPELINE_TIMING_ENABLED: "false"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE_REPOSITORY:?POSTGRES_IMAGE_REPOSITORY is required}@${POSTGRES_IMAGE_DIGEST:?POSTGRES_IMAGE_DIGEST is required}
+    scale: 1
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - database
+
+  migrate:
+    <<: *app
+    scale: 1
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_RELOAD: "false"
+      PIPELINE_TIMING_ENABLED: "false"
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - database
+
+  api:
+    <<: *app
+    scale: 1
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 330s
+    command: ["uvicorn", "oink_finai.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - edge
+      - database
+    deploy:
+      replicas: 1
+
+  worker:
+    <<: *app
+    scale: 1
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 330s
+    command: ["python", "-m", "oink_finai.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - edge
+      - database
+    deploy:
+      replicas: 1
+
+networks:
+  edge:
+  database:
+    internal: true
+
+volumes:
+  postgres_data:

@@ -8,16 +8,15 @@ from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
 
 async def get_evolution_provider() -> AsyncIterator[EvolutionWhatsAppProvider]:
     settings = get_settings()
-    if not all(
-        (settings.evolution_base_url, settings.evolution_api_key, settings.evolution_instance)
-    ):
+    evolution_api_key = settings.evolution_api_key_value
+    if not all((settings.evolution_base_url, evolution_api_key, settings.evolution_instance)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Evolution provider is not configured",
         )
     provider = EvolutionWhatsAppProvider(
         base_url=settings.evolution_base_url,
-        api_key=settings.evolution_api_key,
+        api_key=evolution_api_key,
         instance=settings.evolution_instance,
         timeout_seconds=settings.evolution_timeout_seconds,
         media_timeout_seconds=settings.evolution_media_timeout_seconds,

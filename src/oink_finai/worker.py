@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
 from oink_finai.config.settings import get_settings
@@ -25,15 +26,44 @@ from oink_finai.services.whatsapp_expense_query_result_formatter import (
 logger = logging.getLogger(__name__)
 
 
+async def _run_claim_batch[ClaimT](
+    stop: asyncio.Event,
+    batch_size: int,
+    claim: Callable[[int], Awaitable[Sequence[ClaimT]]],
+    handle: Callable[[ClaimT], Awaitable[None]],
+) -> None:
+    """Claim one item at a time so shutdown never strands unstarted work."""
+    for _ in range(batch_size):
+        if stop.is_set():
+            return
+        claimed = await claim(1)
+        if not claimed:
+            return
+        # A signal received while claim() is in flight does not abandon its result.
+        await handle(claimed[0])
+
+
+async def _close_safely(name: str, close: Callable[[], Awaitable[None]]) -> None:
+    try:
+        await close()
+    except Exception as exc:
+        logger.warning(
+            "Worker resource close failed",
+            extra={"resource": name, "error_type": type(exc).__name__},
+        )
+
+
 async def run_worker() -> None:
     settings = get_settings()
+    openai_api_key = settings.openai_api_key_value
+    evolution_api_key = settings.evolution_api_key_value
     if not all(
         (
-            settings.openai_api_key,
+            openai_api_key,
             settings.openai_expense_model,
             settings.openai_image_model,
             settings.evolution_base_url,
-            settings.evolution_api_key,
+            evolution_api_key,
             settings.evolution_instance,
         )
     ):
@@ -48,7 +78,7 @@ async def run_worker() -> None:
             signal.signal(signal_name, lambda *_: loop.call_soon_threadsafe(stop.set))
 
     openai_client = create_openai_client(
-        api_key=settings.openai_api_key,
+        api_key=openai_api_key,
         timeout_seconds=max(
             settings.openai_expense_timeout_seconds,
             settings.openai_query_timeout_seconds,
@@ -58,7 +88,7 @@ async def run_worker() -> None:
     )
     provider = EvolutionWhatsAppProvider(
         settings.evolution_base_url,
-        settings.evolution_api_key,
+        evolution_api_key,
         settings.evolution_instance,
         timeout_seconds=settings.evolution_timeout_seconds,
         media_timeout_seconds=settings.evolution_media_timeout_seconds,
@@ -71,7 +101,7 @@ async def run_worker() -> None:
     )
     audio_transcriber = create_audio_transcriber(settings, client=openai_client)
     image_analyzer = OpenAIImageAnalyzer(
-        api_key=settings.openai_api_key,
+        api_key=openai_api_key,
         model=settings.openai_image_model,
         timeout_seconds=settings.openai_image_timeout_seconds,
         max_image_bytes=settings.media_max_bytes,
@@ -81,7 +111,7 @@ async def run_worker() -> None:
     processing = ExpenseProcessingService(
         SessionFactory,
         lambda timezone: OpenAIExpenseInterpreter(
-            api_key=settings.openai_api_key,
+            api_key=openai_api_key,
             model=settings.openai_expense_model,
             timeout_seconds=settings.openai_expense_timeout_seconds,
             timezone=timezone,
@@ -95,7 +125,7 @@ async def run_worker() -> None:
         audio_transcriber_factory=lambda: audio_transcriber,
         image_analyzer_factory=lambda: image_analyzer,
         query_interpreter_factory=lambda timezone: OpenAIExpenseQueryInterpreter(
-            api_key=settings.openai_api_key,
+            api_key=openai_api_key,
             timeout_seconds=settings.openai_query_timeout_seconds,
             timezone=timezone,
             client=openai_client,
@@ -127,10 +157,18 @@ async def run_worker() -> None:
                     seconds=settings.outbox_state_timeout_seconds
                 )
                 await delivery.recover_stale(outbox_cutoff)
-                for message_id in await processing.claim(settings.worker_batch_size):
-                    await processing.process(message_id)
-                for outbound_claim in await delivery.claim(settings.worker_batch_size):
-                    await delivery.send(outbound_claim)
+                await _run_claim_batch(
+                    stop,
+                    settings.worker_batch_size,
+                    processing.claim,
+                    processing.process,
+                )
+                await _run_claim_batch(
+                    stop,
+                    settings.worker_batch_size,
+                    delivery.claim,
+                    delivery.send,
+                )
             except Exception as exc:
                 logger.error("Worker iteration failed", extra={"error_type": type(exc).__name__})
             try:
@@ -138,17 +176,12 @@ async def run_worker() -> None:
             except TimeoutError:
                 pass
     finally:
-        await audio_transcriber.aclose()
-        await image_analyzer.aclose()
-        await provider.aclose()
+        await _close_safely("audio_transcriber", audio_transcriber.aclose)
+        await _close_safely("image_analyzer", image_analyzer.aclose)
+        await _close_safely("whatsapp_provider", provider.aclose)
         with openai_private_operation():
-            try:
-                await openai_client.close()
-            except Exception as exc:
-                logger.warning(
-                    "OpenAI client close failed", extra={"error_type": type(exc).__name__}
-                )
-        await engine.dispose()
+            await _close_safely("openai_client", openai_client.close)
+        await _close_safely("database_engine", engine.dispose)
 
 
 def main() -> None:

@@ -1,7 +1,9 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field
+from pydantic import Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,53 +13,64 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
+        hide_input_in_errors=True,
     )
 
+    def __init__(self, **values: Any) -> None:
+        try:
+            super().__init__(**values)
+        except ValidationError as exc:
+            sanitized_errors = exc.errors(include_url=False, include_input=False)
+            raise ValidationError.from_exception_data(
+                self.__class__.__name__, sanitized_errors
+            ) from None
+
     app_name: str = "Oink FinAI"
-    app_env: str = "development"
+    app_env: Literal["development", "test", "production"] = "development"
     app_debug: bool = False
+    app_reload: bool = False
     pipeline_timing_enabled: bool = False
-    database_url: str = "postgresql+asyncpg://oink:oink@localhost:5432/oink"
-    redis_url: str = "redis://localhost:6379/0"
+    database_url: SecretStr = SecretStr("postgresql+asyncpg://oink:oink@localhost:5432/oink")
+    redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
     default_timezone: str = "America/Sao_Paulo"
-    openai_api_key: str | None = Field(default=None, repr=False)
+    openai_api_key: SecretStr | None = None
     openai_expense_model: str = "gpt-4.1-mini"
-    openai_expense_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
-    openai_query_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
+    openai_expense_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
+    openai_query_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
     openai_image_model: str = "gpt-4.1-mini"
-    openai_image_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
+    openai_image_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
     openai_audio_transcription_model: str = "gpt-transcribe"
     openai_audio_transcription_timeout_seconds: float = Field(
-        default=90.0, gt=0, allow_inf_nan=False
+        default=90.0, gt=0, le=120, allow_inf_nan=False
     )
     openai_audio_transcription_language: str = Field(default="pt", pattern=r"^[a-z]{2}$")
     evolution_base_url: str | None = None
-    evolution_api_key: str | None = Field(default=None, repr=False)
+    evolution_api_key: SecretStr | None = None
     evolution_instance: str | None = None
-    evolution_webhook_secret: str | None = Field(default=None, repr=False)
+    evolution_webhook_secret: SecretStr | None = None
     whatsapp_access_mode: Literal["allowlist"] = "allowlist"
     whatsapp_allowed_numbers: str = ""
     whatsapp_self_test_enabled: bool = False
     whatsapp_self_test_number: str | None = Field(default=None, repr=False)
     whatsapp_self_test_prefix: str = "!oink"
     inbound_message_max_length: int = Field(default=2000, ge=1, le=10000)
-    worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_batch_size: int = Field(default=10, ge=1, le=100)
-    worker_processing_lock_timeout_seconds: float = Field(default=300.0, gt=0)
+    worker_processing_lock_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     expense_processing_max_attempts: int = Field(default=4, ge=1, le=10)
-    expense_retry_base_seconds: float = Field(default=30.0, gt=0)
-    expense_retry_max_seconds: float = Field(default=300.0, gt=0)
+    expense_retry_base_seconds: float = Field(default=30.0, gt=0, le=3600)
+    expense_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)
     outbox_max_attempts: int = Field(default=3, ge=1, le=10)
-    outbox_retry_base_seconds: float = Field(default=1.0, gt=0)
-    outbox_state_timeout_seconds: float = Field(default=300.0, gt=0)
-    evolution_timeout_seconds: float = Field(default=10.0, gt=0)
-    evolution_media_timeout_seconds: float = Field(default=15.0, gt=0)
-    media_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
-    media_max_duration_seconds: int = Field(default=300, gt=0)
-    image_max_width: int = Field(default=4096, gt=0)
-    image_max_height: int = Field(default=4096, gt=0)
-    image_max_pixels: int = Field(default=16_000_000, gt=0)
-    expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0)
+    outbox_retry_base_seconds: float = Field(default=1.0, gt=0, le=3600)
+    outbox_state_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    evolution_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    evolution_media_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    media_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=25 * 1024 * 1024)
+    media_max_duration_seconds: int = Field(default=300, gt=0, le=600)
+    image_max_width: int = Field(default=4096, gt=0, le=8192)
+    image_max_height: int = Field(default=4096, gt=0, le=8192)
+    image_max_pixels: int = Field(default=16_000_000, gt=0, le=32_000_000)
+    expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0, le=86400)
     whatsapp_query_message_max_chars: int = Field(default=3500, ge=160, le=4096)
     whatsapp_query_max_pages: int = Field(default=10, ge=1, le=20)
 
@@ -67,6 +80,151 @@ class Settings(BaseSettings):
             normalized
             for value in self.whatsapp_allowed_numbers.split(",")
             if (normalized := "".join(character for character in value if character.isdigit()))
+        )
+
+    @property
+    def database_url_value(self) -> str:
+        return self.database_url.get_secret_value()
+
+    @property
+    def redis_url_value(self) -> str:
+        return self.redis_url.get_secret_value()
+
+    @property
+    def openai_api_key_value(self) -> str | None:
+        return self.openai_api_key.get_secret_value() if self.openai_api_key else None
+
+    @property
+    def evolution_api_key_value(self) -> str | None:
+        return self.evolution_api_key.get_secret_value() if self.evolution_api_key else None
+
+    @property
+    def evolution_webhook_secret_value(self) -> str | None:
+        if self.evolution_webhook_secret is None:
+            return None
+        return self.evolution_webhook_secret.get_secret_value()
+
+    @model_validator(mode="after")
+    def validate_runtime_configuration(self) -> "Settings":
+        if self.expense_retry_base_seconds > self.expense_retry_max_seconds:
+            raise ValueError("expense retry base must not exceed its maximum")
+
+        longest_pipeline = max(
+            self.evolution_media_timeout_seconds
+            + self.openai_audio_transcription_timeout_seconds
+            + self.openai_expense_timeout_seconds,
+            self.evolution_media_timeout_seconds
+            + self.openai_image_timeout_seconds
+            + self.openai_expense_timeout_seconds,
+            self.openai_expense_timeout_seconds + self.openai_query_timeout_seconds,
+        )
+        if self.worker_processing_lock_timeout_seconds <= longest_pipeline + 30:
+            raise ValueError("processing lock timeout must exceed the longest pipeline timeout")
+        if self.outbox_state_timeout_seconds <= self.evolution_timeout_seconds + 5:
+            raise ValueError("outbox state timeout must exceed the provider timeout")
+        if self.image_max_pixels > self.image_max_width * self.image_max_height:
+            raise ValueError("image pixel limit must not exceed the dimension limit")
+
+        try:
+            ZoneInfo(self.default_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("default timezone is invalid") from exc
+
+        if self.app_env == "production":
+            self._validate_production()
+        return self
+
+    def _validate_production(self) -> None:
+        if self.app_debug or self.app_reload:
+            raise ValueError("debug and reload must be disabled in production")
+        if self.whatsapp_self_test_enabled:
+            raise ValueError("WhatsApp self-test must be disabled in production")
+
+        self._require_production_secret("OPENAI_API_KEY", self.openai_api_key, minimum=20)
+        self._require_production_secret("EVOLUTION_API_KEY", self.evolution_api_key, minimum=16)
+        self._require_production_secret(
+            "EVOLUTION_WEBHOOK_SECRET", self.evolution_webhook_secret, minimum=32
+        )
+        webhook_secret = self.evolution_webhook_secret_value
+        if webhook_secret is None or len(set(webhook_secret)) < 12:
+            raise ValueError("EVOLUTION_WEBHOOK_SECRET is weak in production")
+
+        database_url = self.database_url_value
+        try:
+            parsed_database = urlsplit(database_url)
+            _ = parsed_database.port
+        except ValueError:
+            raise ValueError("DATABASE_URL is invalid") from None
+        if (
+            parsed_database.scheme != "postgresql+asyncpg"
+            or not parsed_database.hostname
+            or not parsed_database.username
+            or parsed_database.password is None
+            or not parsed_database.password
+            or parsed_database.path in {"", "/"}
+            or parsed_database.fragment
+            or any(character.isspace() for character in database_url)
+        ):
+            raise ValueError("DATABASE_URL is invalid")
+        default_credentials = {"oink", "postgres", "password", "changeme", "change-me"}
+        database_username = unquote(parsed_database.username).casefold()
+        database_password = unquote(parsed_database.password).casefold()
+        if database_username in default_credentials or database_password in default_credentials:
+            raise ValueError("DATABASE_URL uses default credentials")
+
+        if self.evolution_base_url is None:
+            raise ValueError("EVOLUTION_BASE_URL is required in production")
+        try:
+            parsed_evolution = urlsplit(self.evolution_base_url)
+            _ = parsed_evolution.port
+        except ValueError as exc:
+            raise ValueError("EVOLUTION_BASE_URL is invalid") from exc
+        if (
+            parsed_evolution.scheme != "https"
+            or not parsed_evolution.hostname
+            or parsed_evolution.username is not None
+            or parsed_evolution.password is not None
+            or parsed_evolution.fragment
+            or any(character.isspace() for character in self.evolution_base_url)
+        ):
+            raise ValueError("EVOLUTION_BASE_URL must be an HTTPS URL in production")
+        if self._is_placeholder(self.evolution_instance):
+            raise ValueError("EVOLUTION_INSTANCE is invalid in production")
+        if not self.whatsapp_allowed_number_set:
+            raise ValueError("WHATSAPP_ALLOWED_NUMBERS is required in production")
+        if self._is_placeholder(self.openai_expense_model) or self._is_placeholder(
+            self.openai_image_model
+        ):
+            raise ValueError("OpenAI model names are required in production")
+        if self._is_placeholder(self.openai_audio_transcription_model):
+            raise ValueError("OpenAI model names are required in production")
+
+    @classmethod
+    def _require_production_secret(
+        cls,
+        name: str,
+        secret: SecretStr | None,
+        *,
+        minimum: int,
+    ) -> None:
+        if secret is None:
+            raise ValueError(f"{name} is required in production")
+        value = secret.get_secret_value()
+        if len(value) < minimum or cls._is_placeholder(value):
+            raise ValueError(f"{name} is invalid in production")
+        if not all(33 <= ord(character) <= 126 for character in value):
+            raise ValueError(f"{name} must contain printable non-space ASCII")
+
+    @staticmethod
+    def _is_placeholder(value: str | None) -> bool:
+        if value is None:
+            return True
+        normalized = value.strip().casefold()
+        return (
+            not normalized
+            or normalized in {"test", "testing", "dummy", "placeholder"}
+            or normalized.startswith("your-")
+            or any(marker in normalized for marker in ("change-me", "changeme", "replace-me"))
         )
 
 

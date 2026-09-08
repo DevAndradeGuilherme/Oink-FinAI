@@ -9,5 +9,5 @@ def test_runtime_image_installs_project_and_verifies_openai_import() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     assert any(dependency.startswith("openai") for dependency in project["dependencies"])
-    assert "pip install ." in dockerfile
+    assert "--no-compile ." in dockerfile
     assert 'python -c "import openai; import oink_finai"' in dockerfile

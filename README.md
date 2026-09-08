@@ -28,6 +28,10 @@ cp .env.example .env
 docker compose up --build
 ```
 
+Esse fluxo usa `docker-compose.yml` e é exclusivo de desenvolvimento. Em produção, use somente
+`docker-compose.prod.yml`, sem combiná-lo com o arquivo de desenvolvimento; veja o procedimento
+completo em [`docs/production-runtime.md`](docs/production-runtime.md).
+
 Para manter API e worker como servicos permanentes gerenciados pelo Compose, use:
 
 ```bash
@@ -37,7 +41,9 @@ docker compose up -d api worker
 Use `docker compose run --rm <servico> <comando>` somente para comandos oneoff. Nunca use
 `docker compose run` para manter API ou worker ativos; isso cria containers temporarios duplicados.
 
-No Windows PowerShell, use `Copy-Item .env.example .env`. Troque os valores `change-me` no `.env`. A API executa as migrations ao iniciar e fica disponível em `http://localhost:8000`. Verifique:
+No Windows PowerShell, use `Copy-Item .env.example .env`. Troque os valores `change-me` no `.env`.
+No Compose de desenvolvimento, a API executa as migrations ao iniciar e fica disponível em
+`http://localhost:8000`. Verifique:
 
 ```bash
 curl http://localhost:8000/health
