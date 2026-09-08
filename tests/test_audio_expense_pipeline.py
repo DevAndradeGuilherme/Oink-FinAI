@@ -1,3 +1,4 @@
+import struct
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -38,6 +39,30 @@ from oink_finai.services.transcription_errors import (
     TranscriptionError,
     TranscriptionErrorCode,
 )
+
+
+def valid_ogg_audio() -> bytes:
+    packets = (
+        (2, 0, b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 48_000, 0, 0)),
+        (0, 0, b"OpusTags" + struct.pack("<I", 4) + b"test" + struct.pack("<I", 0)),
+        (0, 960, b"\xf8\xff\xfe"),
+    )
+    pages = []
+    for sequence, (flags, granule, packet) in enumerate(packets):
+        page = (
+            b"OggS"
+            + struct.pack("<BBQIIIB", 0, flags, granule, 1, sequence, 0, 1)
+            + bytes([len(packet)])
+            + packet
+        )
+        checksum = 0
+        for value in page:
+            checksum ^= value << 24
+            for _ in range(8):
+                checksum = (checksum << 1) ^ (0x04C11DB7 if checksum & 0x80000000 else 0)
+                checksum &= 0xFFFFFFFF
+        pages.append(page[:22] + struct.pack("<I", checksum) + page[26:])
+    return b"".join(pages)
 
 
 @pytest_asyncio.fixture
@@ -180,7 +205,7 @@ async def test_audio_success_checkpoints_transcript_and_creates_text_confirmatio
     audio_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     message = await seed_audio(audio_factory)
-    provider = FakeProvider([b"OggSvalid"])
+    provider = FakeProvider([valid_ogg_audio()])
     transcriber = FakeTranscriber(
         [AudioTranscription(transcript="Mercado quarenta e dois e cinquenta", has_speech=True)]
     )
@@ -232,7 +257,7 @@ async def test_openai_failures_use_durable_retry_and_reuse_successful_checkpoint
         return httpx.Response(200, json={"text": "Mercado quarenta e dois e cinquenta"})
 
     message = await seed_audio(audio_factory)
-    provider = FakeProvider([b"OggSvalid"])
+    provider = FakeProvider([valid_ogg_audio()])
     interpreter = FakeAudioInterpreter(
         [InterpretationRateLimitError("synthetic retry"), expense_result()]
     )
@@ -331,7 +356,7 @@ async def test_terminal_audio_failure_clears_reference_and_notifies_once(
     expected_content: str,
 ) -> None:
     message = await seed_audio(audio_factory)
-    provider = FakeProvider([failure] if isinstance(failure, MediaError) else [b"OggSvalid"])
+    provider = FakeProvider([failure] if isinstance(failure, MediaError) else [valid_ogg_audio()])
     transcriber = FakeTranscriber([failure])
     interpreter = FakeAudioInterpreter([expense_result()])
     service = processor(audio_factory, provider, transcriber, interpreter)
@@ -360,7 +385,7 @@ async def test_transient_audio_failure_keeps_reference_for_durable_retry(
     audio_factory: async_sessionmaker[AsyncSession], failure: Exception
 ) -> None:
     message = await seed_audio(audio_factory)
-    provider = FakeProvider([failure] if isinstance(failure, MediaError) else [b"OggSvalid"])
+    provider = FakeProvider([failure] if isinstance(failure, MediaError) else [valid_ogg_audio()])
     transcriber = FakeTranscriber([failure])
     interpreter = FakeAudioInterpreter([expense_result()])
     service = processor(audio_factory, provider, transcriber, interpreter)

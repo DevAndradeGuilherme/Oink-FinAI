@@ -29,13 +29,13 @@ PRIVATE_DETAIL = (
 )
 
 
-def ogg_silence() -> bytes:
+def ogg_silence(*, eos: bool = True) -> bytes:
     """Build a valid mono Ogg/Opus container with one 20 ms silence packet and page CRCs."""
     vendor = b"synthetic-private-audio"
     packets = (
         (2, 0, b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 48_000, 0, 0)),
         (0, 0, b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)),
-        (4, 960, b"\xf8\xff\xfe"),
+        (4 if eos else 0, 960, b"\xf8\xff\xfe"),
     )
     pages = []
     for sequence, (flags, granule, packet) in enumerate(packets):
@@ -153,6 +153,41 @@ async def test_ogg_multipart_contract_single_call_and_private_result(caplog) -> 
     assert result.model_dump()["transcript"] == PRIVATE_TEXT
 
 
+async def test_valid_ogg_without_eos_is_transcribed_once() -> None:
+    media = ValidatedAudio(
+        content=ogg_silence(eos=False),
+        mime_type="audio/ogg",
+        declared_duration_seconds=1,
+        is_voice_note=True,
+    )
+    async with transcriber(lambda _: httpx.Response(200, json={"text": PRIVATE_TEXT})) as (
+        instance,
+        calls,
+        _,
+    ):
+        result = await instance.transcribe(media)
+        assert result.transcript == PRIVATE_TEXT
+        assert len(calls) == 1
+
+
+async def test_truncated_ogg_without_eos_is_rejected_before_provider_call() -> None:
+    media = ValidatedAudio(
+        content=ogg_silence(eos=False)[:-1],
+        mime_type="audio/ogg",
+        declared_duration_seconds=1,
+        is_voice_note=True,
+    )
+    async with transcriber(lambda _: httpx.Response(200, json={"text": PRIVATE_TEXT})) as (
+        instance,
+        calls,
+        _,
+    ):
+        with pytest.raises(TranscriptionError) as caught:
+            await instance.transcribe(media)
+        assert caught.value.code is TranscriptionErrorCode.INVALID_RESPONSE
+        assert calls == []
+
+
 @pytest.mark.parametrize(
     ("status", "code", "transient"),
     [
@@ -242,7 +277,7 @@ async def test_external_timeout_cancels_entire_request_including_response_body(
             )
         await hang()
 
-    async with transcriber(handler, timeout_seconds=0.03) as (instance, calls, _):
+    async with transcriber(handler, timeout_seconds=0.2) as (instance, calls, _):
         with pytest.raises(TranscriptionError) as caught:
             await instance.transcribe(MEDIA)
         assert caught.value.code is TranscriptionErrorCode.TIMEOUT
@@ -373,10 +408,12 @@ async def test_invalid_audio_never_calls_provider(media, code) -> None:
 
 
 async def test_ogg_opus_at_size_and_duration_limits() -> None:
+    content = ogg_silence(eos=False)
     async with transcriber(
-        lambda _: httpx.Response(200, json={"text": PRIVATE_TEXT}), max_audio_bytes=4
+        lambda _: httpx.Response(200, json={"text": PRIVATE_TEXT}),
+        max_audio_bytes=len(content),
     ) as (instance, calls, _):
-        await instance.transcribe(ValidatedAudio(b"OggS", "audio/opus", 300))
+        await instance.transcribe(ValidatedAudio(content, "audio/opus", 300))
         assert len(calls) == 1
         assert b'filename="audio.ogg"' in calls[0].content
         assert b"Content-Type: audio/ogg" in calls[0].content

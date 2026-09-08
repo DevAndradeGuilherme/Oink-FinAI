@@ -21,6 +21,150 @@ _AUDIO_FILES = {
 }
 
 
+def _build_ogg_crc_table() -> tuple[int, ...]:
+    table = []
+    for value in range(256):
+        checksum = value << 24
+        for _ in range(8):
+            checksum = (checksum << 1) ^ (0x04C11DB7 if checksum & 0x80000000 else 0)
+        table.append(checksum & 0xFFFFFFFF)
+    return tuple(table)
+
+
+_OGG_CRC_TABLE = _build_ogg_crc_table()
+
+
+def _ogg_crc(content: bytes | bytearray) -> int:
+    checksum = 0
+    for value in content:
+        checksum = ((checksum << 8) & 0xFFFFFFFF) ^ _OGG_CRC_TABLE[(checksum >> 24) ^ value]
+    return checksum
+
+
+def _opus_packet_is_structurally_valid(packet: bytes) -> bool:
+    if not packet:
+        return False
+    frame_code = packet[0] & 0x03
+    if frame_code == 3:
+        if len(packet) < 2:
+            return False
+        frame_count = packet[1] & 0x3F
+    else:
+        frame_count = 1 if frame_code == 0 else 2
+    if not 0 < frame_count <= 48:
+        return False
+    configuration = packet[0] >> 3
+    if configuration < 12:
+        frame_duration_ms = (10, 20, 40, 60)[configuration % 4]
+    elif configuration < 16:
+        frame_duration_ms = (10, 20)[configuration % 2]
+    else:
+        frame_duration_ms = (2.5, 5, 10, 20)[configuration % 4]
+    return frame_count * frame_duration_ms <= 120
+
+
+def _validate_opus_headers(packets: list[bytes]) -> bool:
+    if len(packets) < 3:
+        return False
+    head = packets[0]
+    if not head.startswith(b"OpusHead") or len(head) < 19:
+        return False
+    if not 0 < head[8] < 16:
+        return False
+    channels = head[9]
+    mapping_family = head[18]
+    if channels == 0 or (mapping_family == 0 and len(head) != 19):
+        return False
+    if mapping_family != 0 and len(head) < 21 + channels:
+        return False
+
+    tags = packets[1]
+    if not tags.startswith(b"OpusTags") or len(tags) < 16:
+        return False
+    offset = 8
+    vendor_length = int.from_bytes(tags[offset : offset + 4], "little")
+    offset += 4
+    if offset + vendor_length + 4 > len(tags):
+        return False
+    offset += vendor_length
+    comment_count = int.from_bytes(tags[offset : offset + 4], "little")
+    offset += 4
+    for _ in range(comment_count):
+        if offset + 4 > len(tags):
+            return False
+        comment_length = int.from_bytes(tags[offset : offset + 4], "little")
+        offset += 4
+        if offset + comment_length > len(tags):
+            return False
+        offset += comment_length
+    return all(_opus_packet_is_structurally_valid(packet) for packet in packets[2:])
+
+
+def _valid_ogg_opus_stream(content: bytes) -> bool:
+    offset = 0
+    stream_serial = None
+    expected_sequence = None
+    pending_packet = bytearray()
+    packets: list[bytes] = []
+    page_index = 0
+    saw_eos = False
+
+    while offset < len(content):
+        if saw_eos or offset + 27 > len(content) or content[offset : offset + 4] != b"OggS":
+            return False
+        if content[offset + 4] != 0:
+            return False
+        flags = content[offset + 5]
+        serial = int.from_bytes(content[offset + 14 : offset + 18], "little")
+        sequence = int.from_bytes(content[offset + 18 : offset + 22], "little")
+        segment_count = content[offset + 26]
+        table_start = offset + 27
+        table_end = table_start + segment_count
+        if table_end > len(content):
+            return False
+        lacing_values = content[table_start:table_end]
+        payload_end = table_end + sum(lacing_values)
+        if payload_end > len(content):
+            return False
+
+        page = bytearray(content[offset:payload_end])
+        stored_checksum = int.from_bytes(page[22:26], "little")
+        page[22:26] = b"\0\0\0\0"
+        if _ogg_crc(page) != stored_checksum:
+            return False
+        if page_index == 0:
+            if not flags & 0x02 or sequence != 0:
+                return False
+            stream_serial = serial
+            expected_sequence = sequence
+        elif flags & 0x02:
+            return False
+        if serial != stream_serial or sequence != expected_sequence:
+            return False
+        if bool(flags & 0x01) != bool(pending_packet):
+            return False
+        expected_sequence += 1
+
+        payload_offset = table_end
+        for length in lacing_values:
+            pending_packet.extend(content[payload_offset : payload_offset + length])
+            payload_offset += length
+            if length < 255:
+                packets.append(bytes(pending_packet))
+                pending_packet.clear()
+
+        saw_eos = bool(flags & 0x04)
+        page_index += 1
+        offset = payload_end
+
+    return (
+        offset == len(content)
+        and not pending_packet
+        and page_index > 0
+        and _validate_opus_headers(packets)
+    )
+
+
 def _positive_number(value: object) -> bool:
     return (
         not isinstance(value, bool)
@@ -170,6 +314,8 @@ class OpenAIAudioTranscriber(AudioTranscriber):
             or duration > self._max_duration_seconds
         ):
             raise TranscriptionError(TranscriptionErrorCode.TOO_LONG, transient=False)
+        if mime_type in {"audio/ogg", "audio/opus"} and not _valid_ogg_opus_stream(audio.content):
+            raise TranscriptionError(TranscriptionErrorCode.INVALID_RESPONSE, transient=False)
         return _AUDIO_FILES[mime_type]
 
     @staticmethod
