@@ -1,7 +1,9 @@
 """Application services and deterministic business validation."""
 
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
+from oink_finai.services.expense_query_executor import ExpenseQueryExecutor
 from oink_finai.services.expense_query_interpreter import ExpenseQueryInterpreter
+from oink_finai.services.expense_query_result_formatter import ExpenseQueryResultFormatter
 from oink_finai.services.openai_expense_interpreter import OpenAIExpenseInterpreter
 from oink_finai.services.openai_expense_query_interpreter import (
     OpenAIExpenseQueryInterpreter,
@@ -9,7 +11,9 @@ from oink_finai.services.openai_expense_query_interpreter import (
 
 __all__ = [
     "ExpenseInterpreter",
+    "ExpenseQueryExecutor",
     "ExpenseQueryInterpreter",
+    "ExpenseQueryResultFormatter",
     "OpenAIExpenseInterpreter",
     "OpenAIExpenseQueryInterpreter",
 ]

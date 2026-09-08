@@ -10,6 +10,10 @@ class ExpenseQueryIntent(StrEnum):
     NOT_QUERY = "NOT_QUERY"
     QUERY_UNCLEAR = "QUERY_UNCLEAR"
 
+    # Domain aliases used by the execution layer. Provider output stays unchanged.
+    TOP_EXPENSES = "RANK"
+    CATEGORY_BREAKDOWN = "GROUP"
+
 
 class ExpenseQueryMetric(StrEnum):
     TOTAL = "TOTAL"
