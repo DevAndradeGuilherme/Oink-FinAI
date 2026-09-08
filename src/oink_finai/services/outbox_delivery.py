@@ -3,8 +3,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from oink_finai.database.models import OutboundMessage
 from oink_finai.domain.enums import OutboundMessageStatus
@@ -55,6 +56,15 @@ class OutboxDeliveryService:
 
     async def claim(self, batch_size: int) -> list[OutboundMessageClaim]:
         now = datetime.now(UTC)
+        earlier_page = aliased(OutboundMessage)
+        earlier_page_pending = exists(
+            select(earlier_page.id).where(
+                earlier_page.processed_message_id == OutboundMessage.processed_message_id,
+                earlier_page.kind == OutboundMessage.kind,
+                earlier_page.sequence_no < OutboundMessage.sequence_no,
+                earlier_page.status != OutboundMessageStatus.SENT,
+            )
+        )
         async with self._session_factory() as session, session.begin():
             messages = list(
                 await session.scalars(
@@ -62,10 +72,15 @@ class OutboxDeliveryService:
                     .where(
                         OutboundMessage.status == OutboundMessageStatus.PENDING,
                         OutboundMessage.available_at <= now,
+                        ~earlier_page_pending,
                     )
-                    .order_by(OutboundMessage.created_at)
+                    .order_by(
+                        OutboundMessage.created_at,
+                        OutboundMessage.sequence_no,
+                        OutboundMessage.id,
+                    )
                     .limit(batch_size)
-                    .with_for_update(skip_locked=True)
+                    .with_for_update(of=OutboundMessage, skip_locked=True)
                 )
             )
             claims = []

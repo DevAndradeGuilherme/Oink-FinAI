@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(default=None, repr=False)
     openai_expense_model: str = "gpt-4.1-mini"
     openai_expense_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
+    openai_query_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
     openai_image_model: str = "gpt-4.1-mini"
     openai_image_timeout_seconds: float = Field(default=90.0, gt=0, allow_inf_nan=False)
     openai_audio_transcription_model: str = "gpt-transcribe"
@@ -57,6 +58,8 @@ class Settings(BaseSettings):
     image_max_height: int = Field(default=4096, gt=0)
     image_max_pixels: int = Field(default=16_000_000, gt=0)
     expense_delete_confirmation_ttl_seconds: float = Field(default=600.0, gt=0)
+    whatsapp_query_message_max_chars: int = Field(default=3500, ge=160, le=4096)
+    whatsapp_query_max_pages: int = Field(default=10, ge=1, le=20)
 
     @property
     def whatsapp_allowed_number_set(self) -> frozenset[str]:

@@ -6,14 +6,21 @@ from datetime import UTC, datetime, timedelta
 from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
 from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
+from oink_finai.repositories import SQLAlchemyExpenseQueryExecutor
 from oink_finai.services.audio_transcriber_factory import create_audio_transcriber
 from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.openai_client import create_openai_client
 from oink_finai.services.openai_expense_interpreter import OpenAIExpenseInterpreter
+from oink_finai.services.openai_expense_query_interpreter import (
+    OpenAIExpenseQueryInterpreter,
+)
 from oink_finai.services.openai_image_analyzer import OpenAIImageAnalyzer
 from oink_finai.services.openai_privacy import openai_private_operation
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
+from oink_finai.services.whatsapp_expense_query_result_formatter import (
+    WhatsAppExpenseQueryResultFormatter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,7 @@ async def run_worker() -> None:
         api_key=settings.openai_api_key,
         timeout_seconds=max(
             settings.openai_expense_timeout_seconds,
+            settings.openai_query_timeout_seconds,
             settings.openai_image_timeout_seconds,
             settings.openai_audio_transcription_timeout_seconds,
         ),
@@ -86,6 +94,17 @@ async def run_worker() -> None:
         media_provider=provider,
         audio_transcriber_factory=lambda: audio_transcriber,
         image_analyzer_factory=lambda: image_analyzer,
+        query_interpreter_factory=lambda timezone: OpenAIExpenseQueryInterpreter(
+            api_key=settings.openai_api_key,
+            timeout_seconds=settings.openai_query_timeout_seconds,
+            timezone=timezone,
+            client=openai_client,
+        ),
+        query_executor=SQLAlchemyExpenseQueryExecutor(SessionFactory),
+        query_formatter=WhatsAppExpenseQueryResultFormatter(
+            max_message_chars=settings.whatsapp_query_message_max_chars,
+            max_pages=settings.whatsapp_query_max_pages,
+        ),
         timing=timing,
     )
     delivery = OutboxDeliveryService(

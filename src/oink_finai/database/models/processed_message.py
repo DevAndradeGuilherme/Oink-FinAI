@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oink_finai.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-from oink_finai.domain.enums import MessageSourceType, ProcessedMessageStatus
+from oink_finai.domain.enums import ExpenseIntent, MessageSourceType, ProcessedMessageStatus
 
 
 class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -48,6 +48,10 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "media_caption IS NULL OR length(media_caption) <= 2000",
             name="processed_message_media_caption_length",
         ),
+        CheckConstraint(
+            "query_page_count IS NULL OR query_page_count >= 1",
+            name="processed_message_query_page_count_valid",
+        ),
     )
 
     provider: Mapped[str] = mapped_column(String(40))
@@ -71,6 +75,22 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSON().with_variant(JSONB(), "postgresql")
     )
     image_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    classification_intent: Mapped[ExpenseIntent | None] = mapped_column(
+        Enum(ExpenseIntent, name="expense_message_intent")
+    )
+    classification_checkpoint: Mapped[dict[str, object] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql")
+    )
+    classified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    query_plan_checkpoint: Mapped[dict[str, object] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql")
+    )
+    query_plan_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    query_result_checkpoint: Mapped[dict[str, object] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql")
+    )
+    query_executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    query_page_count: Mapped[int | None] = mapped_column(Integer)
     message_timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
@@ -91,3 +111,4 @@ class ProcessedMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     user = relationship("User", back_populates="processed_messages")
     expense = relationship("Expense", back_populates="processed_message", uselist=False)
+    outbound_messages = relationship("OutboundMessage", back_populates="processed_message")

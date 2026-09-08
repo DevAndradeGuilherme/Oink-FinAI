@@ -26,6 +26,12 @@ ALLOWED_FIELDS = frozenset(
         "audio_duration_seconds",
         "next_attempt_at",
         "stage",
+        "intent",
+        "metric",
+        "group",
+        "row_count",
+        "group_count",
+        "page_count",
     }
 )
 TIMING_EVENTS = frozenset(
@@ -58,6 +64,16 @@ TIMING_EVENTS = frozenset(
         "outbound_send_started",
         "outbound_send_completed",
         "outbound_accepted",
+        "query_interpretation_started",
+        "query_interpretation_completed",
+        "query_plan_checkpoint_started",
+        "query_plan_checkpoint_completed",
+        "query_execution_started",
+        "query_execution_completed",
+        "query_formatting_started",
+        "query_formatting_completed",
+        "query_outbox_created",
+        "query_processing_completed",
     }
 )
 _SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -73,6 +89,10 @@ _STAGES = frozenset(
         "interpretation",
         "expense_persistence",
         "send",
+        "query_interpretation",
+        "query_plan_checkpoint",
+        "query_execution",
+        "query_formatting",
     }
 )
 
@@ -125,6 +145,35 @@ class PipelineTiming:
                 continue
             elif name == "stage" and value not in _STAGES:
                 continue
+            elif name == "intent" and value not in {
+                "QUERY",
+                "LIST",
+                "AGGREGATE",
+                "GROUP",
+                "RANK",
+                "COMPARE",
+                "NOT_QUERY",
+                "QUERY_UNCLEAR",
+            }:
+                continue
+            elif name == "metric" and value not in {
+                "TOTAL",
+                "COUNT",
+                "AVERAGE",
+                "MINIMUM",
+                "MAXIMUM",
+            }:
+                continue
+            elif name == "group" and value not in {
+                "DAY",
+                "WEEK",
+                "MONTH",
+                "CATEGORY",
+                "MERCHANT",
+                "PAYMENT_METHOD",
+                "SOURCE_TYPE",
+            }:
+                continue
             elif name == "mime_type":
                 if not isinstance(value, str):
                     continue
@@ -140,7 +189,13 @@ class PipelineTiming:
                 value = round(max(0.0, value), 3)
                 if not math.isfinite(value):
                     continue
-            elif name in {"attempt_number", "size_bytes"}:
+            elif name in {
+                "attempt_number",
+                "size_bytes",
+                "row_count",
+                "group_count",
+                "page_count",
+            }:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     continue
             elif name == "next_attempt_at" and isinstance(value, datetime):
