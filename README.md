@@ -75,7 +75,7 @@ Com PostgreSQL configurado no `.env`, use `alembic upgrade head` para aplicar mi
 
 Configurações são lidas por Pydantic Settings. Nunca versione `.env`, tokens, chaves da Evolution API ou senhas. `.env.example` contém somente valores locais ilustrativos. Dinheiro usa `Decimal`/`NUMERIC(14,2)`; exclusões de gastos devem preencher `deleted_at`, nunca remover a linha.
 
-Texto, esclarecimentos e imagens usam a API OpenAI. Os modelos padrão de
+Texto e imagens usam a API OpenAI. Os modelos padrão de
 `OPENAI_EXPENSE_MODEL` e `OPENAI_IMAGE_MODEL` são `gpt-4.1-mini`; áudio usa
 `OPENAI_AUDIO_TRANSCRIPTION_MODEL=gpt-transcribe`. Configure `OPENAI_API_KEY` somente no ambiente.
 Cada operação faz uma chamada por tentativa durável, com timeout externo, sem retry interno do SDK

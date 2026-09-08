@@ -4,7 +4,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,16 +22,10 @@ from oink_finai.providers.whatsapp.evolution import (
     EvolutionWebhookInstanceError,
     EvolutionWhatsAppProvider,
 )
-from oink_finai.schemas.expense_clarification import (
-    ClarificationReplyBinding,
-    ExpenseClarificationContext,
-)
 from oink_finai.services.expense_commands import (
     expense_command_text,
     parse_expense_action,
-    parse_expense_command,
 )
-from oink_finai.services.expense_processing import ExpenseProcessingService
 from oink_finai.services.image_analyzer import normalize_image_caption
 from oink_finai.services.pipeline_timing import PipelineTiming
 
@@ -42,38 +36,12 @@ class WebhookResponse(BaseModel):
     status: str
 
 
-def _clarification_origin(
-    state: ConversationState, now: datetime, *, reply_id: UUID | None = None
-) -> UUID | None:
-    if state.status is not ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
-        return None
-    expires_at = state.expires_at
-    if expires_at is not None and (expires_at.tzinfo is None or expires_at.utcoffset() is None):
-        expires_at = expires_at.replace(tzinfo=UTC)
-    try:
-        context = ExpenseClarificationContext.model_validate(state.context)
-    except (ValidationError, TypeError, ValueError):
-        context = None
-    if context is None:
+def _retire_historical_clarification(state: ConversationState) -> None:
+    if state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION:
         state.status = ConversationStatus.IDLE
         state.active_expense_id = None
         state.context = None
         state.expires_at = None
-        return None
-    if (expires_at is None or expires_at <= now) and not context.reply_bindings:
-        origin_message_id = context.origin_message_id
-        state.status = ConversationStatus.IDLE
-        state.active_expense_id = None
-        state.context = None
-        state.expires_at = None
-        return origin_message_id
-    if reply_id is not None:
-        bindings = dict(context.reply_bindings)
-        bindings[reply_id] = ClarificationReplyBinding(
-            revision=context.revision, deadline=expires_at or now
-        )
-        state.context = context.model_copy(update={"reply_bindings": bindings}).payload()
-    return context.origin_message_id
 
 
 def verify_webhook_secret(
@@ -163,7 +131,6 @@ async def _handle_evolution_webhook(
     accepted_text = accepted_text[: settings.inbound_message_max_length]
 
     try:
-        conversation_state: ConversationState | None = None
         user = await session.scalar(select(User).where(User.phone_number == message.phone_number))
         if user is None:
             try:
@@ -173,40 +140,27 @@ async def _handle_evolution_webhook(
                     )
                     session.add(user)
                     await session.flush()
-                    conversation_state = ConversationState(user_id=user.id)
-                    session.add(conversation_state)
             except IntegrityError:
                 user = await session.scalar(
                     select(User).where(User.phone_number == message.phone_number)
                 )
                 if user is None:
                     raise
-        if conversation_state is None:
-            conversation_state = await session.scalar(
-                select(ConversationState)
-                .where(ConversationState.user_id == user.id)
-                .with_for_update(of=ConversationState)
-            )
-        if conversation_state is None:
-            conversation_state = ConversationState(user_id=user.id)
-            session.add(conversation_state)
-            await session.flush()
+        conversation_state = await session.scalar(
+            select(ConversationState)
+            .where(ConversationState.user_id == user.id)
+            .with_for_update(of=ConversationState)
+        )
+        if conversation_state is not None:
+            _retire_historical_clarification(conversation_state)
         now = datetime.now(UTC)
-        is_reply = (
-            source_type is not MessageSourceType.IMAGE
-            and parse_expense_command(accepted_text) is None
-            and not ExpenseProcessingService._looks_like_new_expense(accepted_text)
-        )
-        clarification_origin_message_id = _clarification_origin(
-            conversation_state, now, reply_id=correlation_id if is_reply else None
-        )
         processed_message = ProcessedMessage(
             id=correlation_id,
             provider=message.provider,
             instance_id=message.instance_id,
             external_message_id=message.external_message_id,
             user_id=user.id,
-            clarification_origin_message_id=clarification_origin_message_id,
+            clarification_origin_message_id=None,
             accepted_text=accepted_text,
             source_type=source_type,
             media_remote_jid=(media_reference.remote_jid if media_reference else None),

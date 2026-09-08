@@ -22,14 +22,11 @@ from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
 from oink_finai.domain.enums import (
     ConversationStatus,
-    ExpenseCategory,
-    ExpenseClarificationField,
     MessageSourceType,
     ProcessedMessageStatus,
 )
 from oink_finai.main import app
 from oink_finai.providers.whatsapp.evolution import EvolutionWhatsAppProvider
-from oink_finai.schemas.expense_clarification import ExpenseClarificationContext
 from oink_finai.services.expense_commands import (
     ExpenseCommand,
     ExpenseCommandType,
@@ -141,7 +138,7 @@ async def test_accepts_allowlisted_dedicated_inbound_without_prefix(
     assert saved.accepted_text == original_text
     assert saved.status == ProcessedMessageStatus.PENDING
     assert await session.scalar(select(func.count()).select_from(User)) == 1
-    assert await session.scalar(select(func.count()).select_from(ConversationState)) == 1
+    assert await session.scalar(select(func.count()).select_from(ConversationState)) == 0
 
 
 async def test_accepts_allowlisted_dedicated_lid_using_remote_jid_alt(
@@ -343,9 +340,8 @@ async def test_duplicate_webhook_succeeds_without_processing_twice(
     assert count == 1
 
 
-@pytest.mark.parametrize("expire_while_processing", [False, True])
-async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
-    webhook_client: TestClient, session: AsyncSession, expire_while_processing: bool
+async def test_webhook_retires_historical_clarification_without_linking_new_message(
+    webhook_client: TestClient, session: AsyncSession
 ) -> None:
     now = datetime.now(UTC)
     user = User(phone_number="5511999999999")
@@ -366,20 +362,11 @@ async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
     await session.flush()
     origin_id = origin.id
     owner_id = user.id
-    context = ExpenseClarificationContext(
-        origin_message_id=origin_id,
-        source_type=MessageSourceType.TEXT,
-        reference_timestamp=now,
-        requested_field=ExpenseClarificationField.AMOUNT,
-        remaining_fields=(ExpenseClarificationField.AMOUNT,),
-        description="Synthetic",
-        category=ExpenseCategory.OTHER,
-    )
     session.add(
         ConversationState(
             user_id=user.id,
             status=ConversationStatus.WAITING_EXPENSE_CLARIFICATION,
-            context=context.payload(),
+            context={"historical": True},
             expires_at=now + timedelta(minutes=5),
         )
     )
@@ -392,27 +379,15 @@ async def test_webhook_links_one_deduplicated_reply_to_active_clarification(
     reply = await session.scalar(select(ProcessedMessage).where(ProcessedMessage.id != origin_id))
     assert first.json() == {"status": "accepted"}
     assert duplicate.json() == {"status": "duplicate"}
-    assert reply is not None and reply.clarification_origin_message_id == origin_id
+    assert reply is not None and reply.clarification_origin_message_id is None
     assert await session.scalar(select(func.count()).select_from(ProcessedMessage)) == 2
     state = await session.scalar(
         select(ConversationState).where(ConversationState.user_id == owner_id)
     )
     await session.refresh(state)
-    bound = ExpenseClarificationContext.model_validate(state.context)
-    assert list(bound.reply_bindings) == [reply.id]
-    assert bound.reply_bindings[reply.id].revision == bound.revision
-    if expire_while_processing:
-        state.expires_at = now - timedelta(seconds=1)
-        reply.status = ProcessedMessageStatus.PROCESSING
-        await session.commit()
-        payload["data"]["key"]["id"] = "SYNTHETIC-SECOND-REPLY"
-        assert post(webhook_client, payload).json() == {"status": "accepted"}
-        await session.refresh(state)
-        after = ExpenseClarificationContext.model_validate(state.context)
-        assert state.status is ConversationStatus.WAITING_EXPENSE_CLARIFICATION
-        assert after.same_draft(bound)
-        assert reply.id in after.reply_bindings
-        assert len(after.reply_bindings) == 2
+    assert state.status is ConversationStatus.IDLE
+    assert state.context is None
+    assert state.expires_at is None
 
 
 @pytest.mark.parametrize("identity_case", ["outside_allowlist", "participant_alt_bypass", "lid"])

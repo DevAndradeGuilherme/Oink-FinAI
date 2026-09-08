@@ -9,16 +9,6 @@ class ConversationStatus(StrEnum):
     WAITING_EXPENSE_CLARIFICATION = "WAITING_EXPENSE_CLARIFICATION"
 
 
-class ExpenseClarificationField(StrEnum):
-    AMOUNT = "amount"
-    EXPENSE_DATE = "expense_date"
-    DESCRIPTION = "description"
-    MERCHANT = "merchant"
-    CATEGORY = "category"
-    PAYMENT_METHOD = "payment_method"
-    INTENT = "intent"
-
-
 class ExpenseHistoryAction(StrEnum):
     CREATED = "CREATED"
     UPDATED = "UPDATED"
@@ -84,6 +74,7 @@ class OutboundMessageStatus(StrEnum):
 
 class OutboundMessageKind(StrEnum):
     EXPENSE_CONFIRMATION = "EXPENSE_CONFIRMATION"
+    INCOMPLETE_EXPENSE = "INCOMPLETE_EXPENSE"
     CLARIFICATION = "CLARIFICATION"
     PROCESSING_FAILURE = "PROCESSING_FAILURE"
     DELETE_CONFIRMATION_REQUEST = "DELETE_CONFIRMATION_REQUEST"

@@ -392,7 +392,7 @@ async def test_transient_database_error_is_not_classified_as_terminal_data_error
 @pytest.mark.parametrize(
     ("intent", "expected_status", "outbox_count"),
     [
-        (ExpenseIntent.UNCLEAR, ProcessedMessageStatus.NEEDS_CLARIFICATION, 1),
+        (ExpenseIntent.UNCLEAR, ProcessedMessageStatus.PROCESSED, 1),
         (ExpenseIntent.NOT_EXPENSE, ProcessedMessageStatus.NOT_EXPENSE, 0),
     ],
 )
@@ -635,7 +635,7 @@ async def test_later_success_creates_one_expense_and_confirmation(
         (
             InterpretationTimeoutError("sanitized"),
             ExpenseIntent.UNCLEAR,
-            ProcessedMessageStatus.NEEDS_CLARIFICATION,
+            ProcessedMessageStatus.PROCESSED,
             "GEMINI_TIMEOUT",
         ),
         (

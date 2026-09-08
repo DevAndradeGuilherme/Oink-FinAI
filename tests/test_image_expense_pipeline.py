@@ -16,6 +16,7 @@ from oink_finai.domain.enums import (
     ExpenseCategory,
     ExpenseIntent,
     MessageSourceType,
+    OutboundMessageKind,
     PaymentMethod,
     ProcessedMessageStatus,
 )
@@ -314,7 +315,7 @@ async def test_invalid_checkpoint_is_terminal_without_download_or_analysis(
     assert provider.download_calls == analyzer.calls == interpreter.calls == 0
 
 
-async def test_multiple_visual_amounts_force_clarification_without_expense(
+async def test_multiple_visual_amounts_request_complete_resubmission_without_expense(
     image_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     message = await seed_image(image_factory)
@@ -328,12 +329,15 @@ async def test_multiple_visual_amounts_force_clarification_without_expense(
 
     async with image_factory() as session:
         saved = await session.get(ProcessedMessage, message.id)
-        assert saved is not None and saved.status is ProcessedMessageStatus.NEEDS_CLARIFICATION
+        assert saved is not None and saved.status is ProcessedMessageStatus.PROCESSED
         assert await session.scalar(select(func.count()).select_from(Expense)) == 0
-        assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+        outbound = await session.scalar(select(OutboundMessage))
+        assert outbound is not None and outbound.kind is OutboundMessageKind.INCOMPLETE_EXPENSE
+        assert "valor" in outbound.content
+        assert "descrição" not in outbound.content.split("Está faltando: ", 1)[1].split(".", 1)[0]
 
 
-async def test_multiple_visual_dates_force_clarification_without_expense(
+async def test_multiple_visual_dates_use_system_date_without_clarification(
     image_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     message = await seed_image(image_factory)
@@ -358,8 +362,11 @@ async def test_multiple_visual_dates_force_clarification_without_expense(
 
     async with image_factory() as session:
         saved = await session.get(ProcessedMessage, message.id)
-        assert saved is not None and saved.status is ProcessedMessageStatus.NEEDS_CLARIFICATION
-        assert await session.scalar(select(func.count()).select_from(Expense)) == 0
+        assert saved is not None and saved.status is ProcessedMessageStatus.PROCESSED
+        expense = await session.scalar(select(Expense))
+        outbound = await session.scalar(select(OutboundMessage))
+        assert expense is not None and expense.expense_date.isoformat() == "2026-09-03"
+        assert outbound is not None and outbound.kind is OutboundMessageKind.EXPENSE_CONFIRMATION
 
 
 @pytest.mark.parametrize(

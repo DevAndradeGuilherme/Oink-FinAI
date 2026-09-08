@@ -16,7 +16,7 @@ class ExpenseInterpretationTransport(BaseModel):
     amount_evidence: str | None
     description: str | None
     merchant: str | None
-    category: ExpenseCategory
+    category: ExpenseCategory | None
     payment_method: PaymentMethod | None
     expense_date: date | None
     confidence: float = Field(ge=0, le=1)
@@ -34,7 +34,7 @@ class ExpenseInterpretation(BaseModel):
     amount_evidence: str | None
     description: str | None
     merchant: str | None
-    category: ExpenseCategory
+    category: ExpenseCategory | None
     payment_method: PaymentMethod | None
     expense_date: date | None
     confidence: float = Field(ge=0, le=1)
@@ -50,7 +50,10 @@ EXPENSE_INTERPRETATION_SCHEMA: dict[str, object] = {
         "amount_evidence": {"type": ["string", "null"]},
         "description": {"type": ["string", "null"]},
         "merchant": {"type": ["string", "null"]},
-        "category": {"type": "string", "enum": [value.value for value in ExpenseCategory]},
+        "category": {
+            "type": ["string", "null"],
+            "enum": [value.value for value in ExpenseCategory] + [None],
+        },
         "payment_method": {
             "type": ["string", "null"],
             "enum": [value.value for value in PaymentMethod] + [None],

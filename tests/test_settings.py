@@ -32,8 +32,6 @@ def test_settings_loads_env_example(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.expense_processing_max_attempts == 3
     assert settings.expense_retry_base_seconds == 0.5
     assert settings.expense_retry_max_seconds == 5.0
-    assert settings.expense_clarification_ttl_seconds == 900.0
-    assert settings.expense_clarification_min_confidence == 0.75
 
 
 def test_default_openai_models_and_private_key_repr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,8 +76,6 @@ def test_canonical_retry_environment_names_configure_settings(
         ("EXPENSE_PROCESSING_MAX_ATTEMPTS", "invalid"),
         ("EXPENSE_RETRY_BASE_SECONDS", "invalid"),
         ("EXPENSE_RETRY_MAX_SECONDS", "invalid"),
-        ("EXPENSE_CLARIFICATION_TTL_SECONDS", "0"),
-        ("EXPENSE_CLARIFICATION_MIN_CONFIDENCE", "1.1"),
         ("OPENAI_EXPENSE_TIMEOUT_SECONDS", "nan"),
         ("OPENAI_IMAGE_TIMEOUT_SECONDS", "inf"),
         ("OPENAI_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "0"),
@@ -105,8 +101,6 @@ def test_all_documented_expense_variables_are_consumed() -> None:
         "EXPENSE_PROCESSING_MAX_ATTEMPTS",
         "EXPENSE_RETRY_BASE_SECONDS",
         "EXPENSE_RETRY_MAX_SECONDS",
-        "EXPENSE_CLARIFICATION_TTL_SECONDS",
-        "EXPENSE_CLARIFICATION_MIN_CONFIDENCE",
     }
     assert all(name.casefold() in Settings.model_fields for name in documented_names)
 

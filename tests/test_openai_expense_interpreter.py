@@ -9,7 +9,7 @@ import httpx
 import pytest
 from openai import APIStatusError, AsyncOpenAI
 
-from oink_finai.domain.enums import ExpenseCategory, ExpenseClarificationField, ExpenseIntent
+from oink_finai.domain.enums import ExpenseCategory, ExpenseIntent
 from oink_finai.schemas.expense_interpretation import (
     EXPENSE_INTERPRETATION_SCHEMA,
     ExpenseInterpretationTransport,
@@ -216,66 +216,6 @@ def responses_api_payload(data: dict[str, object]) -> dict[str, object]:
             }
         ],
     }
-
-
-async def test_clarification_contract_accepts_description_without_revalidating_draft_amount() -> (
-    None
-):
-    message = "OINK_EXPENSE_CLARIFICATION_V1\n" + json.dumps(
-        {
-            "known_expense_fields": {
-                "amount": "80.00",
-                "category": "Outros",
-                "expense_date": "2026-09-06",
-            },
-            "requested_field": ExpenseClarificationField.DESCRIPTION.value,
-            "user_answer": "Foi no mercado",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    interpreter, _ = make_interpreter(
-        response(
-            payload(
-                amount="80.00",
-                amount_evidence=None,
-                description="Mercado",
-                merchant="Mercado",
-                category="Outros",
-                payment_method=None,
-                expense_date="2026-09-06",
-                missing_fields=[],
-            )
-        )
-    )
-
-    result = await interpreter.interpret(message, reference_timestamp=REFERENCE)
-
-    assert result.intent is ExpenseIntent.CREATE_EXPENSE
-    assert result.amount is None and result.amount_evidence is None
-    assert result.description == "Mercado"
-
-
-async def test_amount_clarification_still_requires_evidence_from_current_answer() -> None:
-    message = "OINK_EXPENSE_CLARIFICATION_V1\n" + json.dumps(
-        {
-            "known_expense_fields": {
-                "description": "Mercado",
-                "category": "Alimentação",
-            },
-            "requested_field": ExpenseClarificationField.AMOUNT.value,
-            "user_answer": "Foi 80 reais",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    interpreter, _ = make_interpreter(response(payload(amount="80.00", amount_evidence="80 reais")))
-
-    result = await interpreter.interpret(message, reference_timestamp=REFERENCE)
-
-    assert result.amount == Decimal("80.00")
 
 
 def collect_schema_keywords(value: object) -> set[str]:
@@ -759,7 +699,6 @@ async def test_rejects_invalid_amounts(amount: str) -> None:
         payload(payment_method="Cartão mágico"),
         payload(expense_date="2026-02-30"),
         payload(amount_evidence="42,50 inexistente"),
-        payload(intent="CREATE_EXPENSE", amount=None, amount_evidence=None),
         payload(intent="UNCLEAR", amount="42.50"),
     ],
 )
@@ -932,48 +871,22 @@ async def test_mock_transport_contract_is_one_responses_call_without_sdk_retry()
     assert body["store"] is False
 
 
-async def test_clarification_uses_one_mock_transport_call_and_preserves_draft_boundary() -> None:
-    requests: list[httpx.Request] = []
-    result_payload = payload(
-        amount=None,
-        amount_evidence=None,
-        description="Mercado",
-        merchant="Mercado",
-        payment_method=None,
-        missing_fields=[],
+async def test_transport_accepts_missing_required_fields_and_category_for_backend_policy() -> None:
+    interpreter, _ = make_interpreter(
+        response(
+            payload(
+                amount=None,
+                amount_evidence=None,
+                description=None,
+                category=None,
+                missing_fields=["amount", "description"],
+            )
+        )
     )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json=responses_api_payload(result_payload))
+    result = await interpreter.interpret("Gasto incompleto", reference_timestamp=REFERENCE)
 
-    envelope = "OINK_EXPENSE_CLARIFICATION_V1\n" + json.dumps(
-        {
-            "known_expense_fields": {
-                "amount": "80.00",
-                "category": "Outros",
-                "expense_date": "2026-09-06",
-            },
-            "requested_field": "description",
-            "user_answer": "Foi no mercado",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    async with AsyncOpenAI(
-        api_key="test-secret",
-        base_url="https://openai.invalid/v1",
-        max_retries=2,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    ) as client:
-        interpreter = OpenAIExpenseInterpreter(api_key="test-secret", client=client)
-        result = await interpreter.interpret(envelope, reference_timestamp=REFERENCE)
-        await interpreter.aclose()
-
-    assert result.description == "Mercado"
-    assert result.amount is None and result.amount_evidence is None
-    assert len(requests) == 1
-    body = json.loads(requests[0].content)
-    assert body["model"] == "gpt-4.1-mini"
-    assert body["input"][0]["content"][0]["text"] == envelope
+    assert result.amount is None
+    assert result.description is None
+    assert result.category is None
+    assert result.missing_fields == ["amount", "description"]

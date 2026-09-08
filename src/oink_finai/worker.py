@@ -83,8 +83,6 @@ async def run_worker() -> None:
         retry_base_seconds=settings.expense_retry_base_seconds,
         retry_max_seconds=settings.expense_retry_max_seconds,
         delete_confirmation_ttl_seconds=settings.expense_delete_confirmation_ttl_seconds,
-        clarification_ttl_seconds=settings.expense_clarification_ttl_seconds,
-        clarification_min_confidence=settings.expense_clarification_min_confidence,
         media_provider=provider,
         audio_transcriber_factory=lambda: audio_transcriber,
         image_analyzer_factory=lambda: image_analyzer,

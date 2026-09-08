@@ -78,3 +78,17 @@ def test_clarification_migration_is_linear_and_forward_only() -> None:
     assert 'ondelete="SET NULL"' in source
     downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
     assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()
+
+
+def test_clarification_retirement_migration_is_forward_only_and_normalizes_states() -> None:
+    source = (MIGRATIONS / "20260908_0011_retire_expense_clarification.py").read_text()
+
+    assert 'down_revision: str | None = "20260905_0010"' in source
+    assert "ADD VALUE IF NOT EXISTS 'INCOMPLETE_EXPENSE'" in source
+    assert "WHERE status::text = 'WAITING_EXPENSE_CLARIFICATION'" in source
+    assert "SET status = 'IDLE'" in source
+    assert "active_expense_id = NULL" in source
+    assert "context = NULL" in source
+    assert "expires_at = NULL" in source
+    downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
+    assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()
