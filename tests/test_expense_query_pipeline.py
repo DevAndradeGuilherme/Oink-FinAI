@@ -58,6 +58,9 @@ from oink_finai.services.interpretation_errors import (
 )
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
+from oink_finai.services.whatsapp_expense_query_result_formatter import (
+    WhatsAppExpenseQueryResultFormatter,
+)
 
 
 @pytest_asyncio.fixture
@@ -179,8 +182,10 @@ class FakeQueryInterpreter(ExpenseQueryInterpreter):
     def __init__(self, results: list[ExpenseQueryPlan | Exception]) -> None:
         self.results = results
         self.calls = 0
+        self.reference_timestamps: list[datetime] = []
 
     async def interpret(self, message: str, *, reference_timestamp: datetime):
+        self.reference_timestamps.append(reference_timestamp)
         result = self.results[min(self.calls, len(self.results) - 1)]
         self.calls += 1
         if isinstance(result, Exception):
@@ -208,7 +213,7 @@ class FakeFormatter(ExpenseQueryResultFormatter):
         self.pages = pages
         self.calls = 0
 
-    def format(self, result):
+    def format(self, result, *, context):
         self.calls += 1
         return ExpenseQueryFormattedMessages(
             messages=self.pages,
@@ -222,7 +227,7 @@ class CrashOnceFormatter(ExpenseQueryResultFormatter):
     def __init__(self) -> None:
         self.calls = 0
 
-    def format(self, result):
+    def format(self, result, *, context):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("simulated crash")
@@ -232,6 +237,19 @@ class CrashOnceFormatter(ExpenseQueryResultFormatter):
             total_items=1,
             displayed_items=1,
         )
+
+
+class NaturalCrashOnceFormatter(ExpenseQueryResultFormatter):
+    def __init__(self) -> None:
+        self.delegate = WhatsAppExpenseQueryResultFormatter()
+        self.messages: list[str] = []
+
+    def format(self, result, *, context):
+        formatted = self.delegate.format(result, context=context)
+        self.messages.append(formatted.messages[0])
+        if len(self.messages) == 1:
+            raise RuntimeError("simulated crash after formatting")
+        return formatted
 
 
 class SequenceProvider(WhatsAppProvider):
@@ -257,6 +275,7 @@ async def seed_query(
     *,
     source_type: MessageSourceType = MessageSourceType.TEXT,
     text: str = "Quanto gastei este mês?",
+    created_at: datetime = datetime(2026, 9, 8, 12, tzinfo=UTC),
 ) -> ProcessedMessage:
     async with factory() as session, session.begin():
         user = User(phone_number="5511999999999", timezone="America/Sao_Paulo")
@@ -275,6 +294,7 @@ async def seed_query(
             message_timestamp=datetime(2026, 9, 8, 12, tzinfo=UTC),
             status=ProcessedMessageStatus.PENDING,
             available_at=datetime(2026, 9, 8, 12, tzinfo=UTC),
+            created_at=created_at,
         )
         session.add(message)
         await session.flush()
@@ -467,6 +487,48 @@ async def test_execution_checkpoint_prevents_second_sql_after_crash(query_factor
         assert saved.query_executed_at is not None
         assert saved.query_result_checkpoint is None
         assert await session.scalar(select(func.count()).select_from(OutboundMessage)) == 1
+
+
+async def test_retry_after_midnight_uses_created_at_for_identical_natural_text(
+    query_factory,
+) -> None:
+    created_at = datetime(2026, 9, 9, 1, 30, tzinfo=UTC)
+    message = await seed_query(query_factory, created_at=created_at)
+    plan = total_plan().model_copy(
+        update={
+            "period": ExpenseQueryPeriod(start_date=date(2026, 9, 8), end_date=date(2026, 9, 8))
+        }
+    )
+    result = aggregate_result().model_copy(
+        update={"metadata": aggregate_result().metadata.model_copy(update={"period": plan.period})}
+    )
+    interpreter = FakeQueryInterpreter([plan])
+    executor = FakeExecutor([result])
+    formatter = NaturalCrashOnceFormatter()
+    service = query_service(
+        query_factory,
+        FakeClassifier([query_classification()]),
+        interpreter,
+        executor,
+        formatter,
+    )
+
+    await service.claim(1)
+    with pytest.raises(RuntimeError, match="simulated crash after formatting"):
+        await service.process(message.id)
+    await service.recover_stale(datetime(2026, 9, 10, tzinfo=UTC))
+    assert await service.claim(1) == [message.id]
+    await service.process(message.id)
+
+    assert interpreter.reference_timestamps == [created_at]
+    assert executor.calls == 1
+    assert formatter.messages == [
+        "Hoje, você gastou R$ 42,50.",
+        "Hoje, você gastou R$ 42,50.",
+    ]
+    async with query_factory() as session:
+        outbox = await session.scalar(select(OutboundMessage))
+        assert outbox is not None and outbox.content == formatter.messages[0]
 
 
 async def test_invalid_checkpoint_never_reaches_executor(query_factory) -> None:

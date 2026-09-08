@@ -54,6 +54,7 @@ from oink_finai.schemas.expense_query_checkpoint import (
     ExpenseQueryPlanCheckpoint,
     ExpenseQueryResultCheckpoint,
 )
+from oink_finai.schemas.expense_query_messages import ExpenseQueryFormattingContext
 from oink_finai.schemas.expense_query_result import (
     ExpenseAggregateResult,
     ExpenseComparisonResult,
@@ -340,6 +341,7 @@ class ExpenseProcessingService:
                 return
             text = message.accepted_text
             timestamp = message.message_timestamp
+            query_reference_timestamp = message.created_at
             timezone = user.timezone
             source_type = message.source_type
             transcribed_at = message.transcribed_at
@@ -474,7 +476,7 @@ class ExpenseProcessingService:
             await self._process_query(
                 message_id,
                 text,
-                timestamp=timestamp,
+                timestamp=query_reference_timestamp,
                 timezone=timezone,
                 attempt_number=message.processing_attempts,
             )
@@ -587,6 +589,13 @@ class ExpenseProcessingService:
         timezone: str,
         attempt_number: int,
     ) -> None:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        formatting_timezone = self._timezone(timezone)
+        formatting_context = ExpenseQueryFormattingContext(
+            reference_date=timestamp.astimezone(formatting_timezone).date(),
+            timezone=formatting_timezone.key,
+        )
         try:
             plan = await self._query_plan(
                 message_id,
@@ -668,7 +677,7 @@ class ExpenseProcessingService:
                 stage="query_formatting",
                 intent=plan.intent.value,
             ) as formatting_span:
-                formatted = self._query_formatter.format(result)
+                formatted = self._query_formatter.format(result, context=formatting_context)
                 formatting_span.result(outcome="success", page_count=len(formatted.messages))
         except (TypeError, ValueError):
             await self._mark_query_failed(
