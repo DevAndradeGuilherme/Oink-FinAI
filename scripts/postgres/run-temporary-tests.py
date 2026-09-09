@@ -221,6 +221,7 @@ def main() -> int:
             exercise_denials(postgres, database, bootstrap, migrator, runtime, backup, temp, suffix)
             exercise_default_privileges(postgres, database, migrator, runtime, backup, temp, suffix)
             exercise_dump(postgres, database, backup, temp, suffix)
+            exercise_usage_concurrency(app_image, network, runtime_env)
             validate(postgres, database, bootstrap, migrator, runtime, backup, temp)
 
             print("Testing existing-database adaptation and idempotence...")
@@ -345,6 +346,29 @@ def run_alembic(image: str, network: str, env_file: Path, *arguments: str) -> No
         image,
         "alembic",
         *arguments,
+    )
+
+
+def exercise_usage_concurrency(image: str, network: str, env_file: Path) -> None:
+    docker(
+        "run",
+        "--rm",
+        "--network",
+        network,
+        "--env-file",
+        str(env_file),
+        "--env",
+        f"OINK_DESTRUCTIVE_POSTGRES_TEST_MARKER={MARKER}",
+        "--mount",
+        f"type=bind,source={ROOT / 'src'},target=/app/src,readonly",
+        "--mount",
+        (
+            f"type=bind,source={ROOT / 'scripts' / 'postgres' / 'check-usage-concurrency.py'},"
+            "target=/tmp/check-usage-concurrency.py,readonly"
+        ),
+        image,
+        "python",
+        "/tmp/check-usage-concurrency.py",
     )
 
 
@@ -706,7 +730,7 @@ def exercise_existing_upgrade(
         encoding="utf-8",
         newline="\n",
     )
-    run_alembic(app_image, network, migration_env, "upgrade", "head")
+    run_alembic(app_image, network, migration_env, "upgrade", "20260908_0012")
     psql(
         postgres,
         database,
@@ -716,6 +740,7 @@ def exercise_existing_upgrade(
         f"('30000000-0000-4000-8000-{suffix.rjust(12, '0')}', 'upgrade-{suffix}')",
     )
     before = database_digest(postgres, database, legacy, temp)
+    historical_before = historical_data_digest(postgres, database, legacy, temp)
     schema_before = schema_digest(postgres, database, legacy, temp)
     extra = {
         "LEGACY_OWNER": legacy,
@@ -751,6 +776,17 @@ def exercise_existing_upgrade(
         raise CheckFailed("existing-database constraints, indexes, columns, or ENUMs changed")
     if first_inventory != second_inventory:
         raise CheckFailed("repeated adaptation changed ownership inventory")
+    upgrade_env = temp / "existing-upgrade.env"
+    upgrade_env.write_text(
+        "APP_ENV=production\n"
+        f"MIGRATION_DATABASE_URL={connection_url(migrator, passwords[migrator], database)}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    run_alembic(app_image, network, upgrade_env, "upgrade", "head")
+    run_alembic(app_image, network, upgrade_env, "current", "--check-heads")
+    if historical_data_digest(postgres, database, migrator, temp) != historical_before:
+        raise CheckFailed("0012-to-head upgrade changed historical data, IDs, or counts")
     wrong_owner_count = psql(
         postgres,
         database,
@@ -882,6 +918,29 @@ def database_digest(container: str, database: str, role: str, temp: Path) -> str
                  (SELECT count(*) FROM processed_messages),
                  (SELECT count(*) FROM users)))
         ) data ORDER BY table_name
+        """,
+        tuples=True,
+    ).stdout
+    return hashlib.sha256(values.encode()).hexdigest()
+
+
+def historical_data_digest(container: str, database: str, role: str, temp: Path) -> str:
+    values = psql(
+        container,
+        database,
+        role,
+        temp,
+        """
+        SELECT concat_ws(',',
+          (SELECT count(*)::text FROM categories),
+          (SELECT count(*)::text FROM conversation_states),
+          (SELECT count(*)::text FROM expense_history),
+          (SELECT count(*)::text FROM expenses),
+          (SELECT count(*)::text FROM outbound_messages),
+          (SELECT count(*)::text FROM processed_messages),
+          (SELECT count(*)::text FROM users),
+          (SELECT coalesce(string_agg(id::text || ':' || phone_number, ',' ORDER BY id), '')
+             FROM users))
         """,
         tuples=True,
     ).stdout

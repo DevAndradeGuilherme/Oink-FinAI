@@ -4,6 +4,7 @@ from oink_finai.database.models.expense import Expense
 from oink_finai.database.models.expense_history import ExpenseHistory
 from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
+from oink_finai.database.models.usage_ledger import UsageLedger
 from oink_finai.database.models.user import User
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ProcessedMessage",
     "OutboundMessage",
     "User",
+    "UsageLedger",
 ]

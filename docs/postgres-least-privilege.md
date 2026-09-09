@@ -85,7 +85,7 @@ do `psql`, transfere banco/schema para migrator, revoga `PUBLIC`, aplica grants 
 privileges. Repetir não duplica roles ou grants e não substitui senhas já existentes.
 
 Depois execute o `migrate` one-shot e suba API/worker pelo Compose normal. O migrator cria todas as
-revisions 0001→0012 e objetos futuros; os default privileges entregam automaticamente DML ao
+revisions 0001→head e objetos futuros; os default privileges entregam automaticamente DML ao
 runtime e leitura ao backup para tabelas, além dos privilégios mínimos em sequences.
 
 ## Adaptação de banco existente

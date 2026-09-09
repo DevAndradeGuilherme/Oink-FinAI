@@ -153,6 +153,35 @@ def test_production_settings_accept_a_complete_safe_configuration() -> None:
 
     assert settings.app_env == "production"
     assert settings.database_url_value.startswith("postgresql+asyncpg://")
+    assert settings.usage_window_timezone == "UTC"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("INBOUND_USER_PER_MINUTE_LIMIT", "0"),
+        ("INBOUND_GLOBAL_PER_DAY_LIMIT", "10001"),
+        ("OPENAI_GLOBAL_CONCURRENCY_LIMIT", "0"),
+        ("OPENAI_TEXT_USER_PER_DAY_LIMIT", "1001"),
+        ("OPENAI_EXPENSE_MAX_OUTPUT_TOKENS", "0"),
+        ("USAGE_WINDOW_TIMEZONE", "America/Sao_Paulo"),
+    ],
+)
+def test_unsafe_usage_limits_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_incoherent_usage_limits_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            openai_user_per_day_limit=10,
+            openai_text_user_per_day_limit=11,
+        )
 
 
 @pytest.mark.parametrize(

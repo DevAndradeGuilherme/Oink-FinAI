@@ -1,9 +1,10 @@
 import asyncio
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,6 +32,7 @@ from oink_finai.domain.enums import (
     OutboundMessageKind,
     OutboundMessageStatus,
     ProcessedMessageStatus,
+    UsageOperation,
 )
 from oink_finai.domain.expense_limits import (
     EXPENSE_AMOUNT_MAX,
@@ -88,8 +90,10 @@ from oink_finai.services.interpretation_errors import (
     InterpretationError,
     InterpretationErrorCode,
 )
+from oink_finai.services.openai_usage import OpenAIUsageMetrics, observe_openai_call
 from oink_finai.services.pipeline_timing import PipelineTiming
 from oink_finai.services.transcription_errors import NoSpeechError, TranscriptionError
+from oink_finai.services.usage_control import AdmissionDenial, AdmissionResult, UsageControl
 
 _EXPLICIT_MONETARY_VALUE = re.compile(
     r"(?:R\$[ \t]*)?[0-9][0-9.,]*(?:[ \t]*reais?)?", re.IGNORECASE
@@ -153,6 +157,12 @@ class InterpretationLimitError(ValueError):
         self.code = code
 
 
+class UsageAdmissionError(Exception):
+    def __init__(self, result: AdmissionResult) -> None:
+        self.result = result
+        super().__init__("OPENAI_USAGE_LIMITED")
+
+
 class ExpenseProcessingService:
     def __init__(
         self,
@@ -172,6 +182,11 @@ class ExpenseProcessingService:
         query_executor: ExpenseQueryExecutor | None = None,
         query_formatter: ExpenseQueryResultFormatter | None = None,
         timing: PipelineTiming | None = None,
+        usage_control: UsageControl | None = None,
+        expense_model: str = "gpt-4.1-mini",
+        query_model: str = "gpt-4.1-mini",
+        image_model: str = "gpt-4.1-mini",
+        audio_model: str = "gpt-transcribe",
     ) -> None:
         self._session_factory = session_factory
         self._interpreter_factory = interpreter_factory
@@ -188,8 +203,15 @@ class ExpenseProcessingService:
         self._query_executor = query_executor
         self._query_formatter = query_formatter
         self._timing = timing or PipelineTiming(False)
+        self._usage_control = usage_control
+        self._expense_model = expense_model
+        self._query_model = query_model
+        self._image_model = image_model
+        self._audio_model = audio_model
 
     async def recover_stale(self, older_than: datetime) -> int:
+        if self._usage_control is not None:
+            await self._usage_control.reconcile_stale()
         now = self._now()
         async with self._session_factory() as session, session.begin():
             messages = list(
@@ -452,6 +474,9 @@ class ExpenseProcessingService:
                 self._retry_or_fail(message_id, InterpretationErrorCode.TIMEOUT.value)
             )
             raise
+        except UsageAdmissionError as exc:
+            await self._defer_usage_limit(message_id, exc.result)
+            return
         except InterpretationLimitError as exc:
             await self._mark_failed(message_id, exc.code)
             return
@@ -554,7 +579,12 @@ class ExpenseProcessingService:
             attempt_number=message.processing_attempts,
             source_type=source_type_value(message.source_type),
         ):
-            return await interpreter.interpret(text, reference_timestamp=timestamp)
+            return await self._metered_openai_call(
+                message.id,
+                UsageOperation.TEXT_INTERPRETATION,
+                self._expense_model,
+                lambda: interpreter.interpret(text, reference_timestamp=timestamp),
+            )
 
     async def _checkpoint_classification(
         self,
@@ -607,6 +637,9 @@ class ExpenseProcessingService:
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "QUERY_INTERPRETATION_TIMEOUT"))
             raise
+        except UsageAdmissionError as exc:
+            await self._defer_usage_limit(message_id, exc.result)
+            return
         except InterpretationError as exc:
             if self._is_transient(exc):
                 await self._retry_or_fail(message_id, self._query_error_code(exc))
@@ -732,7 +765,12 @@ class ExpenseProcessingService:
             attempt_number=attempt_number,
             stage="query_interpretation",
         ) as interpretation_span:
-            plan = await interpreter.interpret(text, reference_timestamp=timestamp)
+            plan = await self._metered_openai_call(
+                message_id,
+                UsageOperation.QUERY_INTERPRETATION,
+                self._query_model,
+                lambda: interpreter.interpret(text, reference_timestamp=timestamp),
+            )
             interpretation_span.result(
                 outcome="success",
                 intent=plan.intent.value,
@@ -1246,6 +1284,79 @@ class ExpenseProcessingService:
                 if message.source_type == MessageSourceType.IMAGE:
                     await self._create_failure_notification(session, message, message.user)
 
+    async def _metered_openai_call(
+        self,
+        message_id: UUID,
+        operation: UsageOperation,
+        model: str,
+        call: Callable[[], Awaitable[Any]],
+        *,
+        audio_seconds: int | None = None,
+    ) -> Any:
+        if self._usage_control is None:
+            return await call()
+        reservation = await self._usage_control.reserve_openai(
+            message_id=message_id, operation=operation, model=model
+        )
+        if not reservation.allowed or reservation.ledger_id is None:
+            raise UsageAdmissionError(reservation)
+        metrics: list[OpenAIUsageMetrics] = []
+        with observe_openai_call(
+            lambda: self._usage_control.mark_transmitted(reservation.ledger_id),
+            metrics.append,
+        ):
+            try:
+                result = await call()
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._usage_control.settle_failure(
+                        reservation.ledger_id, metrics[-1] if metrics else None
+                    )
+                )
+                raise
+            except Exception:
+                await self._usage_control.settle_failure(
+                    reservation.ledger_id, metrics[-1] if metrics else None
+                )
+                raise
+        usage = metrics[-1] if metrics else OpenAIUsageMetrics()
+        if usage.audio_seconds is None and audio_seconds is not None:
+            usage = OpenAIUsageMetrics(
+                usage.input_tokens,
+                usage.output_tokens,
+                Decimal(audio_seconds),
+            )
+        await self._usage_control.complete(reservation.ledger_id, usage)
+        return result
+
+    async def _defer_usage_limit(self, message_id: UUID, admission: AdmissionResult) -> None:
+        code = (
+            "OPENAI_CONCURRENCY_LIMITED"
+            if admission.denial is AdmissionDenial.GLOBAL_CONCURRENCY
+            else "OPENAI_RESERVATION_REUSED"
+            if admission.denial is AdmissionDenial.IDEMPOTENCY_CONFLICT
+            else "OPENAI_DAILY_LIMITED"
+        )
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if message is None or message.status is not ProcessedMessageStatus.PROCESSING:
+                return
+            message.error_code = code
+            message.last_error_code = code
+            message.locked_at = None
+            message.attempt_count += 1
+            if message.processing_attempts >= self._max_attempts:
+                await self._mark_attempts_exhausted(session, message)
+                return
+            message.status = ProcessedMessageStatus.PENDING
+            message.next_attempt_at = admission.retry_at or (
+                self._now() + self._retry_delay(message.processing_attempts)
+            )
+
     async def _retry_or_fail(self, message_id: UUID, code: str) -> None:
         async with self._session_factory() as session, session.begin():
             message = await session.scalar(
@@ -1362,7 +1473,12 @@ class ExpenseProcessingService:
                 source_type=MessageSourceType.IMAGE.value,
             ) as analysis_span:
                 try:
-                    analysis = await self._image_analyzer_factory().analyze(image, caption)
+                    analysis = await self._metered_openai_call(
+                        message_id,
+                        UsageOperation.IMAGE_ANALYSIS,
+                        self._image_model,
+                        lambda: self._image_analyzer_factory().analyze(image, caption),
+                    )
                 except ImageAnalysisError as exc:
                     analysis_span.result(
                         outcome=("transient_failure" if exc.transient else "terminal_failure"),
@@ -1376,6 +1492,9 @@ class ExpenseProcessingService:
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "IMAGE_ANALYSIS_UNAVAILABLE"))
             raise
+        except UsageAdmissionError as exc:
+            await self._defer_usage_limit(message_id, exc.result)
+            return None
         except MediaError as exc:
             if exc.transient:
                 await self._retry_or_fail(message_id, exc.code.value)
@@ -1490,17 +1609,26 @@ class ExpenseProcessingService:
                 mime_type=media.declared_mime_type,
                 audio_duration_seconds=media.declared_duration_seconds,
             ):
-                transcription = await self._audio_transcriber_factory().transcribe(
-                    ValidatedAudio(
-                        content=content,
-                        mime_type=media.declared_mime_type,
-                        declared_duration_seconds=media.declared_duration_seconds,
-                        is_voice_note=media.is_voice_note,
-                    )
+                transcription = await self._metered_openai_call(
+                    message_id,
+                    UsageOperation.AUDIO_TRANSCRIPTION,
+                    self._audio_model,
+                    lambda: self._audio_transcriber_factory().transcribe(
+                        ValidatedAudio(
+                            content=content,
+                            mime_type=media.declared_mime_type,
+                            declared_duration_seconds=media.declared_duration_seconds,
+                            is_voice_note=media.is_voice_note,
+                        )
+                    ),
+                    audio_seconds=media.declared_duration_seconds,
                 )
         except asyncio.CancelledError:
             await asyncio.shield(self._retry_or_fail(message_id, "AUDIO_PROCESSING_INTERRUPTED"))
             raise
+        except UsageAdmissionError as exc:
+            await self._defer_usage_limit(message_id, exc.result)
+            return None
         except MediaError as exc:
             if exc.transient:
                 await self._retry_or_fail(message_id, exc.code.value)

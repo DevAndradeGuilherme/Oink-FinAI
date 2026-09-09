@@ -96,3 +96,8 @@ docker compose --env-file /etc/oink-finai/compose.env -f docker-compose.prod.yml
 
 Um exit code diferente de zero mantém API e worker bloqueados. Corrija a causa e recrie
 somente o job antes de subir os dependentes; não execute Alembic dentro do comando da API.
+
+Os limites de abuso e custo são carregados do mesmo arquivo runtime exclusivo de API/worker.
+O job `migrate` não precisa de chaves de provedores para criar o ledger da revisão
+`20260909_0013`. A matriz de limites, estados de reserva, consultas sanitizadas e resposta a abuso
+está em [durable-usage-control.md](durable-usage-control.md).

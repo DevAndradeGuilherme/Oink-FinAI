@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
@@ -36,9 +37,13 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_expense_model: str = "gpt-4.1-mini"
     openai_expense_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
+    openai_expense_max_output_tokens: int = Field(default=600, ge=64, le=4096)
+    openai_query_model: str = "gpt-4.1-mini"
     openai_query_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
+    openai_query_max_output_tokens: int = Field(default=600, ge=64, le=4096)
     openai_image_model: str = "gpt-4.1-mini"
     openai_image_timeout_seconds: float = Field(default=90.0, gt=0, le=120, allow_inf_nan=False)
+    openai_image_max_output_tokens: int = Field(default=500, ge=64, le=4096)
     openai_audio_transcription_model: str = "gpt-transcribe"
     openai_audio_transcription_timeout_seconds: float = Field(
         default=90.0, gt=0, le=120, allow_inf_nan=False
@@ -54,6 +59,23 @@ class Settings(BaseSettings):
     whatsapp_self_test_number: str | None = Field(default=None, repr=False)
     whatsapp_self_test_prefix: str = "!oink"
     inbound_message_max_length: int = Field(default=2000, ge=1, le=10000)
+    usage_window_timezone: Literal["UTC"] = "UTC"
+    inbound_user_per_minute_limit: int = Field(default=10, ge=1, le=120)
+    inbound_user_per_day_limit: int = Field(default=150, ge=1, le=2_000)
+    inbound_global_per_day_limit: int = Field(default=600, ge=1, le=10_000)
+    openai_user_per_day_limit: int = Field(default=60, ge=1, le=1_000)
+    openai_global_per_day_limit: int = Field(default=240, ge=1, le=5_000)
+    openai_global_concurrency_limit: int = Field(default=2, ge=1, le=32)
+    openai_text_user_per_day_limit: int = Field(default=40, ge=1, le=1_000)
+    openai_text_global_per_day_limit: int = Field(default=160, ge=1, le=5_000)
+    openai_query_user_per_day_limit: int = Field(default=20, ge=1, le=1_000)
+    openai_query_global_per_day_limit: int = Field(default=80, ge=1, le=5_000)
+    openai_image_user_per_day_limit: int = Field(default=12, ge=1, le=1_000)
+    openai_image_global_per_day_limit: int = Field(default=48, ge=1, le=5_000)
+    openai_audio_user_per_day_limit: int = Field(default=10, ge=1, le=1_000)
+    openai_audio_global_per_day_limit: int = Field(default=40, ge=1, le=5_000)
+    openai_reservation_stale_seconds: float = Field(default=330.0, gt=0, le=3600)
+    openai_concurrency_retry_seconds: float = Field(default=30.0, gt=0, le=600)
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_batch_size: int = Field(default=10, ge=1, le=100)
     worker_processing_lock_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
@@ -124,6 +146,7 @@ class Settings(BaseSettings):
             raise ValueError("outbox state timeout must exceed the provider timeout")
         if self.image_max_pixels > self.image_max_width * self.image_max_height:
             raise ValueError("image pixel limit must not exceed the dimension limit")
+        self._validate_usage_limits()
 
         try:
             ZoneInfo(self.default_timezone)
@@ -196,8 +219,39 @@ class Settings(BaseSettings):
             self.openai_image_model
         ):
             raise ValueError("OpenAI model names are required in production")
+        if self._is_placeholder(self.openai_query_model):
+            raise ValueError("OpenAI model names are required in production")
         if self._is_placeholder(self.openai_audio_transcription_model):
             raise ValueError("OpenAI model names are required in production")
+        for model in (
+            self.openai_expense_model,
+            self.openai_query_model,
+            self.openai_image_model,
+            self.openai_audio_transcription_model,
+        ):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model):
+                raise ValueError("OpenAI model name is invalid in production")
+
+    def _validate_usage_limits(self) -> None:
+        if self.inbound_user_per_day_limit > self.inbound_global_per_day_limit:
+            raise ValueError("per-user inbound limit must not exceed the global limit")
+        if self.openai_user_per_day_limit > self.openai_global_per_day_limit:
+            raise ValueError("per-user OpenAI limit must not exceed the global limit")
+        if self.openai_global_concurrency_limit > self.openai_global_per_day_limit:
+            raise ValueError("OpenAI concurrency must not exceed the global daily limit")
+        typed_limits = (
+            (self.openai_text_user_per_day_limit, self.openai_text_global_per_day_limit),
+            (self.openai_query_user_per_day_limit, self.openai_query_global_per_day_limit),
+            (self.openai_image_user_per_day_limit, self.openai_image_global_per_day_limit),
+            (self.openai_audio_user_per_day_limit, self.openai_audio_global_per_day_limit),
+        )
+        for user_limit, global_limit in typed_limits:
+            if user_limit > global_limit:
+                raise ValueError("per-user operation limit must not exceed its global limit")
+            if user_limit > self.openai_user_per_day_limit:
+                raise ValueError("operation limit must not exceed the per-user OpenAI limit")
+            if global_limit > self.openai_global_per_day_limit:
+                raise ValueError("operation limit must not exceed the global OpenAI limit")
 
     @classmethod
     def _require_production_secret(

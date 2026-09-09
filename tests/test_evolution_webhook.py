@@ -18,11 +18,13 @@ from oink_finai.database.models.conversation_state import ConversationState
 from oink_finai.database.models.expense import Expense
 from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
+from oink_finai.database.models.usage_ledger import UsageLedger
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
 from oink_finai.domain.enums import (
     ConversationStatus,
     MessageSourceType,
+    OutboundMessageKind,
     ProcessedMessageStatus,
 )
 from oink_finai.main import app
@@ -116,6 +118,48 @@ async def test_enabled_webhook_timing_uses_persisted_internal_id(
         "inbound_persisted",
         "webhook_completed",
     }
+
+
+async def test_rate_limit_is_after_dedup_and_creates_one_guidance(
+    webhook_client: TestClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INBOUND_USER_PER_MINUTE_LIMIT", "1")
+    get_settings.cache_clear()
+    first_payload = authorized_payload()
+    second_payload = copy.deepcopy(first_payload)
+    second_payload["data"]["key"]["id"] = "synthetic-rate-limited-message"
+    third_payload = copy.deepcopy(first_payload)
+    third_payload["data"]["key"]["id"] = "synthetic-rate-limited-message-2"
+
+    first = post(webhook_client, first_payload)
+    blocked = post(webhook_client, second_payload)
+    blocked_again = post(webhook_client, third_payload)
+    duplicate = post(webhook_client, second_payload)
+
+    assert first.json() == {"status": "accepted"}
+    assert blocked.json() == {"status": "rate_limited"}
+    assert blocked_again.json() == {"status": "rate_limited"}
+    assert duplicate.json() == {"status": "duplicate"}
+    assert await session.scalar(select(func.count()).select_from(UsageLedger)) == 1
+    assert await session.scalar(select(func.count()).select_from(Expense)) == 0
+    guidance = list(
+        await session.scalars(
+            select(OutboundMessage).where(
+                OutboundMessage.kind == OutboundMessageKind.RATE_LIMIT_GUIDANCE
+            )
+        )
+    )
+    assert len(guidance) == 1
+    blocked_message = await session.scalar(
+        select(ProcessedMessage).where(
+            ProcessedMessage.external_message_id == "synthetic-rate-limited-message"
+        )
+    )
+    assert blocked_message is not None
+    assert blocked_message.status is ProcessedMessageStatus.FAILED
+    assert blocked_message.next_attempt_at is None
 
 
 @pytest.mark.parametrize("self_test_enabled", ["false", "true"])

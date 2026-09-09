@@ -154,3 +154,10 @@ legenda nunca participa da busca por evidência.
 canônico sem moeda ou milhar; o parser defensivo também aceita representações brasileiras
 inequívocas com `R$`, vírgula decimal e ponto de milhar. `evidence` continua sendo transcrição
 visual separada. Nenhum formato é arredondado, truncado ou limpo por remoção permissiva.
+
+### Controle durável de custo e abuso
+
+Mensagens e operações OpenAI passam por limites duráveis em PostgreSQL, com janelas UTC,
+idempotência por mensagem/tentativa, reserva anterior à chamada e concorrência global. O ledger
+armazena apenas identificadores internos e métricas técnicas numéricas; não armazena conteúdo.
+Consulte [a arquitetura, os defaults e o procedimento operacional](docs/durable-usage-control.md).

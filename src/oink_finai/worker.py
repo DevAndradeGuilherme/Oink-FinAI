@@ -19,6 +19,7 @@ from oink_finai.services.openai_image_analyzer import OpenAIImageAnalyzer
 from oink_finai.services.openai_privacy import openai_private_operation
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
+from oink_finai.services.usage_control import UsageControl
 from oink_finai.services.whatsapp_expense_query_result_formatter import (
     WhatsAppExpenseQueryResultFormatter,
 )
@@ -104,16 +105,19 @@ async def run_worker() -> None:
         api_key=openai_api_key,
         model=settings.openai_image_model,
         timeout_seconds=settings.openai_image_timeout_seconds,
+        max_output_tokens=settings.openai_image_max_output_tokens,
         max_image_bytes=settings.media_max_bytes,
         client=openai_client,
     )
     timing = PipelineTiming(settings.pipeline_timing_enabled)
+    usage_control = UsageControl(settings, SessionFactory)
     processing = ExpenseProcessingService(
         SessionFactory,
         lambda timezone: OpenAIExpenseInterpreter(
             api_key=openai_api_key,
             model=settings.openai_expense_model,
             timeout_seconds=settings.openai_expense_timeout_seconds,
+            max_output_tokens=settings.openai_expense_max_output_tokens,
             timezone=timezone,
             client=openai_client,
         ),
@@ -128,6 +132,8 @@ async def run_worker() -> None:
             api_key=openai_api_key,
             timeout_seconds=settings.openai_query_timeout_seconds,
             timezone=timezone,
+            model=settings.openai_query_model,
+            max_output_tokens=settings.openai_query_max_output_tokens,
             client=openai_client,
         ),
         query_executor=SQLAlchemyExpenseQueryExecutor(SessionFactory),
@@ -136,6 +142,11 @@ async def run_worker() -> None:
             max_pages=settings.whatsapp_query_max_pages,
         ),
         timing=timing,
+        usage_control=usage_control,
+        expense_model=settings.openai_expense_model,
+        query_model=settings.openai_query_model,
+        image_model=settings.openai_image_model,
+        audio_model=settings.openai_audio_transcription_model,
     )
     delivery = OutboxDeliveryService(
         SessionFactory,

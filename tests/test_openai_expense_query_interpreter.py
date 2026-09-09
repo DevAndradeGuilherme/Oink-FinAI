@@ -145,6 +145,7 @@ async def test_uses_responses_structured_outputs_without_storage_or_sdk_retries(
     assert call["text_format"] is OpenAIExpenseQueryTransport
     assert call["store"] is False
     assert call["temperature"] == 0
+    assert call["max_output_tokens"] == 600
     assert call["input"] == [{"role": "user", "content": "liste despesas"}]
 
 

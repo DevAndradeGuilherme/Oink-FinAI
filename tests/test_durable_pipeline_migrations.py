@@ -109,3 +109,26 @@ def test_query_pipeline_migration_is_linear_and_preserves_historical_rows() -> N
     assert "DELETE FROM" not in source
     downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
     assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()
+
+
+def test_usage_control_migration_is_linear_content_free_and_forward_only() -> None:
+    source = (MIGRATIONS / "20260909_0013_durable_usage_control.py").read_text()
+
+    assert 'down_revision: str | None = "20260908_0012"' in source
+    assert '"usage_ledger"' in source
+    assert "uq_usage_ledger_message_operation_attempt" in source
+    assert "ix_usage_ledger_window_operation" in source
+    assert "ix_usage_ledger_user_window" in source
+    assert "ix_usage_ledger_reconciliation" in source
+    for forbidden in (
+        'sa.Column("phone',
+        'sa.Column("jid',
+        'sa.Column("transcript',
+        'sa.Column("prompt',
+        'sa.Column("response',
+        'sa.Column("content',
+    ):
+        assert forbidden not in source
+    assert "INSERT INTO" not in source and "UPDATE processed_messages" not in source
+    downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
+    assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()

@@ -37,6 +37,10 @@ from oink_finai.services.interpretation_errors import (
     InterpretationUnavailableError,
 )
 from oink_finai.services.openai_privacy import openai_private_operation
+from oink_finai.services.openai_usage import (
+    mark_openai_request_transmitted,
+    record_openai_response_usage,
+)
 
 _DECIMAL_PATTERN = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d{1,2})?$")
 _PROVIDER_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -308,6 +312,7 @@ class OpenAIExpenseInterpreter(ExpenseInterpreter):
         api_key: str | None,
         model: str = "gpt-4.1-mini",
         timeout_seconds: float = 90.0,
+        max_output_tokens: int = 600,
         timezone: str | ZoneInfo = "America/Sao_Paulo",
         client: AsyncOpenAI | None = None,
     ) -> None:
@@ -321,6 +326,9 @@ class OpenAIExpenseInterpreter(ExpenseInterpreter):
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
+            or isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 64 <= max_output_tokens <= 4096
         ):
             raise InterpretationConfigurationError()
         if isinstance(timezone, ZoneInfo):
@@ -335,6 +343,7 @@ class OpenAIExpenseInterpreter(ExpenseInterpreter):
         self._model = model
         self._safe_model = model
         self._timeout_seconds = timeout_seconds
+        self._max_output_tokens = max_output_tokens
         self._owns_client = client is None
         self._closed = False
         failure = None
@@ -387,6 +396,7 @@ class OpenAIExpenseInterpreter(ExpenseInterpreter):
                 async with asyncio.timeout(self._timeout_seconds):
                     if self._closed:
                         raise InterpretationConfigurationError()
+                    await mark_openai_request_transmitted()
                     response = await self._client.responses.create(
                         model=self._model,
                         instructions=system_instruction,
@@ -405,8 +415,10 @@ class OpenAIExpenseInterpreter(ExpenseInterpreter):
                             }
                         },
                         temperature=0,
+                        max_output_tokens=self._max_output_tokens,
                         store=False,
                     )
+                    record_openai_response_usage(response)
                     response_text = response.output_text
             except asyncio.CancelledError:
                 raise

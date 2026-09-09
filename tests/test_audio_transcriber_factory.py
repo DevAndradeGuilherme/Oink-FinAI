@@ -89,6 +89,19 @@ async def test_worker_shares_and_closes_one_openai_client(monkeypatch) -> None:
     audio_factory.assert_called_once_with(settings, client=shared_client)
     interpreter = processing_constructor.call_args.args[1]("America/Sao_Paulo")
     assert interpreter._client is shared_client
+    assert interpreter._max_output_tokens == settings.openai_expense_max_output_tokens
+    query_interpreter = processing_constructor.call_args.kwargs["query_interpreter_factory"](
+        "America/Sao_Paulo"
+    )
+    assert query_interpreter._max_output_tokens == settings.openai_query_max_output_tokens
+    worker.OpenAIImageAnalyzer.assert_called_once_with(
+        api_key="synthetic-key",
+        model=settings.openai_image_model,
+        timeout_seconds=settings.openai_image_timeout_seconds,
+        max_output_tokens=settings.openai_image_max_output_tokens,
+        max_image_bytes=settings.media_max_bytes,
+        client=shared_client,
+    )
     transcriber.aclose.assert_awaited_once()
     analyzer.aclose.assert_awaited_once()
     provider.aclose.assert_awaited_once()

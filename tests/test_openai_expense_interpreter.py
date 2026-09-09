@@ -540,6 +540,7 @@ async def test_untrusted_message_is_separate_from_system_instruction(message: st
         "schema": EXPENSE_INTERPRETATION_SCHEMA,
     }
     assert call["store"] is False
+    assert call["max_output_tokens"] == 600
 
 
 @pytest.mark.parametrize(

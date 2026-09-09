@@ -37,6 +37,10 @@ from oink_finai.services.interpretation_errors import (
 )
 from oink_finai.services.openai_client import create_openai_client
 from oink_finai.services.openai_privacy import openai_private_operation
+from oink_finai.services.openai_usage import (
+    mark_openai_request_transmitted,
+    record_openai_response_usage,
+)
 
 OPENAI_QUERY_MODEL = "gpt-4.1-mini"
 _PROVIDER_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -51,6 +55,8 @@ class OpenAIExpenseQueryInterpreter(ExpenseQueryInterpreter):
         api_key: str | None,
         timeout_seconds: float,
         timezone: str | ZoneInfo,
+        model: str = OPENAI_QUERY_MODEL,
+        max_output_tokens: int = 600,
         client: Any | None = None,
     ) -> None:
         if (
@@ -60,6 +66,11 @@ class OpenAIExpenseQueryInterpreter(ExpenseQueryInterpreter):
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
+            or not isinstance(model, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model)
+            or isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 64 <= max_output_tokens <= 4096
         ):
             raise InterpretationConfigurationError()
         if isinstance(timezone, ZoneInfo):
@@ -72,6 +83,8 @@ class OpenAIExpenseQueryInterpreter(ExpenseQueryInterpreter):
                 raise InterpretationConfigurationError() from exc
             self._timezone_name = timezone
         self._timeout_seconds = timeout_seconds
+        self._model = model
+        self._max_output_tokens = max_output_tokens
         try:
             with openai_private_operation():
                 self._client = (
@@ -92,14 +105,17 @@ class OpenAIExpenseQueryInterpreter(ExpenseQueryInterpreter):
         with openai_private_operation():
             try:
                 async with asyncio.timeout(self._timeout_seconds):
+                    await mark_openai_request_transmitted()
                     response = await self._client.responses.parse(
-                        model=OPENAI_QUERY_MODEL,
+                        model=self._model,
                         instructions=self._build_instructions(local_reference),
                         input=[{"role": "user", "content": message}],
                         text_format=OpenAIExpenseQueryTransport,
                         store=False,
                         temperature=0,
+                        max_output_tokens=self._max_output_tokens,
                     )
+                    record_openai_response_usage(response)
             except (TimeoutError, openai.APITimeoutError, httpx.TimeoutException) as exc:
                 failure = self._error(
                     InterpretationTimeoutError,
