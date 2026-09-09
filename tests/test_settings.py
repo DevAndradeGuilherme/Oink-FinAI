@@ -32,6 +32,9 @@ def test_settings_loads_env_example(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.expense_processing_max_attempts == 3
     assert settings.expense_retry_base_seconds == 0.5
     assert settings.expense_retry_max_seconds == 5.0
+    assert settings.log_format == "console"
+    assert settings.log_level == "INFO"
+    assert settings.log_include_traceback is False
 
 
 def test_default_openai_models_and_private_key_repr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,6 +176,11 @@ def test_production_settings_accept_a_complete_safe_configuration() -> None:
         ("WORKER_HEARTBEAT_INTERVAL_SECONDS", "0"),
         ("WORKER_HEARTBEAT_RETENTION_DAYS", "0"),
         ("WORKER_HEARTBEAT_ID_PATH", "../unsafe"),
+        ("LOG_LEVEL", "VERBOSE"),
+        ("LOG_FORMAT", "plaintext"),
+        ("OPERATIONAL_CHECK_DATABASE_TIMEOUT_SECONDS", "0"),
+        ("OPERATIONAL_QUEUE_WARNING_COUNT", "0"),
+        ("OPERATIONAL_OUTBOX_CRITICAL_AGE_SECONDS", "0"),
     ],
 )
 def test_unsafe_usage_limits_are_rejected(
@@ -207,6 +215,21 @@ def test_incoherent_heartbeat_thresholds_are_rejected() -> None:
         )
 
 
+def test_incoherent_operational_thresholds_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            operational_queue_warning_count=10,
+            operational_queue_critical_count=10,
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            operational_outbox_warning_age_seconds=300,
+            operational_outbox_critical_age_seconds=300,
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -225,6 +248,8 @@ def test_incoherent_heartbeat_thresholds_are_rejected() -> None:
         {"evolution_base_url": "https://user:password@evolution.test"},
         {"evolution_instance": "your-instance"},
         {"whatsapp_allowed_numbers": ""},
+        {"log_format": "console"},
+        {"log_include_traceback": True},
     ],
 )
 def test_production_rejects_unsafe_configuration(overrides: dict[str, object]) -> None:

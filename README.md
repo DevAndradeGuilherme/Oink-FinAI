@@ -168,3 +168,10 @@ O webhook possui limite bruto antes do parsing, timeout e concorrência por proc
 indica somente liveness; `/ready` e o alias compatível `/health` exigem PostgreSQL no head
 esperado. O worker mantém heartbeat durável e possui healthcheck sem ferramenta externa. Consulte
 [limites HTTP, semântica de saúde e diagnóstico](docs/http-health-and-worker-heartbeat.md).
+
+### Logs e diagnóstico operacional
+
+Produção emite JSON com allowlist rígida, correlação por UUID interno e rotação limitada pelo
+Docker. O comando `python -m oink_finai.operational_check` consulta somente o PostgreSQL com a role
+runtime e sinaliza backlog, heartbeat, outbox e reservas sem corrigir estado. Consulte
+[o contrato de logs e os checks operacionais](docs/structured-logging-and-operations.md).

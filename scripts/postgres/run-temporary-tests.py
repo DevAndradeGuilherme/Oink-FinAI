@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -213,13 +214,14 @@ def main() -> int:
                 encoding="utf-8",
                 newline="\n",
             )
+            print("Testing API, worker, grants, denials, defaults, and pg_dump...")
+            start_runtime(app_image, network, api, worker, runtime_env)
+            check_runtime_processes(api, worker)
+            exercise_operational_diagnostics(postgres, api, worker, database, runtime, temp, suffix)
             print("Testing PostgreSQL opt-in suite with fake providers...")
             exercise_postgres_pytest(
                 app_image, network, postgres, database, runtime, passwords[runtime]
             )
-            print("Testing API, worker, grants, denials, defaults, and pg_dump...")
-            start_runtime(app_image, network, api, worker, runtime_env)
-            check_runtime_processes(api, worker)
 
             exercise_runtime_dml(postgres, database, runtime, temp, suffix)
             exercise_denials(postgres, database, bootstrap, migrator, runtime, backup, temp, suffix)
@@ -488,6 +490,10 @@ def runtime_environment(url: str) -> str:
             "APP_ENV=production",
             "APP_DEBUG=false",
             "APP_RELOAD=false",
+            "PIPELINE_TIMING_ENABLED=true",
+            "LOG_FORMAT=json",
+            "LOG_LEVEL=INFO",
+            "LOG_INCLUDE_TRACEBACK=false",
             f"DATABASE_URL={url}",
             "OPENAI_API_KEY=sk-synthetic-runtime-validation-0123456789",
             "EVOLUTION_BASE_URL=https://synthetic.invalid",
@@ -563,6 +569,104 @@ def check_runtime_processes(api: str, worker: str) -> None:
             return
         time.sleep(1)
     raise CheckFailed("runtime healthchecks did not become ready within the startup window")
+
+
+def operational_report(api: str) -> tuple[int, dict[str, object]]:
+    result = docker(
+        "exec",
+        api,
+        "python",
+        "-m",
+        "oink_finai.operational_check",
+        check=False,
+    )
+    try:
+        payload = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        raise CheckFailed("operational check did not emit one sanitized JSON document") from None
+    if not isinstance(payload, dict):
+        raise CheckFailed("operational check emitted an invalid document")
+    return result.returncode, payload
+
+
+def exercise_operational_diagnostics(
+    postgres: str,
+    api: str,
+    worker: str,
+    database: str,
+    runtime: str,
+    temp: Path,
+    suffix: str,
+) -> None:
+    code, healthy = operational_report(api)
+    if code != 0 or healthy.get("status") != "ok":
+        raise CheckFailed(
+            "healthy disposable runtime failed operational diagnosis: "
+            + json.dumps(healthy, sort_keys=True)
+        )
+
+    docker("stop", "--time", "10", worker)
+    psql(
+        postgres,
+        database,
+        runtime,
+        temp,
+        "UPDATE worker_heartbeats "
+        "SET started_at = now() - interval '20 minutes', "
+        "last_seen_at = now() - interval '10 minutes', status = 'RUNNING'",
+    )
+    code, stale = operational_report(api)
+    stale_check = stale.get("checks", {}).get("worker_heartbeat", {})
+    if code != 2 or stale_check.get("status") != "critical" or stale_check.get("state") != "stale":
+        raise CheckFailed("stale worker was not reported as critical")
+
+    user_id = f"40000000-0000-4000-8000-{suffix.rjust(12, '0')}"
+    message_id = f"50000000-0000-4000-8000-{suffix.rjust(12, '0')}"
+    outbound_id = f"60000000-0000-4000-8000-{suffix.rjust(12, '0')}"
+    psql(
+        postgres,
+        database,
+        runtime,
+        temp,
+        f"""
+        INSERT INTO users (id, phone_number)
+        VALUES ('{user_id}', 'operational-{suffix}');
+        INSERT INTO processed_messages
+            (id, provider, instance_id, external_message_id, user_id, accepted_text,
+             message_timestamp, status, available_at, processing_attempts, source_type, created_at)
+        VALUES
+            ('{message_id}', 'synthetic', '{suffix}', 'operational-{suffix}', '{user_id}',
+             'synthetic', now() - interval '15 minutes', 'PENDING',
+             now() - interval '15 minutes', 0, 'TEXT', now() - interval '15 minutes');
+        INSERT INTO outbound_messages
+            (id, user_id, processed_message_id, destination, content, content_type, kind,
+             dedup_key, status, available_at, attempt_count, created_at)
+        VALUES
+            ('{outbound_id}', '{user_id}', '{message_id}', 'synthetic', 'synthetic', 'TEXT',
+             'PROCESSING_FAILURE', 'operational-{suffix}', 'UNKNOWN', now(), 1,
+             now() - interval '15 minutes');
+        """,
+    )
+    code, attention = operational_report(api)
+    checks = attention.get("checks", {})
+    if (
+        code != 2
+        or checks.get("processing_queue", {}).get("status") != "critical"
+        or checks.get("outbox_unknown", {}).get("status") != "warning"
+        or checks.get("outbox_unknown", {}).get("count") != 1
+    ):
+        raise CheckFailed("old queue or UNKNOWN outbox diagnosis is incorrect")
+    psql(
+        postgres,
+        database,
+        runtime,
+        temp,
+        f"""
+        DELETE FROM outbound_messages WHERE id = '{outbound_id}';
+        DELETE FROM processed_messages WHERE id = '{message_id}';
+        DELETE FROM users WHERE id = '{user_id}';
+        """,
+    )
 
 
 def psql(

@@ -1,4 +1,7 @@
 import asyncio
+import io
+import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from oink_finai.api.middleware import EVOLUTION_WEBHOOK_PATH, EvolutionWebhookGuardMiddleware
 from oink_finai.database.base import Base
 from oink_finai.database.models import User
+from oink_finai.observability import SafeJsonFormatter
 
 
 def scope(*, content_length: bytes | None = None) -> dict[str, object]:
@@ -207,6 +211,46 @@ async def test_timeout_during_body_read_returns_sanitized_503() -> None:
     )
     await guard(scope(), never_returns, send)
     assert status_of(sent) == 503
+
+
+async def test_webhook_access_log_contains_only_fixed_route_status_and_duration() -> None:
+    private = b"private-body-5511999999999"
+    stream = io.StringIO()
+    target = logging.getLogger("oink_finai.api.middleware")
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(SafeJsonFormatter("api"))
+    previous_handlers = list(target.handlers)
+    previous_level = target.level
+    previous_propagate = target.propagate
+    try:
+        target.handlers[:] = [handler]
+        target.setLevel(logging.INFO)
+        target.propagate = False
+        guard = EvolutionWebhookGuardMiddleware(
+            draining_app([]),
+            max_body_bytes=64,
+            timeout_seconds=1,
+            max_concurrency=1,
+            log_requests=True,
+        )
+        sent = await invoke(
+            guard,
+            [{"type": "http.request", "body": private, "more_body": False}],
+            content_length=str(len(private)).encode(),
+        )
+    finally:
+        target.handlers[:] = previous_handlers
+        target.setLevel(previous_level)
+        target.propagate = previous_propagate
+
+    payload = json.loads(stream.getvalue())
+    assert status_of(sent) == 200
+    assert payload["event"] == "webhook_http_completed"
+    assert payload["method"] == "POST"
+    assert payload["route"] == EVOLUTION_WEBHOOK_PATH
+    assert payload["status_code"] == 200
+    assert payload["duration_ms"] >= 0
+    assert private.decode() not in stream.getvalue()
 
 
 @pytest_asyncio.fixture

@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     app_reload: bool = False
     pipeline_timing_enabled: bool = False
     app_release: str | None = Field(default=None, max_length=128)
+    log_format: Literal["json", "console"] = "json"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_include_traceback: bool = False
     database_url: SecretStr = SecretStr("postgresql+asyncpg://oink:oink@localhost:5432/oink")
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
     default_timezone: str = "America/Sao_Paulo"
@@ -91,6 +94,17 @@ class Settings(BaseSettings):
     worker_heartbeat_database_timeout_seconds: float = Field(default=3.0, gt=0, le=10)
     worker_heartbeat_retention_days: int = Field(default=7, ge=1, le=90)
     worker_heartbeat_id_path: str = "/tmp/oink-finai-worker-id"
+    operational_check_database_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=10, allow_inf_nan=False
+    )
+    operational_queue_warning_count: int = Field(default=25, ge=1, le=10_000)
+    operational_queue_critical_count: int = Field(default=100, ge=2, le=100_000)
+    operational_queue_warning_age_seconds: float = Field(default=120, gt=0, le=86_400)
+    operational_queue_critical_age_seconds: float = Field(default=600, gt=0, le=604_800)
+    operational_outbox_warning_count: int = Field(default=10, ge=1, le=10_000)
+    operational_outbox_critical_count: int = Field(default=50, ge=2, le=100_000)
+    operational_outbox_warning_age_seconds: float = Field(default=60, gt=0, le=86_400)
+    operational_outbox_critical_age_seconds: float = Field(default=300, gt=0, le=604_800)
     expense_processing_max_attempts: int = Field(default=4, ge=1, le=10)
     expense_retry_base_seconds: float = Field(default=30.0, gt=0, le=3600)
     expense_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)
@@ -168,6 +182,20 @@ class Settings(BaseSettings):
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.app_release
         ):
             raise ValueError("APP_RELEASE must be an opaque identifier")
+        if self.operational_queue_warning_count >= self.operational_queue_critical_count:
+            raise ValueError("operational queue warning count must be below critical")
+        if (
+            self.operational_queue_warning_age_seconds
+            >= self.operational_queue_critical_age_seconds
+        ):
+            raise ValueError("operational queue warning age must be below critical")
+        if self.operational_outbox_warning_count >= self.operational_outbox_critical_count:
+            raise ValueError("operational outbox warning count must be below critical")
+        if (
+            self.operational_outbox_warning_age_seconds
+            >= self.operational_outbox_critical_age_seconds
+        ):
+            raise ValueError("operational outbox warning age must be below critical")
         self._validate_usage_limits()
 
         try:
@@ -184,6 +212,8 @@ class Settings(BaseSettings):
             raise ValueError("debug and reload must be disabled in production")
         if self.whatsapp_self_test_enabled:
             raise ValueError("WhatsApp self-test must be disabled in production")
+        if self.log_format != "json" or self.log_include_traceback:
+            raise ValueError("production logging must use JSON without tracebacks")
 
         self._require_production_secret("OPENAI_API_KEY", self.openai_api_key, minimum=20)
         self._require_production_secret("EVOLUTION_API_KEY", self.evolution_api_key, minimum=16)

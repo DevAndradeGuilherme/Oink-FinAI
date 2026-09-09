@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -8,11 +9,19 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from oink_finai.config.migration import migration_database_url
 from oink_finai.database import models  # noqa: F401
 from oink_finai.database.base import Base
+from oink_finai.observability import configure_application_logging
 
 config = context.config
 config.set_main_option("sqlalchemy.url", migration_database_url().replace("%", "%%"))
 
-if config.config_file_name is not None:
+if os.environ.get("APP_ENV", "development").strip().casefold() == "production":
+    configure_application_logging(
+        log_format="json",
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        service="migrate",
+        include_traceback=False,
+    )
+elif config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

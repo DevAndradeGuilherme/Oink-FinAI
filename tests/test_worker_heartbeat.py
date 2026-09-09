@@ -119,22 +119,26 @@ async def test_start_removes_only_records_older_than_retention(
 
 
 async def test_periodic_task_writes_by_interval_and_marks_stopping() -> None:
+    stop = asyncio.Event()
+
     class FakeHeartbeat:
         def __init__(self) -> None:
             self.beats = 0
             self.stopping_calls = 0
+            self.two_beats = asyncio.Event()
 
         async def beat(self, _worker_id):
             self.beats += 1
+            if self.beats >= 2:
+                self.two_beats.set()
+                stop.set()
 
         async def stopping(self, _worker_id):
             self.stopping_calls += 1
 
     fake = FakeHeartbeat()
-    stop = asyncio.Event()
     task = asyncio.create_task(_maintain_heartbeat(fake, uuid4(), stop, 0.01))  # type: ignore[arg-type]
-    await asyncio.sleep(0.035)
-    stop.set()
+    await asyncio.wait_for(fake.two_beats.wait(), timeout=0.5)
     await task
-    assert 2 <= fake.beats <= 4
+    assert fake.beats == 2
     assert fake.stopping_calls == 1

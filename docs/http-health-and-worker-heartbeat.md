@@ -97,3 +97,7 @@ Em restart automático do daemon, `depends_on` não é uma barreira reaplicada. 
 release deve executar novamente `docker compose ... up -d`, conferir o job one-shot e os
 healthchecks. Não diagnostique com `docker inspect` completo ou dump de ambiente, pois isso pode
 expor segredos.
+
+Backlog não participa de `/ready`. Use o comando observacional descrito em
+[`structured-logging-and-operations.md`](structured-logging-and-operations.md) para verificar
+filas, locks, outbox e ledger sem alterar estado.

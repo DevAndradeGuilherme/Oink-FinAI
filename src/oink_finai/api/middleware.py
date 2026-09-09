@@ -1,8 +1,13 @@
 import asyncio
+import logging
+import time
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from oink_finai.observability import emit_event
+
 EVOLUTION_WEBHOOK_PATH = "/api/v1/webhooks/evolution"
+logger = logging.getLogger(__name__)
 
 
 class _BodyTooLarge(Exception):
@@ -23,11 +28,13 @@ class EvolutionWebhookGuardMiddleware:
         max_body_bytes: int,
         timeout_seconds: float,
         max_concurrency: int,
+        log_requests: bool = False,
     ) -> None:
         self._app = app
         self._max_body_bytes = max_body_bytes
         self._timeout_seconds = timeout_seconds
         self._max_concurrency = max_concurrency
+        self._log_requests = log_requests
         self._active_requests = 0
         self._capacity_lock = asyncio.Lock()
 
@@ -36,18 +43,16 @@ class EvolutionWebhookGuardMiddleware:
             await self._app(scope, receive, send)
             return
 
-        content_length = self._content_length(scope)
-        if content_length is None:
-            await self._respond(send, 400, b'{"detail":"invalid request"}')
-            return
-        if content_length > self._max_body_bytes:
-            await self._respond(send, 413, b'{"detail":"request too large"}')
-            return
-        if not await self._try_acquire_capacity():
-            await self._respond(send, 503, b'{"detail":"temporarily unavailable"}')
-            return
-
+        started_at = time.perf_counter()
+        status_code = 500
+        acquired = False
         received_bytes = 0
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
 
         async def limited_receive() -> Message:
             nonlocal received_bytes
@@ -61,17 +66,46 @@ class EvolutionWebhookGuardMiddleware:
             return message
 
         try:
+            content_length = self._content_length(scope)
+            if content_length is None:
+                await self._respond(tracked_send, 400, b'{"detail":"invalid request"}')
+                return
+            if content_length > self._max_body_bytes:
+                await self._respond(tracked_send, 413, b'{"detail":"request too large"}')
+                return
+            if not await self._try_acquire_capacity():
+                await self._respond(tracked_send, 503, b'{"detail":"temporarily unavailable"}')
+                return
+            acquired = True
             try:
                 async with asyncio.timeout(self._timeout_seconds):
-                    await self._app(scope, limited_receive, send)
+                    await self._app(scope, limited_receive, tracked_send)
             except _BodyTooLarge:
-                await self._respond(send, 413, b'{"detail":"request too large"}')
+                await self._respond(tracked_send, 413, b'{"detail":"request too large"}')
             except _ClientDisconnected:
-                await self._respond(send, 400, b'{"detail":"invalid request"}')
+                await self._respond(tracked_send, 400, b'{"detail":"invalid request"}')
             except TimeoutError:
-                await self._respond(send, 503, b'{"detail":"temporarily unavailable"}')
+                await self._respond(tracked_send, 503, b'{"detail":"temporarily unavailable"}')
         finally:
-            await self._release_capacity()
+            if acquired:
+                await self._release_capacity()
+            if self._log_requests:
+                emit_event(
+                    logger,
+                    logging.INFO,
+                    "webhook_http_completed",
+                    method="POST",
+                    route=EVOLUTION_WEBHOOK_PATH,
+                    status_code=status_code,
+                    duration_ms=round(max(0.0, time.perf_counter() - started_at) * 1000, 3),
+                    outcome=(
+                        "success"
+                        if status_code < 400
+                        else "unavailable"
+                        if status_code == 503
+                        else "rejected"
+                    ),
+                )
 
     async def _try_acquire_capacity(self) -> bool:
         async with self._capacity_lock:

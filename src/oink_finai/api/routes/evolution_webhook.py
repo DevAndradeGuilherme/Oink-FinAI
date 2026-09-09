@@ -78,8 +78,12 @@ async def evolution_webhook(
     settings = get_settings()
     correlation_id = uuid4()
     timing = PipelineTiming(settings.pipeline_timing_enabled)
-    timing.event("webhook_received", correlation_id)
-    async with timing.span(None, "webhook_completed", correlation_id):
+    timing_fields = {
+        "processed_message_id": correlation_id,
+        "operation": "INBOUND_MESSAGE",
+    }
+    timing.event("webhook_received", correlation_id, **timing_fields)
+    async with timing.span(None, "webhook_completed", correlation_id, **timing_fields):
         return await _handle_evolution_webhook(
             payload, session, provider, correlation_id, timing, settings
         )

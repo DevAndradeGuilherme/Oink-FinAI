@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
+from oink_finai.observability import configure_application_logging, emit_event
 from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
 from oink_finai.repositories import SQLAlchemyExpenseQueryExecutor
 from oink_finai.services.audio_transcriber_factory import create_audio_transcriber
@@ -51,17 +52,26 @@ async def _close_safely(name: str, close: Callable[[], Awaitable[None]]) -> None
     try:
         await close()
     except Exception as exc:
-        logger.warning(
-            "Worker resource close failed",
-            extra={"resource": name, "error_type": type(exc).__name__},
+        emit_event(
+            logger,
+            logging.WARNING,
+            "worker_resource_close_failed",
+            operation=name,
+            exception_class=type(exc).__name__,
         )
 
 
 async def _heartbeat_safely(code: str, operation: Callable[[], Awaitable[object]]) -> None:
     try:
         await operation()
-    except Exception:
-        logger.warning("Worker heartbeat operation failed", extra={"error_code": code})
+    except Exception as exc:
+        emit_event(
+            logger,
+            logging.WARNING,
+            "worker_heartbeat_failed",
+            error_code=code,
+            exception_class=type(exc).__name__,
+        )
 
 
 async def _maintain_heartbeat(
@@ -245,7 +255,12 @@ async def run_worker() -> None:
                     delivery.send,
                 )
             except Exception as exc:
-                logger.error("Worker iteration failed", extra={"error_type": type(exc).__name__})
+                emit_event(
+                    logger,
+                    logging.ERROR,
+                    "worker_iteration_failed",
+                    exception_class=type(exc).__name__,
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=settings.worker_poll_interval_seconds)
             except TimeoutError:
@@ -264,7 +279,13 @@ async def run_worker() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    settings = get_settings()
+    configure_application_logging(
+        log_format=settings.log_format,
+        level=settings.log_level,
+        service="worker",
+        include_traceback=settings.log_include_traceback,
+    )
     asyncio.run(run_worker())
 
 

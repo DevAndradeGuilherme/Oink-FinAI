@@ -25,10 +25,12 @@ class OutboundMessageClaim:
     claim_token: UUID
     correlation_id: UUID | None = None
     attempt_number: int = 0
+    processed_message_id: UUID | None = None
 
 
 @dataclass(frozen=True)
 class OutboundDeliveryData:
+    outbound_message_id: UUID
     destination: str
     content: str
     content_type: str
@@ -36,6 +38,9 @@ class OutboundDeliveryData:
     fallback_content: str | None
     attempt_count: int
     correlation_id: UUID
+    processed_message_id: UUID | None
+    sequence_no: int | None
+    sequence_count: int | None
 
 
 class OutboxDeliveryService:
@@ -92,7 +97,11 @@ class OutboxDeliveryService:
                 correlation_id = self._correlation_id(message.dedup_key, message.id)
                 claims.append(
                     OutboundMessageClaim(
-                        message.id, token, correlation_id, message.attempt_count + 1
+                        message.id,
+                        token,
+                        correlation_id,
+                        message.attempt_count + 1,
+                        message.processed_message_id,
                     )
                 )
             timing_data = [
@@ -100,17 +109,37 @@ class OutboxDeliveryService:
                     claim.correlation_id,
                     claim.attempt_number,
                     message.available_at,
+                    claim.message_id,
+                    claim.processed_message_id,
+                    message.sequence_no,
+                    message.sequence_count,
                 )
                 for claim, message in zip(claims, messages, strict=True)
             ]
-        for correlation_id, attempt_number, available_at in timing_data:
+        for (
+            correlation_id,
+            attempt_number,
+            available_at,
+            outbound_message_id,
+            processed_message_id,
+            sequence_no,
+            sequence_count,
+        ) in timing_data:
             assert correlation_id is not None
-            self._timing.event("outbox_claimed", correlation_id, attempt_number=attempt_number)
+            fields = {
+                "attempt_number": attempt_number,
+                "outbound_message_id": outbound_message_id,
+                "processed_message_id": processed_message_id,
+                "operation": "OUTBOUND_DELIVERY",
+                "sequence_no": sequence_no,
+                "sequence_count": sequence_count,
+            }
+            self._timing.event("outbox_claimed", correlation_id, **fields)
             self._timing.event(
                 "outbox_queue_wait_completed",
                 correlation_id,
                 duration_ms=self._timing.elapsed_ms(available_at, now),
-                attempt_number=attempt_number,
+                **fields,
             )
         return claims
 
@@ -124,6 +153,11 @@ class OutboxDeliveryService:
             message.correlation_id,
             attempt_number=message.attempt_count,
             stage="send",
+            operation="OUTBOUND_DELIVERY",
+            outbound_message_id=message.outbound_message_id,
+            processed_message_id=message.processed_message_id,
+            sequence_no=message.sequence_no,
+            sequence_count=message.sequence_count,
         )
         async with send_span:
             try:
@@ -176,6 +210,11 @@ class OutboxDeliveryService:
             message.correlation_id,
             attempt_number=message.attempt_count,
             outcome="success",
+            operation="OUTBOUND_DELIVERY",
+            outbound_message_id=message.outbound_message_id,
+            processed_message_id=message.processed_message_id,
+            sequence_no=message.sequence_no,
+            sequence_count=message.sequence_count,
         )
 
     async def _deliver(self, message: OutboundDeliveryData) -> str | None:
@@ -215,6 +254,7 @@ class OutboxDeliveryService:
                 for action in (message.actions or [])
             )
             return OutboundDeliveryData(
+                outbound_message_id=message.id,
                 destination=message.destination,
                 content=message.content,
                 content_type=message.content_type,
@@ -222,6 +262,9 @@ class OutboxDeliveryService:
                 fallback_content=message.fallback_content,
                 attempt_count=message.attempt_count,
                 correlation_id=self._correlation_id(message.dedup_key, message.id),
+                processed_message_id=message.processed_message_id,
+                sequence_no=message.sequence_no,
+                sequence_count=message.sequence_count,
             )
 
     async def _retry(self, claim: OutboundMessageClaim, attempt_count: int) -> datetime:

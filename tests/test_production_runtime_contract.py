@@ -70,6 +70,13 @@ def test_production_compose_isolated_runtime_contract() -> None:
     assert "oink_finai.worker_healthcheck" in worker
     assert "curl" not in api + worker and "wget" not in api + worker
     assert "start_period: 45s" in worker
+    assert compose.count("logging: *bounded-logging") == 4
+    assert "driver: local" in compose
+    assert 'max-size: "10m"' in compose
+    assert 'max-file: "5"' in compose
+    assert "LOG_FORMAT: json" in api and "LOG_FORMAT: json" in migrate
+    assert 'LOG_INCLUDE_TRACEBACK: "false"' in api + migrate
+    assert 'PIPELINE_TIMING_ENABLED: "true"' in api
 
 
 def test_manual_postgres_admin_service_is_isolated() -> None:

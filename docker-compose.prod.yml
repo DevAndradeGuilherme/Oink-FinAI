@@ -1,11 +1,18 @@
 x-image: &image
   image: ${OINK_IMAGE_REPOSITORY:?OINK_IMAGE_REPOSITORY is required}@${OINK_IMAGE_DIGEST:?OINK_IMAGE_DIGEST is required}
 
+x-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
     image: ${POSTGRES_IMAGE_REPOSITORY:?POSTGRES_IMAGE_REPOSITORY is required}@${POSTGRES_IMAGE_DIGEST:?POSTGRES_IMAGE_DIGEST is required}
     scale: 1
     restart: unless-stopped
+    logging: *bounded-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
@@ -29,11 +36,15 @@ services:
     <<: *image
     scale: 1
     restart: "no"
+    logging: *bounded-logging
     command: ["alembic", "upgrade", "head"]
     env_file:
       - ${OINK_MIGRATION_ENV_FILE:?OINK_MIGRATION_ENV_FILE must identify the migration-only environment file}
     environment:
       APP_ENV: production
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+      LOG_INCLUDE_TRACEBACK: "false"
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,6 +57,7 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 330s
+    logging: *bounded-logging
     command: ["uvicorn", "oink_finai.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - ${OINK_RUNTIME_ENV_FILE:?OINK_RUNTIME_ENV_FILE must identify the runtime-only environment file}
@@ -53,7 +65,10 @@ services:
       APP_ENV: production
       APP_DEBUG: "false"
       APP_RELOAD: "false"
-      PIPELINE_TIMING_ENABLED: "false"
+      PIPELINE_TIMING_ENABLED: "true"
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+      LOG_INCLUDE_TRACEBACK: "false"
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -83,6 +98,7 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 330s
+    logging: *bounded-logging
     command: ["python", "-m", "oink_finai.worker"]
     env_file:
       - ${OINK_RUNTIME_ENV_FILE:?OINK_RUNTIME_ENV_FILE must identify the runtime-only environment file}

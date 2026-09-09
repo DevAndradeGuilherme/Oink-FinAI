@@ -88,6 +88,12 @@ arquivo externo de ambiente e recrie API e worker; valores não são recarregado
 A rotação do segredo de webhook exige coordenação com a Evolution e uma janela operacional
 planejada, pois esta fase não implementa aceitação simultânea de segredo antigo e novo.
 
+API, worker e migration usam JSON estruturado em produção. PostgreSQL e os três serviços possuem
+rotação Docker de 10 MiB por arquivo e cinco arquivos por container. Para diagnóstico somente
+leitura, execute `python -m oink_finai.operational_check` com o ambiente runtime. Campos, eventos,
+exit codes e thresholds estão em
+[`structured-logging-and-operations.md`](structured-logging-and-operations.md).
+
 ## Operação do job de migration
 
 Para inspecionar o resultado do job one-shot:
