@@ -1,16 +1,18 @@
 # Runtime Docker de produção
 
-Esta configuração cobre somente a fundação do runtime. Ela ainda não inclui Named Tunnel,
-backup automatizado, papéis PostgreSQL separados, quotas, rate limiting, heartbeat, alertas,
-retenção/LGPD ou CI/CD.
+Esta configuração cobre a fundação do runtime e as identidades PostgreSQL separadas. Ela ainda
+não inclui Named Tunnel, backup automatizado, quotas, rate limiting, heartbeat, alertas,
+retenção/LGPD ou CI/CD. O procedimento de banco está em
+[`postgres-least-privilege.md`](postgres-least-privilege.md).
 
 ## Arquivos e pré-requisitos
 
 Produção usa **somente** `docker-compose.prod.yml`; não combine esse arquivo com
 `docker-compose.yml`, pois o segundo contém bind mounts, portas e `--reload` exclusivos do
-desenvolvimento. O arquivo indicado por `OINK_ENV_FILE` deve existir apenas no host, fora do
-repositório, ter permissão restritiva e conter todas as variáveis da aplicação. Ele não é
-incorporado à imagem.
+desenvolvimento. Os arquivos indicados por `OINK_RUNTIME_ENV_FILE` e
+`OINK_MIGRATION_ENV_FILE` devem existir apenas no host, fora do repositório, e ter permissão
+restritiva. O primeiro contém a configuração da API/worker e somente a URL de runtime; o segundo
+contém somente `MIGRATION_DATABASE_URL`. Eles não são incorporados à imagem.
 
 Defina no ambiente do operador:
 
@@ -18,17 +20,19 @@ Defina no ambiente do operador:
   aplicação;
 - `POSTGRES_IMAGE_REPOSITORY` e `POSTGRES_IMAGE_DIGEST`: repositório e digest `sha256:` da
   imagem PostgreSQL;
-- `OINK_ENV_FILE`: caminho absoluto do arquivo de ambiente de produção;
-- `POSTGRES_DB`, `POSTGRES_USER` e `POSTGRES_PASSWORD`: bootstrap do PostgreSQL;
-- `MIGRATION_DATABASE_URL`: URL usada exclusivamente pelo job de migration. Nesta fase ela
-  pode apontar para a mesma credencial da aplicação; uma role privilegiada separada poderá
-  substituí-la sem mudar o Compose.
+- `OINK_RUNTIME_ENV_FILE`: arquivo externo exclusivo de API e worker;
+- `OINK_MIGRATION_ENV_FILE`: arquivo externo exclusivo do migrator;
+- `POSTGRES_DB` e `POSTGRES_USER`: banco da aplicação e identidade bootstrap;
+- `POSTGRES_BOOTSTRAP_PASSWORD_FILE`: arquivo externo com o segredo bootstrap, nunca uma senha
+  literal no Compose.
 
-Também são obrigatórios no arquivo de ambiente `DATABASE_URL`, `OPENAI_API_KEY`,
+Também são obrigatórios no arquivo de runtime `DATABASE_URL`, `OPENAI_API_KEY`,
 `EVOLUTION_BASE_URL`, `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE`,
 `EVOLUTION_WEBHOOK_SECRET` e `WHATSAPP_ALLOWED_NUMBERS`. Use valores fortes e não reutilize
 os exemplos. `EVOLUTION_BASE_URL` é uma comunicação externa e precisa usar HTTPS. A URL
-interna `DATABASE_URL` pode usar a rede Docker privada sem TLS nesta fase.
+interna `DATABASE_URL` usa a role runtime na rede Docker privada. O arquivo de migration contém
+somente `MIGRATION_DATABASE_URL`, usando a role migrator. O Alembic em produção falha se essa
+variável estiver ausente e nunca usa `DATABASE_URL` como fallback.
 
 Renderize e revise a configuração efetiva antes do deploy:
 

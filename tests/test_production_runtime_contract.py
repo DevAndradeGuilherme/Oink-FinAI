@@ -51,12 +51,52 @@ def test_production_compose_isolated_runtime_contract() -> None:
     assert "ports:" not in worker and "ports:" not in migrate and "ports:" not in postgres
     assert 'command: ["alembic", "upgrade", "head"]' in migrate
     assert 'restart: "no"' in migrate
+    assert "OINK_MIGRATION_ENV_FILE" in migrate
+    assert "OINK_RUNTIME_ENV_FILE" not in migrate
+    assert "DATABASE_URL:" not in migrate
+    assert "OPENAI_" not in migrate and "EVOLUTION_" not in migrate
+    assert "POSTGRES_PASSWORD_FILE" in postgres
+    assert "POSTGRES_PASSWORD:" not in postgres
+    assert "--auth-local=scram-sha-256" in postgres
     for process in (api, worker):
         assert "scale: 1" in process
         assert "init: true" in process
         assert "stop_grace_period: 330s" in process
         assert "condition: service_completed_successfully" in process
         assert "replicas: 1" in process
+        assert "OINK_RUNTIME_ENV_FILE" in process
+        assert "MIGRATION_DATABASE_URL" not in process
+
+
+def test_manual_postgres_admin_service_is_isolated() -> None:
+    compose = (ROOT / "docker-compose.postgres-admin.yml").read_text(encoding="utf-8")
+    admin = service_block(compose, "postgres-admin")
+
+    assert 'profiles: ["postgres-admin"]' in admin
+    assert 'restart: "no"' in admin
+    assert "ports:" not in admin
+    assert "OINK_RUNTIME_ENV_FILE" not in admin
+    assert "OINK_MIGRATION_ENV_FILE" not in admin
+    assert "OPENAI_" not in admin and "EVOLUTION_" not in admin
+    assert "/run/secrets/postgres_bootstrap_password" in admin
+    assert "./scripts/postgres:/opt/oink/postgres:ro" in admin
+
+
+def test_postgres_provisioning_contract_has_no_embedded_passwords_or_reassign_owned() -> None:
+    script_directory = ROOT / "scripts" / "postgres"
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(script_directory.glob("*"))
+        if path.is_file()
+    )
+
+    assert "REASSIGN OWNED" not in sources.upper()
+    assert "PASSWORD NULL" in sources
+    assert "PASSWORD :'" not in sources
+    assert "PGPASSWORD=" not in sources
+    assert "ALLOW_EXISTING_DATABASE_ADAPTATION" in sources
+    assert "REVOKE ALL ON SCHEMA" in sources
+    assert "ALTER DEFAULT PRIVILEGES" in sources
 
 
 def test_image_declares_a_non_root_runtime_user() -> None:

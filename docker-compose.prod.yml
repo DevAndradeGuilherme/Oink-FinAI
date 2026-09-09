@@ -1,12 +1,5 @@
-x-app: &app
+x-image: &image
   image: ${OINK_IMAGE_REPOSITORY:?OINK_IMAGE_REPOSITORY is required}@${OINK_IMAGE_DIGEST:?OINK_IMAGE_DIGEST is required}
-  env_file:
-    - ${OINK_ENV_FILE:?OINK_ENV_FILE must identify the production environment file}
-  environment:
-    APP_ENV: production
-    APP_DEBUG: "false"
-    APP_RELOAD: "false"
-    PIPELINE_TIMING_ENABLED: "false"
 
 services:
   postgres:
@@ -16,9 +9,13 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+    secrets:
+      - postgres_bootstrap_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres/001-cluster-baseline.sql:/docker-entrypoint-initdb.d/001-cluster-baseline.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -29,16 +26,14 @@ services:
       - database
 
   migrate:
-    <<: *app
+    <<: *image
     scale: 1
     restart: "no"
     command: ["alembic", "upgrade", "head"]
+    env_file:
+      - ${OINK_MIGRATION_ENV_FILE:?OINK_MIGRATION_ENV_FILE must identify the migration-only environment file}
     environment:
       APP_ENV: production
-      APP_DEBUG: "false"
-      APP_RELOAD: "false"
-      PIPELINE_TIMING_ENABLED: "false"
-      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,12 +41,19 @@ services:
       - database
 
   api:
-    <<: *app
+    <<: *image
     scale: 1
     restart: unless-stopped
     init: true
     stop_grace_period: 330s
     command: ["uvicorn", "oink_finai.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - ${OINK_RUNTIME_ENV_FILE:?OINK_RUNTIME_ENV_FILE must identify the runtime-only environment file}
+    environment: &runtime_environment
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_RELOAD: "false"
+      PIPELINE_TIMING_ENABLED: "false"
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -76,12 +78,15 @@ services:
       replicas: 1
 
   worker:
-    <<: *app
+    <<: *image
     scale: 1
     restart: unless-stopped
     init: true
     stop_grace_period: 330s
     command: ["python", "-m", "oink_finai.worker"]
+    env_file:
+      - ${OINK_RUNTIME_ENV_FILE:?OINK_RUNTIME_ENV_FILE must identify the runtime-only environment file}
+    environment: *runtime_environment
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -98,3 +103,7 @@ networks:
 
 volumes:
   postgres_data:
+
+secrets:
+  postgres_bootstrap_password:
+    file: ${POSTGRES_BOOTSTRAP_PASSWORD_FILE:?POSTGRES_BOOTSTRAP_PASSWORD_FILE is required}

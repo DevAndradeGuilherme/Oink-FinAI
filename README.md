@@ -31,6 +31,8 @@ docker compose up --build
 Esse fluxo usa `docker-compose.yml` e é exclusivo de desenvolvimento. Em produção, use somente
 `docker-compose.prod.yml`, sem combiná-lo com o arquivo de desenvolvimento; veja o procedimento
 completo em [`docs/production-runtime.md`](docs/production-runtime.md).
+O provisionamento e a operação das quatro roles PostgreSQL estão em
+[`docs/postgres-least-privilege.md`](docs/postgres-least-privilege.md).
 
 Para manter API e worker como servicos permanentes gerenciados pelo Compose, use:
 
