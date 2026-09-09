@@ -180,6 +180,30 @@ def response(data: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(output_text=json.dumps(data, ensure_ascii=False))
 
 
+async def test_classifies_query_without_expense_fields_or_second_classification_call() -> None:
+    interpreter, client = make_interpreter(
+        response(
+            payload(
+                intent="QUERY",
+                amount=None,
+                amount_evidence=None,
+                description=None,
+                merchant=None,
+                category=None,
+                payment_method=None,
+                expense_date=None,
+                missing_fields=[],
+            )
+        )
+    )
+
+    result = await interpreter.interpret("Quanto gastei este mês?", reference_timestamp=REFERENCE)
+
+    assert result.intent is ExpenseIntent.QUERY
+    assert result.amount is result.description is None
+    assert len(client.responses.calls) == 1
+
+
 def api_status_error(status: int) -> APIStatusError:
     response_object = httpx.Response(
         status,

@@ -92,3 +92,20 @@ def test_clarification_retirement_migration_is_forward_only_and_normalizes_state
     assert "expires_at = NULL" in source
     downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
     assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()
+
+
+def test_query_pipeline_migration_is_linear_and_preserves_historical_rows() -> None:
+    source = (MIGRATIONS / "20260908_0012_durable_expense_queries.py").read_text()
+
+    assert 'down_revision: str | None = "20260908_0011"' in source
+    assert "QUERY_RESULT" in source and "QUERY_GUIDANCE" in source
+    assert 'sa.Column("classification_checkpoint", postgresql.JSONB(), nullable=True)' in source
+    assert 'sa.Column("query_plan_checkpoint", postgresql.JSONB(), nullable=True)' in source
+    assert 'sa.Column("query_result_checkpoint", postgresql.JSONB(), nullable=True)' in source
+    assert "processed_message_id" in source
+    assert "sequence_no" in source and "sequence_count" in source
+    assert "uq_outbound_message_processed_kind_sequence" in source
+    assert "UPDATE processed_messages" not in source
+    assert "DELETE FROM" not in source
+    downgrade = source.split("def downgrade() -> None:", maxsplit=1)[1]
+    assert "drop_" not in downgrade and "DELETE" not in downgrade.upper()

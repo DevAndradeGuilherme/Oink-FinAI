@@ -39,6 +39,7 @@ from oink_finai.domain.expense_limits import (
     EXPENSE_MERCHANT_MAX_LENGTH,
     EXPENSE_PAYMENT_METHOD_MAX_LENGTH,
 )
+from oink_finai.domain.expense_query import ExpenseQueryIntent
 from oink_finai.domain.monetary_value import MonetaryValueError, parse_monetary_value
 from oink_finai.providers.whatsapp.base import WhatsAppProvider
 from oink_finai.providers.whatsapp.evolution import (
@@ -47,6 +48,20 @@ from oink_finai.providers.whatsapp.evolution import (
 )
 from oink_finai.providers.whatsapp.media_errors import MediaError, MediaErrorCode
 from oink_finai.schemas.expense_interpretation import ExpenseInterpretation
+from oink_finai.schemas.expense_query import ExpenseQueryPlan
+from oink_finai.schemas.expense_query_checkpoint import (
+    ExpenseClassificationCheckpoint,
+    ExpenseQueryPlanCheckpoint,
+    ExpenseQueryResultCheckpoint,
+)
+from oink_finai.schemas.expense_query_messages import ExpenseQueryFormattingContext
+from oink_finai.schemas.expense_query_result import (
+    ExpenseAggregateResult,
+    ExpenseComparisonResult,
+    ExpenseGroupResult,
+    ExpenseListResult,
+    ExpenseQueryResult,
+)
 from oink_finai.schemas.image_checkpoint import ImageAnalysisCheckpoint
 from oink_finai.schemas.whatsapp import InboundMedia
 from oink_finai.services.audio_transcriber import AudioTranscriber, ValidatedAudio
@@ -57,6 +72,12 @@ from oink_finai.services.expense_commands import (
     parse_expense_command,
 )
 from oink_finai.services.expense_interpreter import ExpenseInterpreter
+from oink_finai.services.expense_query_executor import (
+    ExpenseQueryExecutionError,
+    ExpenseQueryExecutor,
+)
+from oink_finai.services.expense_query_interpreter import ExpenseQueryInterpreter
+from oink_finai.services.expense_query_result_formatter import ExpenseQueryResultFormatter
 from oink_finai.services.image_analysis_errors import ImageAnalysisError
 from oink_finai.services.image_analyzer import (
     ImageAnalyzer,
@@ -106,6 +127,16 @@ INCOMPLETE_EXPENSE_TEMPLATE = (
     "Envie novamente informando o que foi comprado ou pago e o valor.\n\n"
     "Exemplo: Gastei R$ 32,90 com gasolina."
 )
+QUERY_UNCLEAR_TEXT = (
+    "Não consegui entender a consulta. Reenvie uma pergunta completa, por exemplo: "
+    "Quanto gastei com alimentação este mês?"
+)
+QUERY_FAILURE_TEXT = (
+    "Não consegui consultar seus gastos agora. Reenvie a consulta em alguns minutos."
+)
+QUERY_INVALID_TEXT = (
+    "Não consegui processar essa consulta. Reenvie informando claramente o período e os filtros."
+)
 
 
 def utc_now() -> datetime:
@@ -137,6 +168,9 @@ class ExpenseProcessingService:
         media_provider: WhatsAppProvider | None = None,
         audio_transcriber_factory: Callable[[], AudioTranscriber] | None = None,
         image_analyzer_factory: Callable[[], ImageAnalyzer] | None = None,
+        query_interpreter_factory: Callable[[str], ExpenseQueryInterpreter] | None = None,
+        query_executor: ExpenseQueryExecutor | None = None,
+        query_formatter: ExpenseQueryResultFormatter | None = None,
         timing: PipelineTiming | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -150,6 +184,9 @@ class ExpenseProcessingService:
         self._media_provider = media_provider
         self._audio_transcriber_factory = audio_transcriber_factory
         self._image_analyzer_factory = image_analyzer_factory
+        self._query_interpreter_factory = query_interpreter_factory
+        self._query_executor = query_executor
+        self._query_formatter = query_formatter
         self._timing = timing or PipelineTiming(False)
 
     async def recover_stale(self, older_than: datetime) -> int:
@@ -247,7 +284,18 @@ class ExpenseProcessingService:
         message.next_attempt_at = None
         message.media_remote_jid = None
         user = await session.get(User, message.user_id)
-        await self._create_failure_notification(session, message, user)
+        if message.classification_intent is ExpenseIntent.QUERY and user is not None:
+            self._create_query_outbox_pages(
+                session,
+                message,
+                (QUERY_FAILURE_TEXT,),
+                kind=OutboundMessageKind.QUERY_GUIDANCE,
+                destination=user.phone_number,
+            )
+            message.query_page_count = 1
+            message.query_result_checkpoint = None
+        else:
+            await self._create_failure_notification(session, message, user)
 
     async def process(self, message_id: UUID) -> None:
         async with self._session_factory() as session:
@@ -293,12 +341,16 @@ class ExpenseProcessingService:
                 return
             text = message.accepted_text
             timestamp = message.message_timestamp
+            query_reference_timestamp = message.created_at
             timezone = user.timezone
             source_type = message.source_type
             transcribed_at = message.transcribed_at
             image_analyzed_at = message.image_analyzed_at
             image_analysis_payload = message.image_analysis
             media_caption = message.media_caption
+            classified_at = message.classified_at
+            classification_payload = message.classification_checkpoint
+            classification_intent = message.classification_intent
 
         if source_type == MessageSourceType.AUDIO and transcribed_at is None:
             text = await self._transcribe_audio(message_id)
@@ -345,34 +397,56 @@ class ExpenseProcessingService:
             return
 
         try:
-            interpreter = self._interpreter_factory(timezone)
-            interpretation = await self._interpret(
-                interpreter,
-                text,
-                timestamp=timestamp,
-                message=message,
-            )
-            self._validate_partial_interpretation(interpretation)
-            if image_checkpoint is not None:
-                interpretation = self._constrain_image_interpretation(
-                    image_checkpoint, interpretation
+            if classified_at is not None:
+                classification = ExpenseClassificationCheckpoint.from_payload(
+                    classification_payload
                 )
-            elif (
-                interpretation.intent is ExpenseIntent.CREATE_EXPENSE
-                and (interpretation.description is None or not interpretation.description.strip())
-                and (description := self._literal_description(text)) is not None
-            ):
-                interpretation = interpretation.model_copy(update={"description": description})
-            missing_required = self._missing_required_fields(
-                interpretation,
-                force_amount=(
-                    source_type != MessageSourceType.IMAGE
-                    and len(self._explicit_monetary_values(text)) > 1
-                ),
-            )
-            interpretation = interpretation.model_copy(update={"missing_fields": missing_required})
-            if not missing_required:
-                self._validate_interpretation(interpretation)
+                interpretation = classification.to_interpretation()
+                missing_required = list(classification.missing_fields)
+            else:
+                interpreter = self._interpreter_factory(timezone)
+                interpretation = await self._interpret(
+                    interpreter,
+                    text,
+                    timestamp=timestamp,
+                    message=message,
+                )
+                self._validate_partial_interpretation(interpretation)
+                if image_checkpoint is not None:
+                    interpretation = self._constrain_image_interpretation(
+                        image_checkpoint, interpretation
+                    )
+                    if interpretation.intent is ExpenseIntent.QUERY:
+                        interpretation = interpretation.model_copy(
+                            update={"intent": ExpenseIntent.UNCLEAR}
+                        )
+                elif (
+                    interpretation.intent is ExpenseIntent.CREATE_EXPENSE
+                    and (
+                        interpretation.description is None or not interpretation.description.strip()
+                    )
+                    and (description := self._literal_description(text)) is not None
+                ):
+                    interpretation = interpretation.model_copy(update={"description": description})
+                missing_required = self._missing_required_fields(
+                    interpretation,
+                    force_amount=(
+                        source_type != MessageSourceType.IMAGE
+                        and len(self._explicit_monetary_values(text)) > 1
+                    ),
+                )
+                interpretation = interpretation.model_copy(
+                    update={"missing_fields": missing_required}
+                )
+                if not missing_required:
+                    self._validate_interpretation(interpretation)
+                checkpointed = await self._checkpoint_classification(
+                    message_id, interpretation, message.processing_attempts
+                )
+                if checkpointed is None:
+                    return
+                interpretation = checkpointed
+                missing_required = list(interpretation.missing_fields)
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._retry_or_fail(message_id, InterpretationErrorCode.TIMEOUT.value)
@@ -386,6 +460,26 @@ class ExpenseProcessingService:
                 await self._retry_or_fail(message_id, self._error_code(exc))
             else:
                 await self._mark_failed(message_id, self._error_code(exc))
+            return
+        except (ValidationError, TypeError, ValueError):
+            if classification_intent is ExpenseIntent.QUERY:
+                await self._mark_query_failed(
+                    message_id,
+                    "CLASSIFICATION_INVALID_CHECKPOINT",
+                    attempt_number=message.processing_attempts,
+                )
+            else:
+                await self._mark_failed(message_id, "CLASSIFICATION_INVALID_CHECKPOINT")
+            return
+
+        if interpretation.intent is ExpenseIntent.QUERY:
+            await self._process_query(
+                message_id,
+                text,
+                timestamp=query_reference_timestamp,
+                timezone=timezone,
+                attempt_number=message.processing_attempts,
+            )
             return
 
         try:
@@ -462,6 +556,459 @@ class ExpenseProcessingService:
         ):
             return await interpreter.interpret(text, reference_timestamp=timestamp)
 
+    async def _checkpoint_classification(
+        self,
+        message_id: UUID,
+        interpretation: ExpenseInterpretation,
+        attempt_number: int,
+    ) -> ExpenseInterpretation | None:
+        checkpoint = ExpenseClassificationCheckpoint.from_interpretation(interpretation)
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.processing_attempts != attempt_number
+            ):
+                return None
+            if message.classified_at is not None:
+                return ExpenseClassificationCheckpoint.from_payload(
+                    message.classification_checkpoint
+                ).to_interpretation()
+            message.classification_intent = checkpoint.intent
+            message.classification_checkpoint = checkpoint.payload()
+            message.classified_at = self._now()
+            return checkpoint.to_interpretation()
+
+    async def _process_query(
+        self,
+        message_id: UUID,
+        text: str,
+        *,
+        timestamp: datetime,
+        timezone: str,
+        attempt_number: int,
+    ) -> None:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        formatting_timezone = self._timezone(timezone)
+        formatting_context = ExpenseQueryFormattingContext(
+            reference_date=timestamp.astimezone(formatting_timezone).date(),
+            timezone=formatting_timezone.key,
+        )
+        try:
+            plan = await self._query_plan(
+                message_id,
+                text,
+                timestamp=timestamp,
+                timezone=timezone,
+                attempt_number=attempt_number,
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._retry_or_fail(message_id, "QUERY_INTERPRETATION_TIMEOUT"))
+            raise
+        except InterpretationError as exc:
+            if self._is_transient(exc):
+                await self._retry_or_fail(message_id, self._query_error_code(exc))
+            else:
+                await self._mark_query_failed(
+                    message_id, self._query_error_code(exc), attempt_number=attempt_number
+                )
+            return
+        except (ValidationError, TypeError, ValueError):
+            await self._mark_query_failed(
+                message_id, "QUERY_PLAN_INVALID_CHECKPOINT", attempt_number=attempt_number
+            )
+            return
+
+        if plan.intent in {ExpenseQueryIntent.NOT_QUERY, ExpenseQueryIntent.QUERY_UNCLEAR}:
+            page_count = await self._complete_query_guidance(
+                message_id,
+                QUERY_UNCLEAR_TEXT,
+                status=ProcessedMessageStatus.PROCESSED,
+            )
+            if page_count is not None:
+                self._emit_query_completed(
+                    message_id,
+                    attempt_number=attempt_number,
+                    intent=plan.intent.value,
+                    page_count=page_count,
+                    outcome="success",
+                )
+            return
+        if self._query_executor is None or self._query_formatter is None:
+            await self._mark_query_failed(
+                message_id, "QUERY_CONFIGURATION_ERROR", attempt_number=attempt_number
+            )
+            return
+
+        try:
+            result = await self._checkpointed_query_execution(
+                message_id,
+                plan,
+                attempt_number=attempt_number,
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._retry_or_fail(message_id, "QUERY_EXECUTION_INTERRUPTED"))
+            raise
+        except ExpenseQueryExecutionError:
+            await self._mark_query_failed(
+                message_id, "QUERY_PLAN_INVALID", attempt_number=attempt_number
+            )
+            return
+        except DBAPIError:
+            await self._retry_or_fail(message_id, "QUERY_DATABASE_UNAVAILABLE")
+            return
+        except (ConnectionError, TimeoutError):
+            await self._retry_or_fail(message_id, "QUERY_DATABASE_UNAVAILABLE")
+            return
+        except (ValidationError, TypeError, ValueError):
+            await self._mark_query_failed(
+                message_id, "QUERY_RESULT_INVALID_CHECKPOINT", attempt_number=attempt_number
+            )
+            return
+
+        try:
+            with self._timing.span(
+                "query_formatting_started",
+                "query_formatting_completed",
+                message_id,
+                attempt_number=attempt_number,
+                stage="query_formatting",
+                intent=plan.intent.value,
+            ) as formatting_span:
+                formatted = self._query_formatter.format(result, context=formatting_context)
+                formatting_span.result(outcome="success", page_count=len(formatted.messages))
+        except (TypeError, ValueError):
+            await self._mark_query_failed(
+                message_id, "QUERY_FORMATTING_FAILED", attempt_number=attempt_number
+            )
+            return
+
+        try:
+            page_count = await self._complete_query_result(
+                message_id,
+                formatted.messages,
+                attempt_number=attempt_number,
+            )
+        except DBAPIError:
+            await self._retry_or_fail(message_id, "QUERY_DATABASE_UNAVAILABLE")
+            return
+        except (ConnectionError, TimeoutError):
+            await self._retry_or_fail(message_id, "QUERY_DATABASE_UNAVAILABLE")
+            return
+        if page_count is not None:
+            self._emit_query_completed(
+                message_id,
+                attempt_number=attempt_number,
+                intent=plan.intent.value,
+                page_count=page_count,
+                outcome="success",
+            )
+
+    async def _query_plan(
+        self,
+        message_id: UUID,
+        text: str,
+        *,
+        timestamp: datetime,
+        timezone: str,
+        attempt_number: int,
+    ) -> ExpenseQueryPlan:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None or message.status is not ProcessedMessageStatus.PROCESSING:
+                raise ValueError("query message is not processable")
+            if message.query_plan_created_at is not None:
+                return ExpenseQueryPlanCheckpoint.from_payload(message.query_plan_checkpoint).plan
+
+        if self._query_interpreter_factory is None:
+            raise ValueError("query interpreter is not configured")
+        interpreter = self._query_interpreter_factory(timezone)
+        async with self._timing.span(
+            "query_interpretation_started",
+            "query_interpretation_completed",
+            message_id,
+            attempt_number=attempt_number,
+            stage="query_interpretation",
+        ) as interpretation_span:
+            plan = await interpreter.interpret(text, reference_timestamp=timestamp)
+            interpretation_span.result(
+                outcome="success",
+                intent=plan.intent.value,
+                metric=plan.metric.value if plan.metric else None,
+                group=plan.group_by.value if plan.group_by else None,
+            )
+        return await self._checkpoint_query_plan(message_id, plan, attempt_number)
+
+    async def _checkpoint_query_plan(
+        self, message_id: UUID, plan: ExpenseQueryPlan, attempt_number: int
+    ) -> ExpenseQueryPlan:
+        checkpoint = ExpenseQueryPlanCheckpoint(plan=plan)
+        async with (
+            self._timing.span(
+                "query_plan_checkpoint_started",
+                "query_plan_checkpoint_completed",
+                message_id,
+                attempt_number=attempt_number,
+                stage="query_plan_checkpoint",
+                intent=plan.intent.value,
+            ) as checkpoint_span,
+            self._session_factory() as session,
+            session.begin(),
+        ):
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.processing_attempts != attempt_number
+            ):
+                checkpoint_span.result(outcome="terminal_failure", error_code="STALE_ATTEMPT")
+                raise ValueError("query checkpoint attempt is stale")
+            if message.query_plan_created_at is None:
+                message.query_plan_checkpoint = checkpoint.payload()
+                message.query_plan_created_at = self._now()
+            stored = ExpenseQueryPlanCheckpoint.from_payload(message.query_plan_checkpoint).plan
+            checkpoint_span.result(outcome="success")
+            return stored
+
+    async def _trusted_query_user_id(self, message_id: UUID) -> UUID:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None or message.user_id is None:
+                raise ValueError("query user is unavailable")
+            return message.user_id
+
+    async def _checkpointed_query_execution(
+        self,
+        message_id: UUID,
+        plan: ExpenseQueryPlan,
+        *,
+        attempt_number: int,
+    ) -> ExpenseQueryResult:
+        async with self._session_factory() as session:
+            message = await session.get(ProcessedMessage, message_id)
+            if message is None or message.status is not ProcessedMessageStatus.PROCESSING:
+                raise ValueError("query message is not processable")
+            if message.query_executed_at is not None:
+                return ExpenseQueryResultCheckpoint.from_payload(
+                    message.query_result_checkpoint
+                ).result
+
+        assert self._query_executor is not None
+        async with self._timing.span(
+            "query_execution_started",
+            "query_execution_completed",
+            message_id,
+            attempt_number=attempt_number,
+            stage="query_execution",
+            intent=plan.intent.value,
+            metric=plan.metric.value if plan.metric else None,
+            group=plan.group_by.value if plan.group_by else None,
+        ) as execution_span:
+            result = await self._query_executor.execute(
+                user_id=await self._trusted_query_user_id(message_id),
+                plan=plan,
+            )
+            stored = await self._checkpoint_query_result(message_id, result, attempt_number)
+            execution_span.result(outcome="success", **self._query_result_counts(stored))
+            return stored
+
+    async def _checkpoint_query_result(
+        self,
+        message_id: UUID,
+        result: ExpenseQueryResult,
+        attempt_number: int,
+    ) -> ExpenseQueryResult:
+        checkpoint = ExpenseQueryResultCheckpoint(result=result)
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(self._locked_message_statement(message_id))
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.processing_attempts != attempt_number
+            ):
+                raise ValueError("query execution checkpoint attempt is stale")
+            if message.query_executed_at is None:
+                message.query_result_checkpoint = checkpoint.payload()
+                message.query_executed_at = self._now()
+            return ExpenseQueryResultCheckpoint.from_payload(message.query_result_checkpoint).result
+
+    async def _complete_query_result(
+        self,
+        message_id: UUID,
+        pages: tuple[str, ...],
+        *,
+        attempt_number: int,
+    ) -> int | None:
+        if not pages:
+            raise ValueError("query formatter returned no pages")
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.processing_attempts != attempt_number
+                or message.user is None
+                or message.user_id is None
+            ):
+                return None
+            existing = list(
+                await session.scalars(
+                    select(OutboundMessage).where(
+                        OutboundMessage.processed_message_id == message.id,
+                        OutboundMessage.kind == OutboundMessageKind.QUERY_RESULT,
+                    )
+                )
+            )
+            if not existing:
+                self._create_query_outbox_pages(
+                    session,
+                    message,
+                    pages,
+                    kind=OutboundMessageKind.QUERY_RESULT,
+                    destination=message.user.phone_number,
+                )
+            message.query_result_checkpoint = None
+            message.query_page_count = len(existing) if existing else len(pages)
+            self._complete_successfully(message, ProcessedMessageStatus.PROCESSED)
+            return message.query_page_count
+
+    async def _complete_query_guidance(
+        self,
+        message_id: UUID,
+        content: str,
+        *,
+        status: ProcessedMessageStatus,
+        error_code: str | None = None,
+    ) -> int | None:
+        async with self._session_factory() as session, session.begin():
+            message = await session.scalar(
+                self._locked_message_statement(message_id).options(
+                    selectinload(ProcessedMessage.user)
+                )
+            )
+            if (
+                message is None
+                or message.status is not ProcessedMessageStatus.PROCESSING
+                or message.user is None
+                or message.user_id is None
+            ):
+                return None
+            existing = await session.scalar(
+                select(OutboundMessage.id).where(
+                    OutboundMessage.processed_message_id == message.id,
+                    OutboundMessage.kind == OutboundMessageKind.QUERY_GUIDANCE,
+                )
+            )
+            if existing is None:
+                self._create_query_outbox_pages(
+                    session,
+                    message,
+                    (content,),
+                    kind=OutboundMessageKind.QUERY_GUIDANCE,
+                    destination=message.user.phone_number,
+                )
+            message.query_page_count = 1
+            message.query_result_checkpoint = None
+            self._complete_successfully(message, status)
+            if error_code is not None:
+                message.error_code = error_code
+                message.last_error_code = error_code
+            return 1
+
+    async def _mark_query_failed(self, message_id: UUID, code: str, *, attempt_number: int) -> None:
+        page_count = await self._complete_query_guidance(
+            message_id,
+            QUERY_INVALID_TEXT,
+            status=ProcessedMessageStatus.FAILED,
+            error_code=code,
+        )
+        if page_count is not None:
+            self._emit_query_completed(
+                message_id,
+                attempt_number=attempt_number,
+                intent=ExpenseIntent.QUERY.value,
+                page_count=page_count,
+                outcome="terminal_failure",
+                error_code=code,
+            )
+
+    def _emit_query_completed(
+        self,
+        message_id: UUID,
+        *,
+        attempt_number: int,
+        intent: str,
+        page_count: int,
+        outcome: str,
+        error_code: str | None = None,
+    ) -> None:
+        self._timing.event(
+            "query_outbox_created",
+            message_id,
+            attempt_number=attempt_number,
+            outcome=outcome,
+            page_count=page_count,
+        )
+        self._timing.event(
+            "query_processing_completed",
+            message_id,
+            attempt_number=attempt_number,
+            outcome=outcome,
+            intent=intent,
+            page_count=page_count,
+            error_code=error_code,
+        )
+
+    @staticmethod
+    def _create_query_outbox_pages(
+        session: AsyncSession,
+        message: ProcessedMessage,
+        pages: tuple[str, ...],
+        *,
+        kind: OutboundMessageKind,
+        destination: str,
+    ) -> None:
+        page_count = len(pages)
+        now = datetime.now(UTC)
+        for position, content in enumerate(pages, start=1):
+            session.add(
+                OutboundMessage(
+                    user_id=message.user_id,
+                    processed_message_id=message.id,
+                    expense_id=None,
+                    destination=destination,
+                    content=content,
+                    kind=kind,
+                    dedup_key=(f"processed-message:{message.id}:{kind.value}:page:{position}"),
+                    sequence_no=position,
+                    sequence_count=page_count,
+                    status=OutboundMessageStatus.PENDING,
+                    available_at=now,
+                )
+            )
+
+    @staticmethod
+    def _query_result_counts(result) -> dict[str, int]:
+        if isinstance(result, ExpenseListResult):
+            return {"row_count": len(result.items)}
+        if isinstance(result, ExpenseGroupResult):
+            return {"group_count": len(result.items)}
+        if isinstance(result, ExpenseAggregateResult):
+            return {"row_count": result.record_count}
+        if isinstance(result, ExpenseComparisonResult):
+            return {"row_count": result.record_count + result.comparison_record_count}
+        return {}
+
+    @staticmethod
+    def _query_error_code(exc: InterpretationError) -> str:
+        return f"QUERY_{exc.code.value.removeprefix('GEMINI_')}"
+
     @staticmethod
     def _explicit_monetary_values(text: str) -> set[Decimal]:
         values: set[Decimal] = set()
@@ -488,7 +1035,7 @@ class ExpenseProcessingService:
     def _missing_required_fields(
         result: ExpenseInterpretation, *, force_amount: bool = False
     ) -> list[str]:
-        if result.intent is ExpenseIntent.NOT_EXPENSE:
+        if result.intent in {ExpenseIntent.NOT_EXPENSE, ExpenseIntent.QUERY}:
             return []
         missing: list[str] = []
         if force_amount or result.amount is None:
@@ -716,7 +1263,21 @@ class ExpenseProcessingService:
                 message.status = ProcessedMessageStatus.FAILED
                 message.next_attempt_at = None
                 message.media_remote_jid = None
-                await self._create_failure_notification(session, message, message.user)
+                if (
+                    message.classification_intent is ExpenseIntent.QUERY
+                    and message.user is not None
+                ):
+                    self._create_query_outbox_pages(
+                        session,
+                        message,
+                        (QUERY_FAILURE_TEXT,),
+                        kind=OutboundMessageKind.QUERY_GUIDANCE,
+                        destination=message.user.phone_number,
+                    )
+                    message.query_page_count = 1
+                    message.query_result_checkpoint = None
+                else:
+                    await self._create_failure_notification(session, message, message.user)
                 return
             message.status = ProcessedMessageStatus.PENDING
             message.next_attempt_at = self._now() + self._retry_delay(message.processing_attempts)
@@ -1297,6 +1858,8 @@ class ExpenseProcessingService:
             return "transcription"
         if error_code.startswith("IMAGE_ANALYSIS_"):
             return "image_analysis"
+        if error_code.startswith("QUERY_"):
+            return "query_execution"
         if error_code.startswith("GEMINI_"):
             return "interpretation"
         if error_code.startswith("PERSISTENCE_"):

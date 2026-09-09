@@ -1,7 +1,19 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -11,10 +23,26 @@ from oink_finai.domain.enums import OutboundMessageKind, OutboundMessageStatus
 
 class OutboundMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "outbound_messages"
-    __table_args__ = (Index("ix_outbound_messages_claim", "status", "available_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_outbound_messages_claim", "status", "available_at", "created_at"),
+        UniqueConstraint(
+            "processed_message_id",
+            "kind",
+            "sequence_no",
+            name="uq_outbound_message_processed_kind_sequence",
+        ),
+        CheckConstraint(
+            "(sequence_no IS NULL AND sequence_count IS NULL) OR "
+            "(sequence_no >= 1 AND sequence_count >= sequence_no)",
+            name="outbound_message_sequence_valid",
+        ),
+    )
 
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     expense_id: Mapped[UUID | None] = mapped_column(ForeignKey("expenses.id", ondelete="SET NULL"))
+    processed_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("processed_messages.id", ondelete="SET NULL"), index=True
+    )
     destination: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
     content_type: Mapped[str] = mapped_column(String(20), default="TEXT")
@@ -40,6 +68,9 @@ class OutboundMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     provider_message_id: Mapped[str | None] = mapped_column(String(255))
     error_code: Mapped[str | None] = mapped_column(String(64))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sequence_no: Mapped[int | None] = mapped_column(Integer)
+    sequence_count: Mapped[int | None] = mapped_column(Integer)
 
     user = relationship("User", back_populates="outbound_messages")
     expense = relationship("Expense", back_populates="outbound_messages")
+    processed_message = relationship("ProcessedMessage", back_populates="outbound_messages")

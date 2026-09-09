@@ -18,6 +18,7 @@ class ExpenseHistoryAction(StrEnum):
 
 class ExpenseIntent(StrEnum):
     CREATE_EXPENSE = "CREATE_EXPENSE"
+    QUERY = "QUERY"
     NOT_EXPENSE = "NOT_EXPENSE"
     UNCLEAR = "UNCLEAR"
 
@@ -81,3 +82,5 @@ class OutboundMessageKind(StrEnum):
     EXPENSE_DELETED = "EXPENSE_DELETED"
     ACTION_CANCELLED = "ACTION_CANCELLED"
     ACTION_ERROR = "ACTION_ERROR"
+    QUERY_RESULT = "QUERY_RESULT"
+    QUERY_GUIDANCE = "QUERY_GUIDANCE"
