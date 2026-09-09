@@ -163,6 +163,7 @@ async def test_analyzes_supported_inline_image_once(mime_type: str) -> None:
         "schema": IMAGE_ANALYSIS_SCHEMA,
     }
     assert call["temperature"] == 0 and call["store"] is False
+    assert call["max_output_tokens"] == 500
     content = call["input"][0]["content"]
     assert content[0]["type"] == "input_text"
     image_url = content[1]["image_url"]

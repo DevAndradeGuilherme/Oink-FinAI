@@ -1,4 +1,6 @@
 import asyncio
+import signal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -68,11 +70,16 @@ async def test_worker_shares_and_closes_one_openai_client(monkeypatch) -> None:
     audio_factory = Mock(return_value=transcriber)
     provider = Mock(aclose=AsyncMock())
     analyzer = Mock(aclose=AsyncMock())
-    processing = Mock(
-        recover_stale=AsyncMock(), claim=AsyncMock(side_effect=asyncio.CancelledError())
-    )
-    delivery = Mock(recover_stale=AsyncMock())
+    signal_handlers = {}
+
+    def request_sigterm(*_args):
+        signal_handlers[signal.SIGTERM]()
+        return []
+
+    processing = Mock(recover_stale=AsyncMock(), claim=AsyncMock(side_effect=request_sigterm))
+    delivery = Mock(recover_stale=AsyncMock(), claim=AsyncMock(return_value=[]), send=AsyncMock())
     processing_constructor = Mock(return_value=processing)
+    heartbeat = Mock(start=AsyncMock(), beat=AsyncMock(), stopping=AsyncMock(), stopped=AsyncMock())
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     monkeypatch.setattr(worker, "create_openai_client", Mock(return_value=shared_client))
     monkeypatch.setattr(worker, "create_audio_transcriber", audio_factory)
@@ -80,17 +87,41 @@ async def test_worker_shares_and_closes_one_openai_client(monkeypatch) -> None:
     monkeypatch.setattr(worker, "OpenAIImageAnalyzer", Mock(return_value=analyzer))
     monkeypatch.setattr(worker, "ExpenseProcessingService", processing_constructor)
     monkeypatch.setattr(worker, "OutboxDeliveryService", Mock(return_value=delivery))
+    monkeypatch.setattr(worker, "WorkerHeartbeatService", Mock(return_value=heartbeat))
+    monkeypatch.setattr(worker, "_write_worker_id", Mock(return_value=Path("synthetic-worker-id")))
+    remove_worker_id = Mock()
+    monkeypatch.setattr(worker, "_remove_worker_id", remove_worker_id)
     monkeypatch.setattr(worker, "engine", Mock(dispose=AsyncMock()))
-    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", Mock())
+    add_signal_handler = Mock(
+        side_effect=lambda signal_name, callback: signal_handlers.__setitem__(signal_name, callback)
+    )
+    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", add_signal_handler)
 
-    with pytest.raises(asyncio.CancelledError):
-        await worker.run_worker()
+    await worker.run_worker()
 
     audio_factory.assert_called_once_with(settings, client=shared_client)
     interpreter = processing_constructor.call_args.args[1]("America/Sao_Paulo")
     assert interpreter._client is shared_client
+    assert interpreter._max_output_tokens == settings.openai_expense_max_output_tokens
+    query_interpreter = processing_constructor.call_args.kwargs["query_interpreter_factory"](
+        "America/Sao_Paulo"
+    )
+    assert query_interpreter._max_output_tokens == settings.openai_query_max_output_tokens
+    worker.OpenAIImageAnalyzer.assert_called_once_with(
+        api_key="synthetic-key",
+        model=settings.openai_image_model,
+        timeout_seconds=settings.openai_image_timeout_seconds,
+        max_output_tokens=settings.openai_image_max_output_tokens,
+        max_image_bytes=settings.media_max_bytes,
+        client=shared_client,
+    )
     transcriber.aclose.assert_awaited_once()
     analyzer.aclose.assert_awaited_once()
     provider.aclose.assert_awaited_once()
     shared_client.close.assert_awaited_once()
+    heartbeat.start.assert_awaited_once()
+    heartbeat.stopping.assert_awaited_once()
+    heartbeat.stopped.assert_awaited_once()
+    remove_worker_id.assert_called_once_with(Path("synthetic-worker-id"))
     worker.engine.dispose.assert_awaited_once()
+    assert signal.SIGTERM in signal_handlers

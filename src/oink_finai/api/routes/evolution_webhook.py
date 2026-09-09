@@ -12,10 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from oink_finai.api.dependencies import get_evolution_provider
 from oink_finai.config.settings import Settings, get_settings
 from oink_finai.database.models.conversation_state import ConversationState
+from oink_finai.database.models.outbound_message import OutboundMessage
 from oink_finai.database.models.processed_message import ProcessedMessage
 from oink_finai.database.models.user import User
 from oink_finai.database.session import get_session
-from oink_finai.domain.enums import ConversationStatus, MessageSourceType, ProcessedMessageStatus
+from oink_finai.domain.enums import (
+    ConversationStatus,
+    MessageSourceType,
+    OutboundMessageKind,
+    OutboundMessageStatus,
+    ProcessedMessageStatus,
+)
 from oink_finai.providers.whatsapp.access import filter_inbound_message
 from oink_finai.providers.whatsapp.evolution import (
     EvolutionMediaReference,
@@ -28,8 +35,10 @@ from oink_finai.services.expense_commands import (
 )
 from oink_finai.services.image_analyzer import normalize_image_caption
 from oink_finai.services.pipeline_timing import PipelineTiming
+from oink_finai.services.usage_control import UsageControl
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
+RATE_LIMIT_GUIDANCE_TEXT = "Recebi muitas solicitações em pouco tempo. Tente novamente mais tarde."
 
 
 class WebhookResponse(BaseModel):
@@ -47,7 +56,7 @@ def _retire_historical_clarification(state: ConversationState) -> None:
 def verify_webhook_secret(
     webhook_secret: Annotated[str | None, Header(alias="X-Evolution-Webhook-Secret")] = None,
 ) -> None:
-    configured_secret = get_settings().evolution_webhook_secret
+    configured_secret = get_settings().evolution_webhook_secret_value
     if not configured_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -69,8 +78,12 @@ async def evolution_webhook(
     settings = get_settings()
     correlation_id = uuid4()
     timing = PipelineTiming(settings.pipeline_timing_enabled)
-    timing.event("webhook_received", correlation_id)
-    async with timing.span(None, "webhook_completed", correlation_id):
+    timing_fields = {
+        "processed_message_id": correlation_id,
+        "operation": "INBOUND_MESSAGE",
+    }
+    timing.event("webhook_received", correlation_id, **timing_fields)
+    async with timing.span(None, "webhook_completed", correlation_id, **timing_fields):
         return await _handle_evolution_webhook(
             payload, session, provider, correlation_id, timing, settings
         )
@@ -146,13 +159,6 @@ async def _handle_evolution_webhook(
                 )
                 if user is None:
                     raise
-        conversation_state = await session.scalar(
-            select(ConversationState)
-            .where(ConversationState.user_id == user.id)
-            .with_for_update(of=ConversationState)
-        )
-        if conversation_state is not None:
-            _retire_historical_clarification(conversation_state)
         now = datetime.now(UTC)
         processed_message = ProcessedMessage(
             id=correlation_id,
@@ -175,6 +181,42 @@ async def _handle_evolution_webhook(
             available_at=now,
         )
         session.add(processed_message)
+        await session.flush()
+        admission = await UsageControl(settings).admit_inbound(
+            session, message_id=processed_message.id, user_id=user.id
+        )
+        if not admission.allowed:
+            processed_message.status = ProcessedMessageStatus.FAILED
+            processed_message.error_code = "INBOUND_RATE_LIMITED"
+            processed_message.last_error_code = "INBOUND_RATE_LIMITED"
+            processed_message.next_attempt_at = None
+            window_marker = (admission.retry_at or now).astimezone(UTC).isoformat()
+            guidance_key = f"usage-limit:{user.id}:{window_marker}"
+            existing_guidance = await session.scalar(
+                select(OutboundMessage.id).where(OutboundMessage.dedup_key == guidance_key)
+            )
+            if existing_guidance is None:
+                session.add(
+                    OutboundMessage(
+                        user_id=user.id,
+                        processed_message_id=processed_message.id,
+                        destination=user.phone_number,
+                        content=RATE_LIMIT_GUIDANCE_TEXT,
+                        content_type="TEXT",
+                        kind=OutboundMessageKind.RATE_LIMIT_GUIDANCE,
+                        dedup_key=guidance_key,
+                        status=OutboundMessageStatus.PENDING,
+                        available_at=now,
+                    )
+                )
+        else:
+            conversation_state = await session.scalar(
+                select(ConversationState)
+                .where(ConversationState.user_id == user.id)
+                .with_for_update(of=ConversationState)
+            )
+            if conversation_state is not None:
+                _retire_historical_clarification(conversation_state)
         async with timing.span(
             None,
             "inbound_persisted",
@@ -189,4 +231,4 @@ async def _handle_evolution_webhook(
     except IntegrityError:
         await session.rollback()
         return WebhookResponse(status="duplicate")
-    return WebhookResponse(status="accepted")
+    return WebhookResponse(status="accepted" if admission.allowed else "rate_limited")

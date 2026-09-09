@@ -1,10 +1,14 @@
 import asyncio
 import logging
 import signal
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
+from oink_finai.observability import configure_application_logging, emit_event
 from oink_finai.providers.whatsapp import EvolutionWhatsAppProvider
 from oink_finai.repositories import SQLAlchemyExpenseQueryExecutor
 from oink_finai.services.audio_transcriber_factory import create_audio_transcriber
@@ -18,22 +22,104 @@ from oink_finai.services.openai_image_analyzer import OpenAIImageAnalyzer
 from oink_finai.services.openai_privacy import openai_private_operation
 from oink_finai.services.outbox_delivery import OutboxDeliveryService
 from oink_finai.services.pipeline_timing import PipelineTiming
+from oink_finai.services.usage_control import UsageControl
 from oink_finai.services.whatsapp_expense_query_result_formatter import (
     WhatsAppExpenseQueryResultFormatter,
 )
+from oink_finai.services.worker_heartbeat import WorkerHeartbeatService
 
 logger = logging.getLogger(__name__)
 
 
+async def _run_claim_batch[ClaimT](
+    stop: asyncio.Event,
+    batch_size: int,
+    claim: Callable[[int], Awaitable[Sequence[ClaimT]]],
+    handle: Callable[[ClaimT], Awaitable[None]],
+) -> None:
+    """Claim one item at a time so shutdown never strands unstarted work."""
+    for _ in range(batch_size):
+        if stop.is_set():
+            return
+        claimed = await claim(1)
+        if not claimed:
+            return
+        # A signal received while claim() is in flight does not abandon its result.
+        await handle(claimed[0])
+
+
+async def _close_safely(name: str, close: Callable[[], Awaitable[None]]) -> None:
+    try:
+        await close()
+    except Exception as exc:
+        emit_event(
+            logger,
+            logging.WARNING,
+            "worker_resource_close_failed",
+            operation=name,
+            exception_class=type(exc).__name__,
+        )
+
+
+async def _heartbeat_safely(code: str, operation: Callable[[], Awaitable[object]]) -> None:
+    try:
+        await operation()
+    except Exception as exc:
+        emit_event(
+            logger,
+            logging.WARNING,
+            "worker_heartbeat_failed",
+            error_code=code,
+            exception_class=type(exc).__name__,
+        )
+
+
+async def _maintain_heartbeat(
+    heartbeat: WorkerHeartbeatService,
+    worker_id: UUID,
+    stop: asyncio.Event,
+    interval_seconds: float,
+) -> None:
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            await _heartbeat_safely("HEARTBEAT_UPDATE_FAILED", lambda: heartbeat.beat(worker_id))
+            continue
+        await _heartbeat_safely("HEARTBEAT_STOPPING_FAILED", lambda: heartbeat.stopping(worker_id))
+        return
+
+
+def _write_worker_id(path_value: str, worker_id: UUID) -> Path:
+    path = Path(path_value)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(str(worker_id), encoding="ascii")
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    temporary.replace(path)
+    return path
+
+
+def _remove_worker_id(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 async def run_worker() -> None:
     settings = get_settings()
+    openai_api_key = settings.openai_api_key_value
+    evolution_api_key = settings.evolution_api_key_value
     if not all(
         (
-            settings.openai_api_key,
+            openai_api_key,
             settings.openai_expense_model,
             settings.openai_image_model,
             settings.evolution_base_url,
-            settings.evolution_api_key,
+            evolution_api_key,
             settings.evolution_instance,
         )
     ):
@@ -48,7 +134,7 @@ async def run_worker() -> None:
             signal.signal(signal_name, lambda *_: loop.call_soon_threadsafe(stop.set))
 
     openai_client = create_openai_client(
-        api_key=settings.openai_api_key,
+        api_key=openai_api_key,
         timeout_seconds=max(
             settings.openai_expense_timeout_seconds,
             settings.openai_query_timeout_seconds,
@@ -58,7 +144,7 @@ async def run_worker() -> None:
     )
     provider = EvolutionWhatsAppProvider(
         settings.evolution_base_url,
-        settings.evolution_api_key,
+        evolution_api_key,
         settings.evolution_instance,
         timeout_seconds=settings.evolution_timeout_seconds,
         media_timeout_seconds=settings.evolution_media_timeout_seconds,
@@ -71,19 +157,22 @@ async def run_worker() -> None:
     )
     audio_transcriber = create_audio_transcriber(settings, client=openai_client)
     image_analyzer = OpenAIImageAnalyzer(
-        api_key=settings.openai_api_key,
+        api_key=openai_api_key,
         model=settings.openai_image_model,
         timeout_seconds=settings.openai_image_timeout_seconds,
+        max_output_tokens=settings.openai_image_max_output_tokens,
         max_image_bytes=settings.media_max_bytes,
         client=openai_client,
     )
     timing = PipelineTiming(settings.pipeline_timing_enabled)
+    usage_control = UsageControl(settings, SessionFactory)
     processing = ExpenseProcessingService(
         SessionFactory,
         lambda timezone: OpenAIExpenseInterpreter(
-            api_key=settings.openai_api_key,
+            api_key=openai_api_key,
             model=settings.openai_expense_model,
             timeout_seconds=settings.openai_expense_timeout_seconds,
+            max_output_tokens=settings.openai_expense_max_output_tokens,
             timezone=timezone,
             client=openai_client,
         ),
@@ -95,9 +184,11 @@ async def run_worker() -> None:
         audio_transcriber_factory=lambda: audio_transcriber,
         image_analyzer_factory=lambda: image_analyzer,
         query_interpreter_factory=lambda timezone: OpenAIExpenseQueryInterpreter(
-            api_key=settings.openai_api_key,
+            api_key=openai_api_key,
             timeout_seconds=settings.openai_query_timeout_seconds,
             timezone=timezone,
+            model=settings.openai_query_model,
+            max_output_tokens=settings.openai_query_max_output_tokens,
             client=openai_client,
         ),
         query_executor=SQLAlchemyExpenseQueryExecutor(SessionFactory),
@@ -106,6 +197,11 @@ async def run_worker() -> None:
             max_pages=settings.whatsapp_query_max_pages,
         ),
         timing=timing,
+        usage_control=usage_control,
+        expense_model=settings.openai_expense_model,
+        query_model=settings.openai_query_model,
+        image_model=settings.openai_image_model,
+        audio_model=settings.openai_audio_transcription_model,
     )
     delivery = OutboxDeliveryService(
         SessionFactory,
@@ -113,6 +209,25 @@ async def run_worker() -> None:
         max_attempts=settings.outbox_max_attempts,
         retry_base_seconds=settings.outbox_retry_base_seconds,
         timing=timing,
+    )
+    heartbeat = WorkerHeartbeatService(
+        SessionFactory,
+        stale_seconds=settings.worker_heartbeat_stale_seconds,
+        database_timeout_seconds=settings.worker_heartbeat_database_timeout_seconds,
+        retention_days=settings.worker_heartbeat_retention_days,
+    )
+    worker_id = uuid4()
+    worker_id_path = _write_worker_id(settings.worker_heartbeat_id_path, worker_id)
+    await _heartbeat_safely(
+        "HEARTBEAT_START_FAILED", lambda: heartbeat.start(worker_id, settings.app_release)
+    )
+    heartbeat_task = asyncio.create_task(
+        _maintain_heartbeat(
+            heartbeat,
+            worker_id,
+            stop,
+            settings.worker_heartbeat_interval_seconds,
+        )
     )
     try:
         outbox_cutoff = datetime.now(UTC) - timedelta(seconds=settings.outbox_state_timeout_seconds)
@@ -127,32 +242,50 @@ async def run_worker() -> None:
                     seconds=settings.outbox_state_timeout_seconds
                 )
                 await delivery.recover_stale(outbox_cutoff)
-                for message_id in await processing.claim(settings.worker_batch_size):
-                    await processing.process(message_id)
-                for outbound_claim in await delivery.claim(settings.worker_batch_size):
-                    await delivery.send(outbound_claim)
+                await _run_claim_batch(
+                    stop,
+                    settings.worker_batch_size,
+                    processing.claim,
+                    processing.process,
+                )
+                await _run_claim_batch(
+                    stop,
+                    settings.worker_batch_size,
+                    delivery.claim,
+                    delivery.send,
+                )
             except Exception as exc:
-                logger.error("Worker iteration failed", extra={"error_type": type(exc).__name__})
+                emit_event(
+                    logger,
+                    logging.ERROR,
+                    "worker_iteration_failed",
+                    exception_class=type(exc).__name__,
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=settings.worker_poll_interval_seconds)
             except TimeoutError:
                 pass
     finally:
-        await audio_transcriber.aclose()
-        await image_analyzer.aclose()
-        await provider.aclose()
+        stop.set()
+        await heartbeat_task
+        await _close_safely("audio_transcriber", audio_transcriber.aclose)
+        await _close_safely("image_analyzer", image_analyzer.aclose)
+        await _close_safely("whatsapp_provider", provider.aclose)
         with openai_private_operation():
-            try:
-                await openai_client.close()
-            except Exception as exc:
-                logger.warning(
-                    "OpenAI client close failed", extra={"error_type": type(exc).__name__}
-                )
-        await engine.dispose()
+            await _close_safely("openai_client", openai_client.close)
+        await _heartbeat_safely("HEARTBEAT_STOPPED_FAILED", lambda: heartbeat.stopped(worker_id))
+        _remove_worker_id(worker_id_path)
+        await _close_safely("database_engine", engine.dispose)
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    settings = get_settings()
+    configure_application_logging(
+        log_format=settings.log_format,
+        level=settings.log_level,
+        service="worker",
+        include_traceback=settings.log_include_traceback,
+    )
     asyncio.run(run_worker())
 
 

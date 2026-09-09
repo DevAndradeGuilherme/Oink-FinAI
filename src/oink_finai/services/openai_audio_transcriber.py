@@ -8,6 +8,10 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 from oink_finai.schemas.audio import MAX_TRANSCRIPT_CHARACTERS, AudioTranscription
 from oink_finai.services.audio_transcriber import AudioTranscriber, ValidatedAudio
 from oink_finai.services.openai_privacy import openai_private_operation
+from oink_finai.services.openai_usage import (
+    mark_openai_request_transmitted,
+    record_openai_response_usage,
+)
 from oink_finai.services.transcription_errors import TranscriptionError, TranscriptionErrorCode
 
 _AUDIO_FILES = {
@@ -265,12 +269,14 @@ class OpenAIAudioTranscriber(AudioTranscriber):
                             TranscriptionErrorCode.CONFIGURATION, transient=False
                         )
                     filename, mime_type = self._validate_audio(audio)
+                    await mark_openai_request_transmitted()
                     response = await self._client.audio.transcriptions.create(
                         model=self._model,
                         file=(filename, audio.content, mime_type),
                         language=self._language,
                         response_format="json",
                     )
+                    record_openai_response_usage(response)
                     text = getattr(response, "text", None)
                     if not isinstance(text, str) or not text.strip():
                         raise TranscriptionError(

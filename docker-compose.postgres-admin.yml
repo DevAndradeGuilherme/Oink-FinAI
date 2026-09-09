@@ -1,0 +1,44 @@
+services:
+  postgres-admin:
+    image: ${POSTGRES_IMAGE_REPOSITORY:?POSTGRES_IMAGE_REPOSITORY is required}@${POSTGRES_IMAGE_DIGEST:?POSTGRES_IMAGE_DIGEST is required}
+    profiles: ["postgres-admin"]
+    restart: "no"
+    entrypoint: ["sh", "/opt/oink/postgres/provision.sh"]
+    environment:
+      PROVISION_MODE: ${PROVISION_MODE:?PROVISION_MODE must be new or existing}
+      APP_DATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+      APP_SCHEMA: ${APP_SCHEMA:?APP_SCHEMA is required}
+      BOOTSTRAP_HOST: postgres
+      BOOTSTRAP_PORT: "5432"
+      BOOTSTRAP_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      BOOTSTRAP_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+      MIGRATOR_ROLE: ${MIGRATOR_ROLE:?MIGRATOR_ROLE is required}
+      RUNTIME_ROLE: ${RUNTIME_ROLE:?RUNTIME_ROLE is required}
+      BACKUP_ROLE: ${BACKUP_ROLE:?BACKUP_ROLE is required}
+      MIGRATOR_PASSWORD_FILE: /run/secrets/postgres_migrator_password
+      RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+      LEGACY_OWNER: ${LEGACY_OWNER-}
+      ALLOW_EXISTING_DATABASE_ADAPTATION: ${ALLOW_EXISTING_DATABASE_ADAPTATION-}
+      INVENTORY_DIRECTORY: /var/lib/oink-inventory
+    volumes:
+      - ./scripts/postgres:/opt/oink/postgres:ro
+      - ${POSTGRES_INVENTORY_DIRECTORY:?POSTGRES_INVENTORY_DIRECTORY is required}:/var/lib/oink-inventory
+    secrets:
+      - postgres_bootstrap_password
+      - postgres_migrator_password
+      - postgres_runtime_password
+      - postgres_backup_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - database
+
+secrets:
+  postgres_migrator_password:
+    file: ${MIGRATOR_PASSWORD_FILE:?MIGRATOR_PASSWORD_FILE is required}
+  postgres_runtime_password:
+    file: ${RUNTIME_PASSWORD_FILE:?RUNTIME_PASSWORD_FILE is required}
+  postgres_backup_password:
+    file: ${BACKUP_PASSWORD_FILE:?BACKUP_PASSWORD_FILE is required}

@@ -51,6 +51,10 @@ from oink_finai.services.image_analyzer import (
     normalize_image_caption,
 )
 from oink_finai.services.openai_privacy import openai_private_operation
+from oink_finai.services.openai_usage import (
+    mark_openai_request_transmitted,
+    record_openai_response_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +192,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
         api_key: str | None,
         model: str = "gpt-4.1-mini",
         timeout_seconds: float = 90.0,
+        max_output_tokens: int = 500,
         max_image_bytes: int = 10 * 1024 * 1024,
         max_visible_text_characters: int = IMAGE_ANALYSIS_VISIBLE_TEXT_MAX_LENGTH,
         max_caption_characters: int = IMAGE_ANALYSIS_CAPTION_MAX_LENGTH,
@@ -203,6 +208,9 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
+            or isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 64 <= max_output_tokens <= 4096
             or isinstance(max_image_bytes, bool)
             or not isinstance(max_image_bytes, int)
             or max_image_bytes <= 0
@@ -217,6 +225,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
         self._model = model
         self._safe_model = model
         self._timeout_seconds = timeout_seconds
+        self._max_output_tokens = max_output_tokens
         self._max_image_bytes = max_image_bytes
         self._max_visible_text_characters = max_visible_text_characters
         self._max_caption_characters = max_caption_characters
@@ -325,6 +334,7 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
         ]
         if caption is not None:
             content.append({"type": "input_text", "text": f"Legenda não confiável:\n{caption}"})
+        await mark_openai_request_transmitted()
         response = await self._client.responses.create(
             model=self._model,
             instructions=_IMAGE_ANALYSIS_INSTRUCTION,
@@ -338,8 +348,10 @@ class OpenAIImageAnalyzer(ImageAnalyzer):
                 }
             },
             temperature=0,
+            max_output_tokens=self._max_output_tokens,
             store=False,
         )
+        record_openai_response_usage(response)
         response_text = response.output_text
         if not isinstance(response_text, str) or not response_text.strip():
             raise ImageAnalysisError(ImageAnalysisErrorCode.INVALID_RESPONSE, transient=False)

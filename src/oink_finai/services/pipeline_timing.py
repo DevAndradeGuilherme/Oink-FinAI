@@ -8,12 +8,17 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
+from oink_finai.observability import PIPELINE_EVENTS
+
 logger = logging.getLogger("oink_finai.pipeline_timing")
 
 ALLOWED_FIELDS = frozenset(
     {
         "event",
         "correlation_id",
+        "processed_message_id",
+        "outbound_message_id",
+        "operation",
         "timestamp",
         "duration_ms",
         "attempt_number",
@@ -32,51 +37,13 @@ ALLOWED_FIELDS = frozenset(
         "row_count",
         "group_count",
         "page_count",
+        "sequence_no",
+        "sequence_count",
     }
 )
-TIMING_EVENTS = frozenset(
-    {
-        "webhook_received",
-        "access_filter_completed",
-        "inbound_persisted",
-        "webhook_completed",
-        "processing_claimed",
-        "queue_wait_completed",
-        "media_download_started",
-        "media_download_completed",
-        "image_download_started",
-        "image_download_completed",
-        "image_analysis_started",
-        "image_analysis_completed",
-        "image_checkpoint_started",
-        "image_checkpoint_completed",
-        "transcription_started",
-        "transcription_completed",
-        "transcript_checkpoint_started",
-        "transcript_checkpoint_completed",
-        "interpretation_started",
-        "interpretation_completed",
-        "expense_persistence_started",
-        "expense_persistence_completed",
-        "processing_completed",
-        "outbox_claimed",
-        "outbox_queue_wait_completed",
-        "outbound_send_started",
-        "outbound_send_completed",
-        "outbound_accepted",
-        "query_interpretation_started",
-        "query_interpretation_completed",
-        "query_plan_checkpoint_started",
-        "query_plan_checkpoint_completed",
-        "query_execution_started",
-        "query_execution_completed",
-        "query_formatting_started",
-        "query_formatting_completed",
-        "query_outbox_created",
-        "query_processing_completed",
-    }
-)
+TIMING_EVENTS = PIPELINE_EVENTS
 _SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SAFE_OPERATION = re.compile(r"^(?:[A-Z][A-Z0-9_]{0,63}|[a-z][a-z0-9_]{0,63})$")
 _SAFE_MIME = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
 _STAGES = frozenset(
     {
@@ -135,6 +102,14 @@ class PipelineTiming:
                 value = (
                     value if isinstance(value, str) and _SAFE_CODE.fullmatch(value) else "UNKNOWN"
                 )
+            elif name in {"processed_message_id", "outbound_message_id"}:
+                try:
+                    value = str(UUID(str(value)))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            elif name == "operation":
+                if not isinstance(value, str) or not _SAFE_OPERATION.fullmatch(value):
+                    continue
             elif name == "outcome" and value not in {
                 "success",
                 "transient_failure",
@@ -195,6 +170,8 @@ class PipelineTiming:
                 "row_count",
                 "group_count",
                 "page_count",
+                "sequence_no",
+                "sequence_count",
             }:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     continue

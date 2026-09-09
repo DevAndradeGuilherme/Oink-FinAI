@@ -6,7 +6,7 @@ from oink_finai.services.openai_audio_transcriber import OpenAIAudioTranscriber
 def create_audio_transcriber(settings: Settings, *, client=None) -> AudioTranscriber:
     """Build the sole audio provider without probing credentials or fallback."""
     return OpenAIAudioTranscriber(
-        api_key=settings.openai_api_key,
+        api_key=settings.openai_api_key_value,
         model=settings.openai_audio_transcription_model,
         timeout_seconds=settings.openai_audio_transcription_timeout_seconds,
         language=settings.openai_audio_transcription_language,
