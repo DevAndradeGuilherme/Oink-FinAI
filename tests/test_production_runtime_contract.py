@@ -66,6 +66,10 @@ def test_production_compose_isolated_runtime_contract() -> None:
         assert "replicas: 1" in process
         assert "OINK_RUNTIME_ENV_FILE" in process
         assert "MIGRATION_DATABASE_URL" not in process
+    assert "urllib.request" in api and "127.0.0.1:8000/ready" in api
+    assert "oink_finai.worker_healthcheck" in worker
+    assert "curl" not in api + worker and "wget" not in api + worker
+    assert "start_period: 45s" in worker
 
 
 def test_manual_postgres_admin_service_is_isolated() -> None:
@@ -97,6 +101,7 @@ def test_postgres_provisioning_contract_has_no_embedded_passwords_or_reassign_ow
     assert "ALLOW_EXISTING_DATABASE_ADAPTATION" in sources
     assert "REVOKE ALL ON SCHEMA" in sources
     assert "ALTER DEFAULT PRIVILEGES" in sources
+    assert "GRANT SELECT ON TABLE %I.alembic_version" in sources
 
 
 def test_image_declares_a_non_root_runtime_user() -> None:

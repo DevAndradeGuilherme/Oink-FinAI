@@ -15,7 +15,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA :"app_schema"
 GRANT SELECT ON ALL TABLES IN SCHEMA :"app_schema" TO :"backup_role";
 
 SELECT format(
-    'REVOKE ALL PRIVILEGES ON TABLE %I.alembic_version FROM %I',
+    'REVOKE ALL PRIVILEGES ON TABLE %I.alembic_version FROM %I; '
+    'GRANT SELECT ON TABLE %I.alembic_version TO %I',
+    :'app_schema',
+    :'runtime_role',
     :'app_schema',
     :'runtime_role'
 )

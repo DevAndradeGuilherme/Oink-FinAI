@@ -161,3 +161,10 @@ Mensagens e operações OpenAI passam por limites duráveis em PostgreSQL, com j
 idempotência por mensagem/tentativa, reserva anterior à chamada e concorrência global. O ledger
 armazena apenas identificadores internos e métricas técnicas numéricas; não armazena conteúdo.
 Consulte [a arquitetura, os defaults e o procedimento operacional](docs/durable-usage-control.md).
+
+### Limites HTTP e saúde operacional
+
+O webhook possui limite bruto antes do parsing, timeout e concorrência por processo. `/live`
+indica somente liveness; `/ready` e o alias compatível `/health` exigem PostgreSQL no head
+esperado. O worker mantém heartbeat durável e possui healthcheck sem ferramenta externa. Consulte
+[limites HTTP, semântica de saúde e diagnóstico](docs/http-health-and-worker-heartbeat.md).

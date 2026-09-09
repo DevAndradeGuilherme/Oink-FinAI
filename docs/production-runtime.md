@@ -1,8 +1,8 @@
 # Runtime Docker de produção
 
-Esta configuração cobre a fundação do runtime e as identidades PostgreSQL separadas. Ela ainda
-não inclui Named Tunnel, backup automatizado, quotas, rate limiting, heartbeat, alertas,
-retenção/LGPD ou CI/CD. O procedimento de banco está em
+Esta configuração cobre a fundação do runtime, identidades PostgreSQL separadas, limites duráveis
+de uso, proteção HTTP, readiness e heartbeat. Ela ainda não inclui Named Tunnel, backup
+automatizado, alertas externos, retenção/LGPD ou CI/CD. O procedimento de banco está em
 [`postgres-least-privilege.md`](postgres-least-privilege.md).
 
 ## Arquivos e pré-requisitos
@@ -66,8 +66,11 @@ somente `127.0.0.1:8000`, para consumo futuro por um Named Tunnel executado no h
 não publica portas. API e worker também usam `edge` para as integrações externas. Redis não
 é iniciado e não participa da arquitetura atual porque não existe consumidor no código.
 
-O PostgreSQL é liberado por `pg_isready`; a API é verificada pelo endpoint compatível
-`/health`. A documentação `/docs`, `/redoc` e `/openapi.json` fica desabilitada em produção.
+O PostgreSQL é liberado por `pg_isready`; a API é verificada por `/ready` e o worker pelo comando
+`python -m oink_finai.worker_healthcheck`. Ambos usam apenas ferramentas presentes na imagem. A
+documentação `/docs`, `/redoc` e `/openapi.json` fica desabilitada em produção. A semântica de
+`/live`, `/ready`, `/health`, os thresholds do heartbeat e o diagnóstico estão em
+[`http-health-and-worker-heartbeat.md`](http-health-and-worker-heartbeat.md).
 API e worker recebem sinais diretamente, usam um init mínimo e têm 330 segundos para
 encerrar. Esse prazo cobre o máximo validado de uma operação corrente (300 segundos) com
 30 segundos de margem. Após SIGTERM/SIGINT, o worker termina o item já reivindicado e não

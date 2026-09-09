@@ -32,7 +32,15 @@ WITH expected_roles(role_name, can_create_objects, can_write) AS (
     SELECT :'runtime_role'::name AS role_name,
            has_database_privilege(:'runtime_role', current_database(), 'CONNECT')
            AND has_schema_privilege(:'runtime_role', :'app_schema', 'USAGE')
-           AND NOT has_schema_privilege(:'runtime_role', :'app_schema', 'CREATE') AS valid
+           AND NOT has_schema_privilege(:'runtime_role', :'app_schema', 'CREATE')
+           AND has_table_privilege(
+               :'runtime_role', format('%I.alembic_version', :'app_schema'), 'SELECT'
+           )
+           AND NOT has_table_privilege(
+               :'runtime_role',
+               format('%I.alembic_version', :'app_schema'),
+               'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+           ) AS valid
     UNION ALL
     SELECT :'backup_role'::name,
            has_database_privilege(:'backup_role', current_database(), 'CONNECT')

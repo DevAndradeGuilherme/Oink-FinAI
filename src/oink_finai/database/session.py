@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -11,4 +12,11 @@ SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
 
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with SessionFactory() as session:
-        yield session
+        try:
+            yield session
+        except asyncio.CancelledError:
+            await asyncio.shield(session.rollback())
+            raise
+        except BaseException:
+            await session.rollback()
+            raise

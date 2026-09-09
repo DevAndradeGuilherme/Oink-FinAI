@@ -39,7 +39,7 @@ def do_run_migrations(connection) -> None:
 
 
 def _harden_alembic_metadata(connection) -> None:
-    """Keep runtime out of Alembic metadata without fixing deployment role names."""
+    """Expose only the schema version needed for readiness to tagged runtime roles."""
     schema = connection.exec_driver_sql("SELECT current_schema()").scalar_one()
     runtime_roles = connection.exec_driver_sql(
         """
@@ -52,6 +52,7 @@ def _harden_alembic_metadata(connection) -> None:
     table = f"{quote(schema)}.{quote('alembic_version')}"
     for role in runtime_roles:
         connection.exec_driver_sql(f"REVOKE ALL PRIVILEGES ON TABLE {table} FROM {quote(role)}")
+        connection.exec_driver_sql(f"GRANT SELECT ON TABLE {table} TO {quote(role)}")
 
 
 async def run_async_migrations() -> None:

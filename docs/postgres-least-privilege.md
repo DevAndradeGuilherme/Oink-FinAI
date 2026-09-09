@@ -12,13 +12,15 @@ manutenção. A validação falha se qualquer role da aplicação puder conectar
 | --- | --- | --- | --- |
 | bootstrap/admin | Instalação inicial e emergência | Administração do cluster; não é usada em operação normal | API, worker, migrate ou backup |
 | migrator | Alembic one-shot | Dona do banco, schema e objetos; `LOGIN`, sem atributos administrativos | Segredos OpenAI, Evolution ou webhook |
-| runtime | API e worker | `CONNECT`, `USAGE`, DML nas tabelas e `USAGE, SELECT` nas sequences | URL de migration, bootstrap ou backup |
+| runtime | API e worker | `CONNECT`, `USAGE`, DML nas tabelas, `USAGE, SELECT` nas sequences e somente `SELECT` em `alembic_version` | URL de migration, bootstrap ou backup |
 | backup | Ferramentas futuras | `CONNECT`, `USAGE`, `SELECT`; transação read-only por padrão | DML, DDL ou outras credenciais |
 
 As três roles da aplicação são `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOINHERIT`,
 `NOREPLICATION` e `NOBYPASSRLS`, não têm memberships e não podem assumir migrator ou bootstrap.
 `SELECT FOR UPDATE` funciona para runtime porque ela possui `SELECT` e `UPDATE`. `TRUNCATE`,
-`CREATE`, `ALTER` e `DROP` não são concedidos.
+`CREATE`, `ALTER` e `DROP` não são concedidos. A exceção de metadado para readiness é estrita:
+runtime pode ler `alembic_version`, mas não pode inserir, atualizar, apagar ou truncar essa tabela
+e não pode executar Alembic.
 
 ## Preparação de segredos sem histórico de shell
 

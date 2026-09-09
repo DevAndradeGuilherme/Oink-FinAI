@@ -213,6 +213,10 @@ def main() -> int:
                 encoding="utf-8",
                 newline="\n",
             )
+            print("Testing PostgreSQL opt-in suite with fake providers...")
+            exercise_postgres_pytest(
+                app_image, network, postgres, database, runtime, passwords[runtime]
+            )
             print("Testing API, worker, grants, denials, defaults, and pg_dump...")
             start_runtime(app_image, network, api, worker, runtime_env)
             check_runtime_processes(api, worker)
@@ -372,6 +376,90 @@ def exercise_usage_concurrency(image: str, network: str, env_file: Path) -> None
     )
 
 
+def exercise_postgres_pytest(
+    image: str,
+    database_network: str,
+    container: str,
+    database: str,
+    runtime: str,
+    runtime_password: str,
+) -> None:
+    bridge_network = f"{container}_loopback"
+    proxy = f"{container}_proxy"
+    proxy_source = """
+import asyncio
+
+async def copy(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    finally:
+        writer.close()
+
+async def forward(reader, writer):
+    try:
+        upstream_reader, upstream_writer = await asyncio.open_connection("postgres", 5432)
+    except Exception:
+        writer.close()
+        return
+    await asyncio.gather(copy(reader, upstream_writer), copy(upstream_reader, writer))
+
+async def main():
+    server = await asyncio.start_server(forward, "0.0.0.0", 5432)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+"""
+    try:
+        docker("network", "create", bridge_network)
+        docker(
+            "run",
+            "--detach",
+            "--name",
+            proxy,
+            "--network",
+            bridge_network,
+            "--publish",
+            "127.0.0.1:0:5432",
+            image,
+            "python",
+            "-c",
+            proxy_source,
+        )
+        docker("network", "connect", database_network, proxy)
+        published = docker("port", proxy, "5432/tcp").stdout.strip()
+        match = re.fullmatch(r"127\.0\.0\.1:(\d+)", published)
+        if match is None:
+            raise CheckFailed("temporary PostgreSQL loopback port was not assigned safely")
+        time.sleep(0.5)
+        environment = os.environ.copy()
+        environment["OINK_TEST_POSTGRES_URL"] = (
+            f"postgresql+asyncpg://{quote(runtime, safe='')}:{quote(runtime_password, safe='')}@"
+            f"127.0.0.1:{match.group(1)}/{quote(database, safe='')}"
+        )
+        environment["OINK_TEST_POSTGRES_DISPOSABLE"] = "YES_DELETE"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_postgres_outbox_integration.py",
+                "tests/test_postgres_expense_query_pipeline.py",
+                "tests/test_postgres_expense_query_executor.py",
+                "tests/test_postgres_usage_control.py",
+            ],
+            env=environment,
+        )
+    finally:
+        if proxy.startswith(container):
+            docker("rm", "--force", proxy, check=False)
+        if bridge_network.startswith(container):
+            docker("network", "rm", bridge_network, check=False)
+
+
 def assert_runtime_cannot_migrate(image: str, network: str, env_file: Path) -> None:
     result = docker(
         "run",
@@ -446,11 +534,35 @@ def start_runtime(image: str, network: str, api: str, worker: str, env_file: Pat
 
 
 def check_runtime_processes(api: str, worker: str) -> None:
-    time.sleep(2)
-    for container in (api, worker):
-        state = docker("inspect", "--format", "{{.State.Running}}", container).stdout.strip()
-        if state != "true":
-            raise CheckFailed("a runtime process failed to start")
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        states = [
+            docker(
+                "inspect", "--format", "{{.State.Running}}", container, check=False
+            ).stdout.strip()
+            for container in (api, worker)
+        ]
+        if any(state == "false" for state in states):
+            raise CheckFailed("a runtime process stopped during startup")
+        api_health = docker(
+            "exec",
+            api,
+            "python",
+            "-c",
+            (
+                "import urllib.request; "
+                "urllib.request.urlopen('http://127.0.0.1:8000/live', timeout=3).read(); "
+                "urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"
+            ),
+            check=False,
+        )
+        worker_health = docker(
+            "exec", worker, "python", "-m", "oink_finai.worker_healthcheck", check=False
+        )
+        if states == ["true", "true"] and api_health.returncode == worker_health.returncode == 0:
+            return
+        time.sleep(1)
+    raise CheckFailed("runtime healthchecks did not become ready within the startup window")
 
 
 def psql(
@@ -544,6 +656,14 @@ def exercise_denials(
         'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"',
         f"SET ROLE {migrator}",
         f"SET ROLE {bootstrap}",
+    ):
+        assert_denied(container, database, runtime, temp, statement)
+    psql(container, database, runtime, temp, "SELECT version_num FROM alembic_version")
+    for statement in (
+        "INSERT INTO alembic_version (version_num) VALUES ('forbidden')",
+        "UPDATE alembic_version SET version_num = 'forbidden'",
+        "DELETE FROM alembic_version",
+        "TRUNCATE TABLE alembic_version",
     ):
         assert_denied(container, database, runtime, temp, statement)
     for statement in (
@@ -730,7 +850,7 @@ def exercise_existing_upgrade(
         encoding="utf-8",
         newline="\n",
     )
-    run_alembic(app_image, network, migration_env, "upgrade", "20260908_0012")
+    run_alembic(app_image, network, migration_env, "upgrade", "20260909_0013")
     psql(
         postgres,
         database,
@@ -786,7 +906,7 @@ def exercise_existing_upgrade(
     run_alembic(app_image, network, upgrade_env, "upgrade", "head")
     run_alembic(app_image, network, upgrade_env, "current", "--check-heads")
     if historical_data_digest(postgres, database, migrator, temp) != historical_before:
-        raise CheckFailed("0012-to-head upgrade changed historical data, IDs, or counts")
+        raise CheckFailed("0013-to-head upgrade changed historical data, IDs, or counts")
     wrong_owner_count = psql(
         postgres,
         database,

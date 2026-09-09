@@ -100,3 +100,9 @@ class UsageReservationState(StrEnum):
     COMPLETED = "COMPLETED"
     AMBIGUOUS = "AMBIGUOUS"
     RELEASED = "RELEASED"
+
+
+class WorkerHeartbeatStatus(StrEnum):
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"

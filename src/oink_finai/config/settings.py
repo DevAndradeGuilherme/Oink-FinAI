@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     app_debug: bool = False
     app_reload: bool = False
     pipeline_timing_enabled: bool = False
+    app_release: str | None = Field(default=None, max_length=128)
     database_url: SecretStr = SecretStr("postgresql+asyncpg://oink:oink@localhost:5432/oink")
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
     default_timezone: str = "America/Sao_Paulo"
@@ -59,6 +60,12 @@ class Settings(BaseSettings):
     whatsapp_self_test_number: str | None = Field(default=None, repr=False)
     whatsapp_self_test_prefix: str = "!oink"
     inbound_message_max_length: int = Field(default=2000, ge=1, le=10000)
+    evolution_webhook_max_body_bytes: int = Field(default=262_144, ge=1_024, le=1_048_576)
+    evolution_webhook_http_timeout_seconds: float = Field(
+        default=10.0, gt=0, le=30, allow_inf_nan=False
+    )
+    evolution_webhook_max_concurrency: int = Field(default=8, ge=1, le=64)
+    readiness_database_timeout_seconds: float = Field(default=2.0, gt=0, le=5, allow_inf_nan=False)
     usage_window_timezone: Literal["UTC"] = "UTC"
     inbound_user_per_minute_limit: int = Field(default=10, ge=1, le=120)
     inbound_user_per_day_limit: int = Field(default=150, ge=1, le=2_000)
@@ -79,6 +86,11 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_batch_size: int = Field(default=10, ge=1, le=100)
     worker_processing_lock_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    worker_heartbeat_interval_seconds: float = Field(default=15.0, ge=5, le=60)
+    worker_heartbeat_stale_seconds: float = Field(default=60.0, ge=15, le=600)
+    worker_heartbeat_database_timeout_seconds: float = Field(default=3.0, gt=0, le=10)
+    worker_heartbeat_retention_days: int = Field(default=7, ge=1, le=90)
+    worker_heartbeat_id_path: str = "/tmp/oink-finai-worker-id"
     expense_processing_max_attempts: int = Field(default=4, ge=1, le=10)
     expense_retry_base_seconds: float = Field(default=30.0, gt=0, le=3600)
     expense_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)
@@ -146,6 +158,16 @@ class Settings(BaseSettings):
             raise ValueError("outbox state timeout must exceed the provider timeout")
         if self.image_max_pixels > self.image_max_width * self.image_max_height:
             raise ValueError("image pixel limit must not exceed the dimension limit")
+        if self.worker_heartbeat_stale_seconds < 3 * self.worker_heartbeat_interval_seconds:
+            raise ValueError("worker heartbeat stale threshold must be at least three intervals")
+        if self.worker_heartbeat_database_timeout_seconds >= self.worker_heartbeat_interval_seconds:
+            raise ValueError("worker heartbeat database timeout must be shorter than its interval")
+        if not re.fullmatch(r"/tmp/[A-Za-z0-9._-]{1,100}", self.worker_heartbeat_id_path):
+            raise ValueError("worker heartbeat ID path must be a safe file in /tmp")
+        if self.app_release is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.app_release
+        ):
+            raise ValueError("APP_RELEASE must be an opaque identifier")
         self._validate_usage_limits()
 
         try:

@@ -3,6 +3,8 @@ import logging
 import signal
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from oink_finai.config.settings import get_settings
 from oink_finai.database.session import SessionFactory, engine
@@ -23,6 +25,7 @@ from oink_finai.services.usage_control import UsageControl
 from oink_finai.services.whatsapp_expense_query_result_formatter import (
     WhatsAppExpenseQueryResultFormatter,
 )
+from oink_finai.services.worker_heartbeat import WorkerHeartbeatService
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,48 @@ async def _close_safely(name: str, close: Callable[[], Awaitable[None]]) -> None
             "Worker resource close failed",
             extra={"resource": name, "error_type": type(exc).__name__},
         )
+
+
+async def _heartbeat_safely(code: str, operation: Callable[[], Awaitable[object]]) -> None:
+    try:
+        await operation()
+    except Exception:
+        logger.warning("Worker heartbeat operation failed", extra={"error_code": code})
+
+
+async def _maintain_heartbeat(
+    heartbeat: WorkerHeartbeatService,
+    worker_id: UUID,
+    stop: asyncio.Event,
+    interval_seconds: float,
+) -> None:
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            await _heartbeat_safely("HEARTBEAT_UPDATE_FAILED", lambda: heartbeat.beat(worker_id))
+            continue
+        await _heartbeat_safely("HEARTBEAT_STOPPING_FAILED", lambda: heartbeat.stopping(worker_id))
+        return
+
+
+def _write_worker_id(path_value: str, worker_id: UUID) -> Path:
+    path = Path(path_value)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(str(worker_id), encoding="ascii")
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    temporary.replace(path)
+    return path
+
+
+def _remove_worker_id(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 async def run_worker() -> None:
@@ -155,6 +200,25 @@ async def run_worker() -> None:
         retry_base_seconds=settings.outbox_retry_base_seconds,
         timing=timing,
     )
+    heartbeat = WorkerHeartbeatService(
+        SessionFactory,
+        stale_seconds=settings.worker_heartbeat_stale_seconds,
+        database_timeout_seconds=settings.worker_heartbeat_database_timeout_seconds,
+        retention_days=settings.worker_heartbeat_retention_days,
+    )
+    worker_id = uuid4()
+    worker_id_path = _write_worker_id(settings.worker_heartbeat_id_path, worker_id)
+    await _heartbeat_safely(
+        "HEARTBEAT_START_FAILED", lambda: heartbeat.start(worker_id, settings.app_release)
+    )
+    heartbeat_task = asyncio.create_task(
+        _maintain_heartbeat(
+            heartbeat,
+            worker_id,
+            stop,
+            settings.worker_heartbeat_interval_seconds,
+        )
+    )
     try:
         outbox_cutoff = datetime.now(UTC) - timedelta(seconds=settings.outbox_state_timeout_seconds)
         await delivery.recover_stale(outbox_cutoff)
@@ -187,11 +251,15 @@ async def run_worker() -> None:
             except TimeoutError:
                 pass
     finally:
+        stop.set()
+        await heartbeat_task
         await _close_safely("audio_transcriber", audio_transcriber.aclose)
         await _close_safely("image_analyzer", image_analyzer.aclose)
         await _close_safely("whatsapp_provider", provider.aclose)
         with openai_private_operation():
             await _close_safely("openai_client", openai_client.close)
+        await _heartbeat_safely("HEARTBEAT_STOPPED_FAILED", lambda: heartbeat.stopped(worker_id))
+        _remove_worker_id(worker_id_path)
         await _close_safely("database_engine", engine.dispose)
 
 

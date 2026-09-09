@@ -165,6 +165,14 @@ def test_production_settings_accept_a_complete_safe_configuration() -> None:
         ("OPENAI_TEXT_USER_PER_DAY_LIMIT", "1001"),
         ("OPENAI_EXPENSE_MAX_OUTPUT_TOKENS", "0"),
         ("USAGE_WINDOW_TIMEZONE", "America/Sao_Paulo"),
+        ("EVOLUTION_WEBHOOK_MAX_BODY_BYTES", "0"),
+        ("EVOLUTION_WEBHOOK_MAX_BODY_BYTES", "1048577"),
+        ("EVOLUTION_WEBHOOK_HTTP_TIMEOUT_SECONDS", "0"),
+        ("EVOLUTION_WEBHOOK_MAX_CONCURRENCY", "0"),
+        ("READINESS_DATABASE_TIMEOUT_SECONDS", "0"),
+        ("WORKER_HEARTBEAT_INTERVAL_SECONDS", "0"),
+        ("WORKER_HEARTBEAT_RETENTION_DAYS", "0"),
+        ("WORKER_HEARTBEAT_ID_PATH", "../unsafe"),
     ],
 )
 def test_unsafe_usage_limits_are_rejected(
@@ -181,6 +189,21 @@ def test_incoherent_usage_limits_are_rejected() -> None:
             _env_file=None,
             openai_user_per_day_limit=10,
             openai_text_user_per_day_limit=11,
+        )
+
+
+def test_incoherent_heartbeat_thresholds_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            worker_heartbeat_interval_seconds=15,
+            worker_heartbeat_stale_seconds=44,
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            worker_heartbeat_interval_seconds=5,
+            worker_heartbeat_database_timeout_seconds=5,
         )
 
 
